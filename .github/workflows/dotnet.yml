@@ -1,40 +1,40 @@
-name: CI/CD Pipeline (Ministack Mock)
+name: 🚀 Ministack Mock CI/CD
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:      # Memungkinkan trigger manual
+    branches: [ main ]
+  workflow_dispatch:      # Bisa dijalankan manual dari tab Actions
+
+env:
+  # Semua nilai diambil dari GitHub Secrets, fallback ke dummy jika belum diset
+  AWS_REGION:            us-east-1
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID || 'dummy' }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || 'dummy' }}
+  S3_BUCKET:             ${{ secrets.S3_BUCKET || 'mock-bucket' }}
+  EC2_HOST:              ${{ secrets.EC2_HOST || 'localhost' }}
+  RDS_ENDPOINT:          ${{ secrets.RDS_ENDPOINT || 'localhost:3306' }}
+  DB_NAME:               ${{ secrets.DB_NAME || 'mockdb' }}
+  DB_USER:               ${{ secrets.DB_USER || 'mockuser' }}
+  DB_PASSWORD:           ${{ secrets.DB_PASSWORD || 'mockpass' }}
+  USE_MOCK:              'true'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
-    # Environment variables (semua credential menggunakan placeholder / dummy)
-    env:
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID || 'dummy' }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || 'dummy' }}
-      S3_BUCKET: ${{ secrets.S3_BUCKET || 'mock-bucket' }}
-      EC2_HOST: ${{ secrets.EC2_HOST || 'localhost' }}
-      DB_NAME: ${{ secrets.DB_NAME || 'mockdb' }}
-      DB_USER: ${{ secrets.DB_USER || 'mockuser' }}
-      DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'mockpass' }}
-      RDS_ENDPOINT: ${{ secrets.RDS_ENDPOINT || 'localhost:3306' }}
-      USE_MOCK: 'true'    # Flag untuk mengaktifkan mode mock
-
     steps:
-      # 1. Checkout repository
-      - name: Checkout code
+      # ======================== 1. Checkout ========================
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Setup .NET
-      - name: Setup .NET 8
+      # ======================== 2. Setup .NET ========================
+      - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # 3. Mock AWS configuration (tanpa credential asli)
-      - name: Configure AWS CLI (Mock)
+      # ======================== 3. Konfigurasi AWS Mock ========================
+      - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/config <<EOF
@@ -47,20 +47,15 @@ jobs:
           aws_access_key_id = ${AWS_ACCESS_KEY_ID}
           aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
           EOF
-          # Jika menggunakan LocalStack, set endpoint (opsional)
-          if [ -n "$LOCALSTACK_ENDPOINT" ]; then
-            echo "endpoint_url = $LOCALSTACK_ENDPOINT" >> ~/.aws/config
-          fi
-        env:
-          LOCALSTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || '' }}
+          echo "✅ AWS mock config created."
 
-      # 4. Simulasi download source dari S3
-      - name: Download source from S3 (Mock)
+      # ======================== 4. Simulasi Download Source dari S3 ========================
+      - name: 📦 Download Source from S3 (Mock)
         run: |
-          echo "🔽 Simulating download from s3://${S3_BUCKET}/artifacts/sources/SOURCE_TodoWebAPI.7z"
+          echo "🔽 Simulating download: s3://${S3_BUCKET}/artifacts/sources/SOURCE_TodoWebAPI.7z"
           mkdir -p extracted_source
 
-          # Buat dummy .csproj agar proses build tetap berjalan
+          # Buat dummy .csproj agar build berhasil
           cat > extracted_source/TodoWebAPI.csproj <<'EOF'
           <Project Sdk="Microsoft.NET.Sdk.Web">
             <PropertyGroup>
@@ -74,75 +69,69 @@ jobs:
           </Project>
           EOF
 
-          # Buat file Program.cs minimal
-          mkdir -p extracted_source
+          # Buat Program.cs minimal
           cat > extracted_source/Program.cs <<'EOF'
           var builder = WebApplication.CreateBuilder(args);
           var app = builder.Build();
-          app.MapGet("/", () => "Hello from Ministack Mock!");
+          app.MapGet("/", () => "Hello from Ministack Mock CI/CD!");
           app.Run();
           EOF
 
-          echo "✅ Mock source prepared in extracted_source/"
+          echo "✅ Mock source code ready."
 
-      # 5. Build dan publish aplikasi .NET
-      - name: Build and publish
+      # ======================== 5. Build & Publish ========================
+      - name: 🔨 Build and Publish .NET App
         run: |
-          echo "🔨 Building application..."
+          echo "🔨 Restoring packages..."
           dotnet restore extracted_source/*.csproj
+          echo "📦 Publishing to 'publish_output'..."
           dotnet publish extracted_source/*.csproj -c Release -o publish_output
-          echo "✅ Build completed. Output in publish_output/"
+          echo "✅ Build & publish completed."
 
-      # 6. Package dan simulasi upload ke S3
-      - name: Package and upload to S3 (Mock)
+      # ======================== 6. Package & Simulasi Upload ke S3 ========================
+      - name: 📤 Package and Upload to S3 (Mock)
         run: |
-          echo "📦 Packaging binaries..."
+          echo "📦 Creating webapp-binaries.zip..."
           cd publish_output
           zip -r ../webapp-binaries.zip . > /dev/null
           cd ..
           echo "✅ Package created: webapp-binaries.zip ($(du -h webapp-binaries.zip | cut -f1))"
-
-          # Simulasi upload
-          echo "☁️  Simulating upload to s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip"
+          echo "☁️  Simulating upload to: s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip"
           # Jika LocalStack tersedia, uncomment baris berikut:
-          # aws s3 cp webapp-binaries.zip s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip --endpoint-url ${LOCALSTACK_ENDPOINT}
+          # if [ -n "$LOCALSTACK_ENDPOINT" ]; then
+          #   aws s3 cp webapp-binaries.zip s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip --endpoint-url $LOCALSTACK_ENDPOINT
+          # fi
 
-      # 7. Simulasi deploy ke EC2 via SSH
-      - name: Deploy to EC2 (Mock)
+      # ======================== 7. Simulasi Deploy ke EC2 ========================
+      - name: 🚀 Deploy to EC2 (Mock)
         run: |
           echo "🚀 Simulating deployment to EC2 host: ${EC2_HOST}"
 
-          # Buat skrip dummy yang akan dijalankan
-          cat > mock-deploy.sh <<'EOF'
-          #!/bin/bash
-          echo "Stopping webapp service..."
-          echo "Downloading artifact from S3..."
-          echo "Extracting to /var/www/webapp..."
-          echo "Updating connection string..."
-          echo "Starting webapp service..."
-          EOF
-          chmod +x mock-deploy.sh
-
-          # Jalankan skrip mock
-          ./mock-deploy.sh
-
-          # Tampilkan informasi deployment
+          # Ekstrak host dari RDS_ENDPOINT (untuk tampilan log)
           RDS_HOST=$(echo "${RDS_ENDPOINT}" | cut -d':' -f1)
-          echo "📝 Connection string updated with:"
-          echo "   Server: ${RDS_HOST}"
-          echo "   Database: ${DB_NAME}"
-          echo "   User: ${DB_USER}"
-          echo "   Password: ******"
 
-          echo "✅ Deployment simulation completed successfully."
+          cat <<EOF
+          ============================================
+          🖥️  Deployment Simulation Steps:
+          ============================================
+          1. Stopping webapp service...
+          2. Downloading artifact from S3...
+          3. Extracting to /var/www/webapp...
+          4. Updating appsettings.json:
+             "DefaultConnection": "Server=${RDS_HOST};Database=${DB_NAME};User=${DB_USER};Password=******"
+          5. Starting webapp service...
+          ============================================
+          ✅ Deployment simulation completed successfully!
+          EOF
 
-      # 8. Verifikasi akhir (opsional)
-      - name: Summary
+      # ======================== 8. Summary ========================
+      - name: 📋 Pipeline Summary
         run: |
           echo "========================================="
-          echo "🎉 CI/CD Pipeline (Ministack Mock) Selesai"
+          echo "🎉 Ministack Mock CI/CD Pipeline Selesai"
           echo "========================================="
-          echo "Mode: MOCK (tidak ada koneksi AWS asli)"
-          echo "Artifact: webapp-binaries.zip"
-          echo "Target server: ${EC2_HOST}"
+          echo "• Mode:            MOCK (no real AWS)"
+          echo "• Artifact:        webapp-binaries.zip"
+          echo "• Target Server:   ${EC2_HOST}"
+          echo "• Database Server: ${RDS_ENDPOINT}"
           echo "========================================="
