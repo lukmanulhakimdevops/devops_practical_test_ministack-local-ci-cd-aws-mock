@@ -1,12 +1,14 @@
-name: 🚀 Deploy Existing .NET Publish Artifact to Laptop Docker
+name: 🚀 Deploy Artifact to Laptop Docker
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["🚀 Ministack Mock CI/CD"]
+    types:
+      - completed
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: deploy-laptop-main
@@ -15,52 +17,14 @@ concurrency:
 env:
   APP_NAME: todo-api
   APP_DLL: TodoWebAPI.dll
-  ZIP_PATH: artifacts/binaries/linux-x64/webapp-binaries.zip
   ARTIFACT_NAME: webapp-binaries
   CONTAINER_NAME: todo-api
   HOST_PORT: "8080"
   CONTAINER_PORT: "8080"
 
 jobs:
-  package-artifact:
-    name: Prepare Existing Publish Artifact
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ✅ Validate packaged app files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f "${ZIP_PATH}" ]]; then
-            echo "ERROR: ZIP_PATH not found: ${ZIP_PATH}"
-            echo "Available files under artifacts:"
-            find artifacts -maxdepth 5 -type f | sed 's/^/ - /' || true
-            exit 1
-          fi
-
-          mkdir -p artifact_bundle
-
-          cp "${ZIP_PATH}" "artifact_bundle/webapp-binaries.zip"
-          printf '%s' "${APP_DLL}" > artifact_bundle/app_dll.txt
-
-          echo "Artifact prepared:"
-          ls -lah artifact_bundle
-
-      - name: ⬆️ Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: artifact_bundle/
-          if-no-files-found: error
-          retention-days: 7
-
   deploy:
-    name: Deploy to Laptop Docker
-    needs: package-artifact
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: [self-hosted, linux, x64]
 
     steps:
@@ -71,19 +35,18 @@ jobs:
           docker --version
           unzip -v >/dev/null
 
-      - name: ⬇️ Download workflow artifact
+      - name: ⬇️ Download artifact from build workflow run
         uses: actions/download-artifact@v5
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ./artifact
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
 
-      - name: 📂 Extract artifact and verify DLL
+      - name: 📂 Extract artifact
         shell: bash
         run: |
           set -euo pipefail
-
-          APP_DLL="$(cat ./artifact/app_dll.txt)"
-          echo "APP_DLL=${APP_DLL}" >> "$GITHUB_ENV"
 
           rm -rf deploy_input
           mkdir -p deploy_input/publish
@@ -92,7 +55,6 @@ jobs:
 
           if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
             echo "ERROR: DLL not found after unzip: ${APP_DLL}"
-            echo "Contents of deploy_input/publish:"
             find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
             exit 1
           fi
@@ -111,7 +73,6 @@ jobs:
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
 
-          echo "Dockerfile created:"
           cat deploy_input/Dockerfile
 
       - name: 🏗️ Build Docker image on laptop
