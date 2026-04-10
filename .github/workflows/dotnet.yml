@@ -1,4 +1,4 @@
-name: 🚀 Build Artifact and Deploy to Laptop Docker
+name: 🚀 Build Real .NET Artifact and Deploy to Laptop Docker
 
 on:
   push:
@@ -14,19 +14,19 @@ concurrency:
 
 env:
   APP_NAME: todo-api
-  APP_DLL: TodoWebAPI.dll
+  PROJECT_PATH: "" # contoh: src/TodoWebAPI/TodoWebAPI.csproj
   ARTIFACT_NAME: webapp-binaries
   CONTAINER_NAME: todo-api
-  HOST_PORT: 8080
-  CONTAINER_PORT: 8080
+  HOST_PORT: "8080"
+  CONTAINER_PORT: "8080"
 
 jobs:
   build:
-    name: Build and Upload Artifact
+    name: Build and Upload Real Artifact
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout Repository
+      - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
       - name: 🔧 Setup .NET 8
@@ -34,55 +34,99 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: 📦 Prepare source
+      - name: 🔎 Resolve .NET project
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p extracted_source
+          PROJECT_FILE="${PROJECT_PATH}"
 
-          cat > extracted_source/TodoWebAPI.csproj <<'EOF'
-          <Project Sdk="Microsoft.NET.Sdk.Web">
-            <PropertyGroup>
-              <TargetFramework>net8.0</TargetFramework>
-              <Nullable>enable</Nullable>
-              <ImplicitUsings>enable</ImplicitUsings>
-            </PropertyGroup>
-            <ItemGroup>
-              <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.0" />
-            </ItemGroup>
-          </Project>
-          EOF
+          if [[ -z "${PROJECT_FILE}" ]]; then
+            mapfile -t PROJECTS < <(find . -type f -name '*.csproj' ! -path '*/bin/*' ! -path '*/obj/*' | sort)
 
-          cat > extracted_source/Program.cs <<'EOF'
-          var builder = WebApplication.CreateBuilder(args);
-          var app = builder.Build();
-          app.MapGet("/", () => "Hello from artifact deployed to laptop Docker!");
-          app.Run();
-          EOF
+            if [[ ${#PROJECTS[@]} -eq 0 ]]; then
+              echo "ERROR: No .csproj file found in repository."
+              exit 1
+            fi
 
-      - name: 🔨 Build and Publish .NET App
+            for p in "${PROJECTS[@]}"; do
+              if grep -q 'Microsoft.NET.Sdk.Web' "$p"; then
+                PROJECT_FILE="$p"
+                break
+              fi
+            done
+
+            if [[ -z "${PROJECT_FILE}" && ${#PROJECTS[@]} -eq 1 ]]; then
+              PROJECT_FILE="${PROJECTS[0]}"
+            fi
+          fi
+
+          if [[ -z "${PROJECT_FILE}" ]]; then
+            echo "ERROR: Multiple .csproj files found and no web project could be auto-detected."
+            printf ' - %s\n' "${PROJECTS[@]}"
+            echo "Set env PROJECT_PATH to the correct .csproj path."
+            exit 1
+          fi
+
+          if [[ ! -f "${PROJECT_FILE}" ]]; then
+            echo "ERROR: PROJECT_PATH does not exist: ${PROJECT_FILE}"
+            exit 1
+          fi
+
+          APP_DLL="$(basename "${PROJECT_FILE%.csproj}").dll"
+
+          mkdir -p .build-meta
+          printf '%s' "${PROJECT_FILE}" > .build-meta/project_file.txt
+          printf '%s' "${APP_DLL}" > .build-meta/app_dll.txt
+
+          echo "PROJECT_FILE=${PROJECT_FILE}" >> "$GITHUB_ENV"
+          echo "APP_DLL=${APP_DLL}" >> "$GITHUB_ENV"
+
+          echo "Resolved project : ${PROJECT_FILE}"
+          echo "Resolved app dll : ${APP_DLL}"
+
+      - name: 📦 Restore dependencies
         shell: bash
         run: |
           set -euo pipefail
-          dotnet restore extracted_source/*.csproj
-          dotnet publish extracted_source/*.csproj -c Release -o publish_output
+          dotnet restore "${PROJECT_FILE}"
 
-      - name: 📦 Package publish output
+      - name: 🏗️ Publish application
         shell: bash
         run: |
           set -euo pipefail
-          cd publish_output
-          zip -r ../webapp-binaries.zip . > /dev/null
-          cd ..
-          test -f webapp-binaries.zip
-          ls -lh webapp-binaries.zip
+          rm -rf publish_output
+          dotnet publish "${PROJECT_FILE}" -c Release -o publish_output
+
+          if [[ ! -f "publish_output/${APP_DLL}" ]]; then
+            echo "ERROR: Expected DLL not found after publish: publish_output/${APP_DLL}"
+            find publish_output -maxdepth 3 -type f | sed 's/^/ - /'
+            exit 1
+          fi
+
+      - name: 🗜️ Package publish output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf artifact_bundle
+          mkdir -p artifact_bundle
+
+          (
+            cd publish_output
+            zip -r ../artifact_bundle/webapp-binaries.zip . > /dev/null
+          )
+
+          cp .build-meta/* artifact_bundle/
+
+          echo "Artifact bundle contents:"
+          ls -lah artifact_bundle
 
       - name: ⬆️ Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: webapp-binaries
-          path: webapp-binaries.zip
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact_bundle/
           if-no-files-found: error
           retention-days: 7
 
@@ -102,13 +146,16 @@ jobs:
       - name: ⬇️ Download workflow artifact
         uses: actions/download-artifact@v5
         with:
-          name: webapp-binaries
+          name: ${{ env.ARTIFACT_NAME }}
           path: ./artifact
 
-      - name: 📂 Extract artifact
+      - name: 📂 Extract artifact and read metadata
         shell: bash
         run: |
           set -euo pipefail
+
+          APP_DLL="$(cat ./artifact/app_dll.txt)"
+          echo "APP_DLL=${APP_DLL}" >> "$GITHUB_ENV"
 
           rm -rf deploy_input
           mkdir -p deploy_input/publish
@@ -116,7 +163,7 @@ jobs:
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
 
           if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: ${APP_DLL} not found in artifact"
+            echo "ERROR: DLL not found in downloaded artifact: ${APP_DLL}"
             find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
             exit 1
           fi
@@ -134,6 +181,9 @@ jobs:
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
+
+          echo "Dockerfile:"
+          cat deploy_input/Dockerfile
 
       - name: 🏗️ Build Docker image on laptop
         shell: bash
@@ -157,9 +207,10 @@ jobs:
             --restart unless-stopped \
             ${APP_NAME}:latest
 
-      - name: ✅ Show running container
+      - name: ✅ Verify running container
         shell: bash
         run: |
           set -euo pipefail
+          sleep 3
           docker ps --filter "name=${CONTAINER_NAME}"
-          docker logs --tail 20 ${CONTAINER_NAME} || true
+          docker logs --tail 50 ${CONTAINER_NAME} || true
