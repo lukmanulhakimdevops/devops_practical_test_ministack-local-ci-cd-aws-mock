@@ -1,0 +1,45 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches: [main]
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Download source from S3
+        run: |
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/artifacts/sources/SOURCE_TodoWebAPI.7z .
+          7z x SOURCE_TodoWebAPI.7z -oextracted_source
+      - name: Build and publish
+        run: |
+          dotnet restore extracted_source/*.csproj
+          dotnet publish extracted_source/*.csproj -c Release -o publish_output
+      - name: Package and upload to S3
+        run: |
+          cd publish_output && zip -r ../webapp-binaries.zip . && cd ..
+          aws s3 cp webapp-binaries.zip s3://${{ secrets.S3_BUCKET }}/artifacts/binaries/webapp-binaries.zip
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo systemctl stop webapp
+            aws s3 cp s3://${{ secrets.S3_BUCKET }}/artifacts/binaries/webapp-binaries.zip /tmp/webapp.zip
+            sudo rm -rf /var/www/webapp
+            sudo unzip -o /tmp/webapp.zip -d /var/www/webapp
+            # Update connection string
+            RDS_HOST=$(echo "${{ secrets.RDS_ENDPOINT }}" | cut -d':' -f1)
+            CONN="Server=$RDS_HOST;Database=${{ secrets.DB_NAME }};User=${{ secrets.DB_USER }};Password=${{ secrets.DB_PASSWORD }}"
+            sudo sed -i "s|\"DefaultConnection\": \".*\"|\"DefaultConnection\": \"$CONN\"|" /var/www/webapp/appsettings.json
+            sudo systemctl start webapp
