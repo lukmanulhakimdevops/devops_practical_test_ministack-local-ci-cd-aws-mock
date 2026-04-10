@@ -2,7 +2,8 @@ name: 🚀 Deploy Artifact to Laptop Docker
 
 on:
   workflow_run:
-    workflows: ["🚀 Ministack Mock CI/CD"]
+    workflows:
+      - "🚀 Ministack Mock CI/CD"
     types:
       - completed
 
@@ -18,12 +19,14 @@ env:
   APP_NAME: todo-api
   APP_DLL: TodoWebAPI.dll
   ARTIFACT_NAME: webapp-binaries
+  ARTIFACT_ZIP: webapp-binaries.zip
   CONTAINER_NAME: todo-api
   HOST_PORT: "8080"
   CONTAINER_PORT: "8080"
 
 jobs:
   deploy:
+    name: Deploy to Laptop Docker
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: [self-hosted, linux, x64]
 
@@ -35,7 +38,13 @@ jobs:
           docker --version
           unzip -v >/dev/null
 
-      - name: ⬇️ Download artifact from build workflow run
+      - name: 🧹 Clean old workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf artifact deploy_input
+
+      - name: ⬇️ Download artifact from upstream workflow run
         uses: actions/download-artifact@v5
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -43,18 +52,29 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
+      - name: ✅ Verify downloaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "./artifact/${ARTIFACT_ZIP}" ]]; then
+            echo "ERROR: Artifact zip not found: ./artifact/${ARTIFACT_ZIP}"
+            echo "Downloaded files:"
+            find ./artifact -maxdepth 3 -type f | sed 's/^/ - /' || true
+            exit 1
+          fi
+
       - name: 📂 Extract artifact
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf deploy_input
           mkdir -p deploy_input/publish
-
-          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+          unzip -q "./artifact/${ARTIFACT_ZIP}" -d deploy_input/publish
 
           if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
             echo "ERROR: DLL not found after unzip: ${APP_DLL}"
+            echo "Extracted files:"
             find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
             exit 1
           fi
@@ -67,12 +87,15 @@ jobs:
           cat > deploy_input/Dockerfile <<EOF
           FROM mcr.microsoft.com/dotnet/aspnet:8.0
           WORKDIR /app
+
           EXPOSE ${CONTAINER_PORT}
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
+
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
 
+          echo "Dockerfile created:"
           cat deploy_input/Dockerfile
 
       - name: 🏗️ Build Docker image on laptop
