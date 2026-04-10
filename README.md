@@ -1,6 +1,6 @@
 # 🚀 Ministack Mock CI/CD
 
-[![CI/CD Pipeline](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions/workflows/ministack-mock-ci-cd.yml/badge.svg)](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions)
+[![CI/CD Pipeline](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions/workflows/dotnet.yml/badge.svg)](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions)
 
 Proyek ini merupakan simulasi pipeline **CI/CD** menggunakan **GitHub Actions** dalam lingkungan **mock (Ministack)**. Seluruh layanan seperti **S3, EC2, dan RDS** hanya disimulasikan melalui file dummy dan log proses, sehingga tidak membutuhkan akun AWS nyata.
 
