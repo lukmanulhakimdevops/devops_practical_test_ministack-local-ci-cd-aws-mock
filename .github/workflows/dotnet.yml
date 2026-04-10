@@ -1,4 +1,4 @@
-name: 🚀 Build Real .NET Artifact and Deploy to Laptop Docker
+name: 🚀 Deploy Existing .NET Publish Artifact to Laptop Docker
 
 on:
   push:
@@ -14,112 +14,40 @@ concurrency:
 
 env:
   APP_NAME: todo-api
-  PROJECT_PATH: "" # contoh: src/TodoWebAPI/TodoWebAPI.csproj
+  APP_DLL: TodoWebAPI.dll
+  ZIP_PATH: artifacts/binaries/linux-x64/webapp-binaries.zip
   ARTIFACT_NAME: webapp-binaries
   CONTAINER_NAME: todo-api
   HOST_PORT: "8080"
   CONTAINER_PORT: "8080"
 
 jobs:
-  build:
-    name: Build and Upload Real Artifact
+  package-artifact:
+    name: Prepare Existing Publish Artifact
     runs-on: ubuntu-latest
 
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🔧 Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
-
-      - name: 🔎 Resolve .NET project
+      - name: ✅ Validate packaged app files
         shell: bash
         run: |
           set -euo pipefail
 
-          PROJECT_FILE="${PROJECT_PATH}"
-
-          if [[ -z "${PROJECT_FILE}" ]]; then
-            mapfile -t PROJECTS < <(find . -type f -name '*.csproj' ! -path '*/bin/*' ! -path '*/obj/*' | sort)
-
-            if [[ ${#PROJECTS[@]} -eq 0 ]]; then
-              echo "ERROR: No .csproj file found in repository."
-              exit 1
-            fi
-
-            for p in "${PROJECTS[@]}"; do
-              if grep -q 'Microsoft.NET.Sdk.Web' "$p"; then
-                PROJECT_FILE="$p"
-                break
-              fi
-            done
-
-            if [[ -z "${PROJECT_FILE}" && ${#PROJECTS[@]} -eq 1 ]]; then
-              PROJECT_FILE="${PROJECTS[0]}"
-            fi
-          fi
-
-          if [[ -z "${PROJECT_FILE}" ]]; then
-            echo "ERROR: Multiple .csproj files found and no web project could be auto-detected."
-            printf ' - %s\n' "${PROJECTS[@]}"
-            echo "Set env PROJECT_PATH to the correct .csproj path."
+          if [[ ! -f "${ZIP_PATH}" ]]; then
+            echo "ERROR: ZIP_PATH not found: ${ZIP_PATH}"
+            echo "Available files under artifacts:"
+            find artifacts -maxdepth 5 -type f | sed 's/^/ - /' || true
             exit 1
           fi
 
-          if [[ ! -f "${PROJECT_FILE}" ]]; then
-            echo "ERROR: PROJECT_PATH does not exist: ${PROJECT_FILE}"
-            exit 1
-          fi
-
-          APP_DLL="$(basename "${PROJECT_FILE%.csproj}").dll"
-
-          mkdir -p .build-meta
-          printf '%s' "${PROJECT_FILE}" > .build-meta/project_file.txt
-          printf '%s' "${APP_DLL}" > .build-meta/app_dll.txt
-
-          echo "PROJECT_FILE=${PROJECT_FILE}" >> "$GITHUB_ENV"
-          echo "APP_DLL=${APP_DLL}" >> "$GITHUB_ENV"
-
-          echo "Resolved project : ${PROJECT_FILE}"
-          echo "Resolved app dll : ${APP_DLL}"
-
-      - name: 📦 Restore dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          dotnet restore "${PROJECT_FILE}"
-
-      - name: 🏗️ Publish application
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf publish_output
-          dotnet publish "${PROJECT_FILE}" -c Release -o publish_output
-
-          if [[ ! -f "publish_output/${APP_DLL}" ]]; then
-            echo "ERROR: Expected DLL not found after publish: publish_output/${APP_DLL}"
-            find publish_output -maxdepth 3 -type f | sed 's/^/ - /'
-            exit 1
-          fi
-
-      - name: 🗜️ Package publish output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf artifact_bundle
           mkdir -p artifact_bundle
 
-          (
-            cd publish_output
-            zip -r ../artifact_bundle/webapp-binaries.zip . > /dev/null
-          )
+          cp "${ZIP_PATH}" "artifact_bundle/webapp-binaries.zip"
+          printf '%s' "${APP_DLL}" > artifact_bundle/app_dll.txt
 
-          cp .build-meta/* artifact_bundle/
-
-          echo "Artifact bundle contents:"
+          echo "Artifact prepared:"
           ls -lah artifact_bundle
 
       - name: ⬆️ Upload workflow artifact
@@ -132,7 +60,7 @@ jobs:
 
   deploy:
     name: Deploy to Laptop Docker
-    needs: build
+    needs: package-artifact
     runs-on: [self-hosted, linux, x64]
 
     steps:
@@ -149,7 +77,7 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: ./artifact
 
-      - name: 📂 Extract artifact and read metadata
+      - name: 📂 Extract artifact and verify DLL
         shell: bash
         run: |
           set -euo pipefail
@@ -163,7 +91,8 @@ jobs:
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
 
           if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: DLL not found in downloaded artifact: ${APP_DLL}"
+            echo "ERROR: DLL not found after unzip: ${APP_DLL}"
+            echo "Contents of deploy_input/publish:"
             find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
             exit 1
           fi
@@ -182,7 +111,7 @@ jobs:
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
 
-          echo "Dockerfile:"
+          echo "Dockerfile created:"
           cat deploy_input/Dockerfile
 
       - name: 🏗️ Build Docker image on laptop
