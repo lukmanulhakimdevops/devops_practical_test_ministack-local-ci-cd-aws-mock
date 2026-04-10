@@ -46,12 +46,12 @@ flowchart LR
     B --> C["Mock AWS Stack<br>(S3, EC2, RDS)"]
     B --> D["Artifact<br>.zip"]
 
-    %% Styling taktis untuk visibilitas (Opsional)
+    %% Styling taktis untuk visibilitas
     style A fill:#2b3137,stroke:#fafbfc,stroke-width:2px,color:#fff
     style B fill:#2088FF,stroke:#fafbfc,stroke-width:2px,color:#fff
     style C fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#232F3E
     style D fill:#ececec,stroke:#333,stroke-width:2px,color:#333
-
+```
 ---
 
 ## Teknologi yang Digunakan
