@@ -2,22 +2,27 @@ name: 🚀 Build Artifact and Deploy to Laptop Docker
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: deploy-todo-api-main
+  group: deploy-laptop-main
   cancel-in-progress: true
 
 env:
   APP_NAME: todo-api
   APP_DLL: TodoWebAPI.dll
+  ARTIFACT_NAME: webapp-binaries
   CONTAINER_NAME: todo-api
   HOST_PORT: 8080
   CONTAINER_PORT: 8080
 
 jobs:
   build:
+    name: Build and Upload Artifact
     runs-on: ubuntu-latest
 
     steps:
@@ -27,10 +32,13 @@ jobs:
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: 8.0.x
 
       - name: 📦 Prepare source
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p extracted_source
 
           cat > extracted_source/TodoWebAPI.csproj <<'EOF'
@@ -40,26 +48,34 @@ jobs:
               <Nullable>enable</Nullable>
               <ImplicitUsings>enable</ImplicitUsings>
             </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.0" />
+            </ItemGroup>
           </Project>
           EOF
 
           cat > extracted_source/Program.cs <<'EOF'
           var builder = WebApplication.CreateBuilder(args);
           var app = builder.Build();
-          app.MapGet("/", () => "Hello from GitHub Actions artifact!");
+          app.MapGet("/", () => "Hello from artifact deployed to laptop Docker!");
           app.Run();
           EOF
 
-      - name: 🔨 Build and publish
+      - name: 🔨 Build and Publish .NET App
+        shell: bash
         run: |
+          set -euo pipefail
           dotnet restore extracted_source/*.csproj
           dotnet publish extracted_source/*.csproj -c Release -o publish_output
 
-      - name: 🗜️ Package publish output
+      - name: 📦 Package publish output
+        shell: bash
         run: |
+          set -euo pipefail
           cd publish_output
           zip -r ../webapp-binaries.zip . > /dev/null
           cd ..
+          test -f webapp-binaries.zip
           ls -lh webapp-binaries.zip
 
       - name: ⬆️ Upload workflow artifact
@@ -67,28 +83,49 @@ jobs:
         with:
           name: webapp-binaries
           path: webapp-binaries.zip
+          if-no-files-found: error
           retention-days: 7
 
   deploy:
+    name: Deploy to Laptop Docker
     needs: build
     runs-on: [self-hosted, linux, x64]
 
     steps:
-      - name: ⬇️ Download artifact
+      - name: 🧪 Check runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker --version
+          unzip -v >/dev/null
+
+      - name: ⬇️ Download workflow artifact
         uses: actions/download-artifact@v5
         with:
           name: webapp-binaries
           path: ./artifact
 
       - name: 📂 Extract artifact
+        shell: bash
         run: |
+          set -euo pipefail
+
           rm -rf deploy_input
           mkdir -p deploy_input/publish
-          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          test -f "deploy_input/publish/${APP_DLL}"
 
-      - name: 🐳 Generate Dockerfile
+          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+
+          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
+            echo "ERROR: ${APP_DLL} not found in artifact"
+            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
+            exit 1
+          fi
+
+      - name: 🐳 Create Dockerfile
+        shell: bash
         run: |
+          set -euo pipefail
+
           cat > deploy_input/Dockerfile <<EOF
           FROM mcr.microsoft.com/dotnet/aspnet:8.0
           WORKDIR /app
@@ -99,15 +136,21 @@ jobs:
           EOF
 
       - name: 🏗️ Build Docker image on laptop
+        shell: bash
         run: |
+          set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
 
       - name: 🧹 Remove old container
+        shell: bash
         run: |
+          set -euo pipefail
           docker rm -f ${CONTAINER_NAME} || true
 
       - name: 🚀 Run new container
+        shell: bash
         run: |
+          set -euo pipefail
           docker run -d \
             --name ${CONTAINER_NAME} \
             -p ${HOST_PORT}:${CONTAINER_PORT} \
@@ -115,5 +158,8 @@ jobs:
             ${APP_NAME}:latest
 
       - name: ✅ Show running container
+        shell: bash
         run: |
+          set -euo pipefail
           docker ps --filter "name=${CONTAINER_NAME}"
+          docker logs --tail 20 ${CONTAINER_NAME} || true
