@@ -1,129 +1,16 @@
-name: 🚀 Deploy Artifact to Laptop Docker
-
-on:
-  workflow_run:
-    workflows:
-      - "🚀 Ministack Mock CI/CD"
-    types:
-      - completed
-
-permissions:
-  contents: read
-  actions: read
-
-concurrency:
-  group: deploy-laptop-main
-  cancel-in-progress: true
-
-env:
-  APP_NAME: todo-api
-  APP_DLL: TodoWebAPI.dll
-  ARTIFACT_NAME: webapp-binaries
-  ARTIFACT_ZIP: webapp-binaries.zip
-  CONTAINER_NAME: todo-api
-  HOST_PORT: "8080"
-  CONTAINER_PORT: "8080"
-
-jobs:
-  deploy:
-    name: Deploy to Laptop Docker
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    runs-on: [self-hosted, linux, x64]
-
-    steps:
-      - name: 🧪 Check runner prerequisites
+      - name: 📤 Package publish output
         shell: bash
         run: |
           set -euo pipefail
-          docker --version
-          unzip -v >/dev/null
+          cd publish_output
+          zip -r ../webapp-binaries.zip . > /dev/null
+          cd ..
+          ls -lh webapp-binaries.zip
 
-      - name: 🧹 Clean old workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf artifact deploy_input
-
-      - name: ⬇️ Download artifact from upstream workflow run
-        uses: actions/download-artifact@v5
+      - name: ⬆️ Upload GitHub artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ./artifact
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-
-      - name: ✅ Verify downloaded artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f "./artifact/${ARTIFACT_ZIP}" ]]; then
-            echo "ERROR: Artifact zip not found: ./artifact/${ARTIFACT_ZIP}"
-            echo "Downloaded files:"
-            find ./artifact -maxdepth 3 -type f | sed 's/^/ - /' || true
-            exit 1
-          fi
-
-      - name: 📂 Extract artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p deploy_input/publish
-          unzip -q "./artifact/${ARTIFACT_ZIP}" -d deploy_input/publish
-
-          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: DLL not found after unzip: ${APP_DLL}"
-            echo "Extracted files:"
-            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
-            exit 1
-          fi
-
-      - name: 🐳 Create Dockerfile
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > deploy_input/Dockerfile <<EOF
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0
-          WORKDIR /app
-
-          EXPOSE ${CONTAINER_PORT}
-          ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
-
-          COPY publish/ /app/
-          ENTRYPOINT ["dotnet", "${APP_DLL}"]
-          EOF
-
-          echo "Dockerfile created:"
-          cat deploy_input/Dockerfile
-
-      - name: 🏗️ Build Docker image on laptop
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build -t ${APP_NAME}:latest ./deploy_input
-
-      - name: 🧹 Remove old container
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker rm -f ${CONTAINER_NAME} || true
-
-      - name: 🚀 Run new container
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${HOST_PORT}:${CONTAINER_PORT} \
-            --restart unless-stopped \
-            ${APP_NAME}:latest
-
-      - name: ✅ Verify running container
-        shell: bash
-        run: |
-          set -euo pipefail
-          sleep 3
-          docker ps --filter "name=${CONTAINER_NAME}"
-          docker logs --tail 50 ${CONTAINER_NAME} || true
+          name: webapp-binaries
+          path: webapp-binaries.zip
+          if-no-files-found: error
+          retention-days: 7
