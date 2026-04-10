@@ -1,1 +1,62 @@
 linux-x64/webapp-binaries.zip
+.env
+# Self-hosted runner local
+actions-runner/
+.runner
+.credentials
+.credentials_rsaparams
+_diag/
+_work/
+externals/
+bin/
+
+# Build / deploy temp
+.build/
+publish_output/
+artifact/
+deploy_input/
+extracted_source/
+
+# Archives
+*.zip
+*.tar.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Self-hosted runner local
+actions-runner/
+.runner
+.credentials
+.credentials_rsaparams
+_diag/
+_work/
+externals/
+bin/
+
+# Build / deploy temp
+.build/
+publish_output/
+artifact/
+deploy_input/
+extracted_source/
+
+# Archives
+*.zip
+*.tar.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
+# Keep workflow files tracked
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!.github/workflows/*.yaml
