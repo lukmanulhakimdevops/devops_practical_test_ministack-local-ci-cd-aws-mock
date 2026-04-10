@@ -1,61 +1,38 @@
-name: 🚀 Ministack Mock CI/CD
+name: 🚀 Build Artifact and Deploy to Laptop Docker
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:      # Bisa dijalankan manual dari tab Actions
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-todo-api-main
+  cancel-in-progress: true
 
 env:
-  # Semua nilai diambil dari GitHub Secrets, fallback ke dummy jika belum diset
-  AWS_REGION:            us-east-1
-  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID || 'dummy' }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY || 'dummy' }}
-  S3_BUCKET:             ${{ secrets.S3_BUCKET || 'mock-bucket' }}
-  EC2_HOST:              ${{ secrets.EC2_HOST || 'localhost' }}
-  RDS_ENDPOINT:          ${{ secrets.RDS_ENDPOINT || 'localhost:3306' }}
-  DB_NAME:               ${{ secrets.DB_NAME || 'mockdb' }}
-  DB_USER:               ${{ secrets.DB_USER || 'mockuser' }}
-  DB_PASSWORD:           ${{ secrets.DB_PASSWORD || 'mockpass' }}
-  USE_MOCK:              'true'
+  APP_NAME: todo-api
+  APP_DLL: TodoWebAPI.dll
+  CONTAINER_NAME: todo-api
+  HOST_PORT: 8080
+  CONTAINER_PORT: 8080
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      # ======================== 1. Checkout ========================
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      # ======================== 2. Setup .NET ========================
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # ======================== 3. Konfigurasi AWS Mock ========================
-      - name: ☁️ Configure AWS CLI (Mock)
+      - name: 📦 Prepare source
         run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/config <<EOF
-          [default]
-          region = ${AWS_REGION}
-          output = json
-          EOF
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
-          aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
-          EOF
-          echo "✅ AWS mock config created."
-
-      # ======================== 4. Simulasi Download Source dari S3 ========================
-      - name: 📦 Download Source from S3 (Mock)
-        run: |
-          echo "🔽 Simulating download: s3://${S3_BUCKET}/artifacts/sources/SOURCE_TodoWebAPI.7z"
           mkdir -p extracted_source
 
-          # Buat dummy .csproj agar build berhasil
           cat > extracted_source/TodoWebAPI.csproj <<'EOF'
           <Project Sdk="Microsoft.NET.Sdk.Web">
             <PropertyGroup>
@@ -63,75 +40,80 @@ jobs:
               <Nullable>enable</Nullable>
               <ImplicitUsings>enable</ImplicitUsings>
             </PropertyGroup>
-            <ItemGroup>
-              <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.0" />
-            </ItemGroup>
           </Project>
           EOF
 
-          # Buat Program.cs minimal
           cat > extracted_source/Program.cs <<'EOF'
           var builder = WebApplication.CreateBuilder(args);
           var app = builder.Build();
-          app.MapGet("/", () => "Hello from Ministack Mock CI/CD!");
+          app.MapGet("/", () => "Hello from GitHub Actions artifact!");
           app.Run();
           EOF
 
-          echo "✅ Mock source code ready."
-
-      # ======================== 5. Build & Publish ========================
-      - name: 🔨 Build and Publish .NET App
+      - name: 🔨 Build and publish
         run: |
-          echo "🔨 Restoring packages..."
           dotnet restore extracted_source/*.csproj
-          echo "📦 Publishing to 'publish_output'..."
           dotnet publish extracted_source/*.csproj -c Release -o publish_output
-          echo "✅ Build & publish completed."
 
-      # ======================== 6. Package & Simulasi Upload ke S3 ========================
-      - name: 📤 Package and Upload to S3 (Mock)
+      - name: 🗜️ Package publish output
         run: |
-          echo "📦 Creating webapp-binaries.zip..."
           cd publish_output
           zip -r ../webapp-binaries.zip . > /dev/null
           cd ..
-          echo "✅ Package created: webapp-binaries.zip ($(du -h webapp-binaries.zip | cut -f1))"
-          echo "☁️  Simulating upload to: s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip"
-          # Jika LocalStack tersedia, uncomment baris berikut:
-          # if [ -n "$LOCALSTACK_ENDPOINT" ]; then
-          #   aws s3 cp webapp-binaries.zip s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip --endpoint-url $LOCALSTACK_ENDPOINT
-          # fi
+          ls -lh webapp-binaries.zip
 
-      # ======================== 7. Simulasi Deploy ke EC2 ========================
-      - name: 🚀 Deploy to EC2 (Mock)
+      - name: ⬆️ Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-binaries
+          path: webapp-binaries.zip
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64]
+
+    steps:
+      - name: ⬇️ Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: webapp-binaries
+          path: ./artifact
+
+      - name: 📂 Extract artifact
         run: |
-          echo "🚀 Simulating deployment to EC2 host: ${EC2_HOST}"
+          rm -rf deploy_input
+          mkdir -p deploy_input/publish
+          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+          test -f "deploy_input/publish/${APP_DLL}"
 
-          # Ekstrak host dari RDS_ENDPOINT (untuk tampilan log)
-          RDS_HOST=$(echo "${RDS_ENDPOINT}" | cut -d':' -f1)
-
-          cat <<EOF
-          ============================================
-          🖥️  Deployment Simulation Steps:
-          ============================================
-          1. Stopping webapp service...
-          2. Downloading artifact from S3...
-          3. Extracting to /var/www/webapp...
-          4. Updating appsettings.json:
-             "DefaultConnection": "Server=${RDS_HOST};Database=${DB_NAME};User=${DB_USER};Password=******"
-          5. Starting webapp service...
-          ============================================
-          ✅ Deployment simulation completed successfully!
+      - name: 🐳 Generate Dockerfile
+        run: |
+          cat > deploy_input/Dockerfile <<EOF
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0
+          WORKDIR /app
+          EXPOSE ${CONTAINER_PORT}
+          ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
+          COPY publish/ /app/
+          ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
 
-      # ======================== 8. Summary ========================
-      - name: 📋 Pipeline Summary
+      - name: 🏗️ Build Docker image on laptop
         run: |
-          echo "========================================="
-          echo "🎉 Ministack Mock CI/CD Pipeline Selesai"
-          echo "========================================="
-          echo "• Mode:            MOCK (no real AWS)"
-          echo "• Artifact:        webapp-binaries.zip"
-          echo "• Target Server:   ${EC2_HOST}"
-          echo "• Database Server: ${RDS_ENDPOINT}"
-          echo "========================================="
+          docker build -t ${APP_NAME}:latest ./deploy_input
+
+      - name: 🧹 Remove old container
+        run: |
+          docker rm -f ${CONTAINER_NAME} || true
+
+      - name: 🚀 Run new container
+        run: |
+          docker run -d \
+            --name ${CONTAINER_NAME} \
+            -p ${HOST_PORT}:${CONTAINER_PORT} \
+            --restart unless-stopped \
+            ${APP_NAME}:latest
+
+      - name: ✅ Show running container
+        run: |
+          docker ps --filter "name=${CONTAINER_NAME}"
