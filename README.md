@@ -1,6 +1,3 @@
-Berikut versi **README.md** dalam format **code snippet GitHub** yang sudah rapi dan siap ditempel ke repository Anda. 
-
-````markdown
 # 🚀 Ministack Mock CI/CD
 
 [![CI/CD Pipeline](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions/workflows/ministack-mock-ci-cd.yml/badge.svg)](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions)
