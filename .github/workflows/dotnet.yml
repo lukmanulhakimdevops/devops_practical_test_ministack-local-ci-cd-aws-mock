@@ -1,4 +1,4 @@
-name: 🚀 Ministack CI/CD with Docker Deploy to Laptop
+name: 🛡️ DevSecOps Ministack CI/CD 
 
 on:
   push:
@@ -25,18 +25,33 @@ env:
   CONTAINER_PORT:        80
 
 jobs:
-  build:
-    name: 🔨 Build and Package
+  security_and_build:
+    name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
 
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Penting untuk scanner keamanan membaca riwayat commit
+
+      # [DevSecOps] Layer 1: Secret Scanning
+      - name: 🔐 Secret Scanning (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      # [DevSecOps] Layer 2: Software Composition Analysis (SCA)
+      - name: 📦 SCA - Audit NuGet Dependencies
+        run: |
+          echo "🔍 Checking for vulnerable NuGet packages..."
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet list TodoWebAPI/*.csproj package --vulnerable
 
       - name: ☁️ Configure AWS CLI (Mock)
         run: |
@@ -73,7 +88,6 @@ jobs:
           name: webapp-binaries
           path: webapp-binaries.zip
 
-      # --- Simulasi S3 & EC2 (mock) tetap dipertahankan ---
       - name: ☁️ Simulate S3 Upload (Mock)
         run: |
           echo "☁️  Simulating upload to: s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip"
@@ -90,15 +104,15 @@ jobs:
           2. Downloading artifact from S3...
           3. Extracting to /var/www/webapp...
           4. Updating appsettings.json:
-             "DefaultConnection": "Server=${RDS_HOST};Database=${DB_NAME};User=${DB_USER};Password=******"
+              "DefaultConnection": "Server=${RDS_HOST};Database=${DB_NAME};User=${DB_USER};Password=******"
           5. Starting webapp service...
           ============================================
           ✅ EC2 simulation completed.
           EOF
 
   deploy:
-    name: 🐳 Deploy to Laptop Docker
-    needs: build
+    name: 🐳 Container Scan & Deploy
+    needs: security_and_build
     runs-on: [self-hosted, linux, x64]
 
     steps:
@@ -128,15 +142,22 @@ jobs:
             exit 1
           fi
 
-      - name: 🐳 Create Dockerfile
+      # [DevSecOps] Layer 3: Hardened Dockerfile
+      - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
+          # Menggunakan Alpine untuk memperkecil attack surface dan menambahkan user non-root
           cat > deploy_input/Dockerfile <<EOF
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
           EXPOSE ${CONTAINER_PORT}
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
+          
+          # Security: Jalankan sebagai non-root user
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
+          USER appuser
+          
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
@@ -147,22 +168,35 @@ jobs:
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
 
+      # [DevSecOps] Layer 4: Container Vulnerability Scanning
+      - name: 🛡️ Container Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.APP_NAME }}:latest'
+          format: 'table'
+          exit-code: '1' # Set 1 agar pipeline GAGAL jika menemukan celah keamanan
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
       - name: 🧹 Remove old container
         shell: bash
         run: |
           set -euo pipefail
           docker rm -f ${CONTAINER_NAME} || true
 
-      - name: 🚀 Run new container
+      - name: 🚀 Run secure container
         shell: bash
         run: |
           set -euo pipefail
+          # Menambahkan parameter security-opt untuk keamanan ekstra pada runtime
           docker run -d \
             --name ${CONTAINER_NAME} \
             -p ${HOST_PORT}:${CONTAINER_PORT} \
             -e ASPNETCORE_ENVIRONMENT=Development \
             -e ASPNETCORE_URLS=http://+:80 \            
             --restart unless-stopped \
+            --security-opt="no-new-privileges:true" \
             ${APP_NAME}:latest
 
       - name: ✅ Show running container
