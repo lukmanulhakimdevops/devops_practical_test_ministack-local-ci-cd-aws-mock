@@ -20,23 +20,23 @@ env:
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
-  CONTAINER_PORT:        5000
+  CONTAINER_PORT:        5000   # Kestrel HTTP port inside container
 
-# ============================================================================
-# JOB 1: SAST, SCA & Build (GitHub-hosted runner)
-# ============================================================================
+# ============================================================
+# JOB 1 — SAST, SCA & Build (GitHub-hosted runner)
+# ============================================================
 jobs:
   security_and_build:
     name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🔐 Secret scanning (Gitleaks)
+      - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,58 +46,57 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: 🩹 Auto-patch vulnerable NuGet packages
+      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
         run: |
           echo "🩹 Patching Microsoft.Build to a secure version..."
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      - name: 📦 SCA – Audit NuGet dependencies
+      - name: 📦 SCA — Audit NuGet Dependencies
         run: |
           echo "🔍 Scanning NuGet packages for known vulnerabilities..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      - name: ☁️ Configure AWS CLI (mock)
+      - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/config <<EOF
           [default]
-          region = ${AWS_REGION}
-          output = json
+          region     = ${AWS_REGION}
+          output     = json
           EOF
           cat > ~/.aws/credentials <<EOF
           [default]
-          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+          aws_access_key_id     = ${AWS_ACCESS_KEY_ID}
           aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
           EOF
           echo "✅ AWS mock config created."
 
-      - name: 🔨 Build and publish .NET app
+      - name: 🔨 Build and Publish .NET App
         run: |
           echo "📦 Restoring packages..."
           dotnet restore TodoWebAPI/*.csproj
-
           echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
-      - name: 📤 Upload artifact (publish_output folder)
+      - name: 📤 Upload Artifact (publish_output folder)
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
           path: publish_output
 
-# ============================================================================
-# JOB 2: DAST, Container Scan & Deploy (self-hosted runner)
-# ============================================================================
+# ============================================================
+# JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
+# ============================================================
   deploy:
     name: 🐳 DAST, Scan & Deploy
     needs: security_and_build
     runs-on: [self-hosted, linux, x64]
 
     steps:
-      - name: 🧪 Check runner prerequisites
+      - name: 🧪 Check Runner Prerequisites
         shell: bash
         run: |
           set -euo pipefail
@@ -107,23 +106,23 @@ jobs:
           unzip -v >/dev/null
           echo "✅ All prerequisites OK."
 
-      - name: ⬇️ Download workflow artifact
+      - name: ⬇️ Download Workflow Artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: ./artifact
 
-      - name: 📂 Extract artifact (GitHub auto‑zip)
+      - name: 📂 Extract Artifact
         shell: bash
         run: |
           set -euo pipefail
           rm -rf deploy_input
           mkdir -p deploy_input/publish
-          # The downloaded artifact is a zip file named 'webapp-binaries.zip'
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
           echo "✅ Artifact extracted to deploy_input/publish/"
 
-      - name: 🐳 Create secure Dockerfile
+      # ----- Hardened Dockerfile with self-signed cert -----
+      - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
@@ -161,14 +160,14 @@ jobs:
           DOCKERFILE
           echo "✅ Dockerfile created."
 
-      - name: 🏗️ Build Docker image
+      - name: 🏗️ Build Docker Image
         shell: bash
         run: |
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
           echo "✅ Docker image built: ${APP_NAME}:latest"
 
-      - name: 🛡️ Container scan (Trivy)
+      - name: 🛡️ Container Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
@@ -178,13 +177,13 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      - name: 🧹 Remove old container
+      - name: 🧹 Remove Old Container
         shell: bash
         run: |
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
           echo "✅ Old container removed (if any)."
 
-      - name: 🚀 Run secure container (pre‑DAST)
+      - name: 🚀 Run Secure Container (Pre-DAST)
         shell: bash
         run: |
           set -euo pipefail
@@ -203,7 +202,7 @@ jobs:
             ${APP_NAME}:latest
           echo "✅ Container started: ${CONTAINER_NAME} (host:${HOST_PORT} → container:${CONTAINER_PORT})"
 
-      - name: ⏳ Wait for app readiness
+      - name: ⏳ Wait for App Readiness
         shell: bash
         run: |
           echo "⏳ Waiting for the app to become ready..."
@@ -219,7 +218,7 @@ jobs:
           docker logs ${CONTAINER_NAME}
           exit 1
 
-      - name: 🕷️ DAST scan (OWASP ZAP)
+      - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
           echo "💥 Launching DAST scan against the running container..."
@@ -234,7 +233,7 @@ jobs:
               }
           echo "✅ DAST scan passed. Application is safe."
 
-      - name: ✅ Show running container
+      - name: ✅ Show Running Container
         shell: bash
         run: |
           set -euo pipefail
