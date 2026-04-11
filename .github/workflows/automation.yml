@@ -26,7 +26,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 permissions:
-  contents: write          # Diperlukan untuk commit otomatis hasil format
+  contents: write
   security-events: write
   actions: read
   checks: write
@@ -34,11 +34,10 @@ permissions:
 defaults:
   run:
     shell: bash
-    working-directory: TodoWebAPI
 
 jobs:
   # ------------------------------------------------------------------
-  # CODE QUALITY & LINTING (Dengan auto-fix dan commit)
+  # CODE QUALITY & LINTING
   # ------------------------------------------------------------------
   lint:
     name: 🔍 Code Linting & Format
@@ -46,13 +45,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}   # Untuk push ke branch yang sama
+          ref: ${{ github.head_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Run dotnet format (auto-fix)
+        working-directory: TodoWebAPI
         run: dotnet format --no-restore
       - name: Commit formatting changes (if any)
         run: |
@@ -62,7 +62,7 @@ jobs:
           git diff --quiet && git diff --staged --quiet || (git commit -m "style: apply dotnet format" && git push)
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING (Menggunakan CodeQL sebagai pengganti)
+  # SAST & SECRET SCANNING
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -83,8 +83,8 @@ jobs:
         with:
           languages: csharp
       - name: Build CodeQL database
-        run: |
-          dotnet build TodoWebAPI/TodoWebAPI.csproj
+        working-directory: TodoWebAPI
+        run: dotnet build TodoWebAPI.csproj
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
@@ -101,8 +101,10 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Restore
+        working-directory: TodoWebAPI
         run: dotnet restore
       - name: Audit vulnerabilities
+        working-directory: TodoWebAPI
         run: dotnet list package --vulnerable --include-transitive || true
       - name: Generate SBOM (CycloneDX)
         uses: CycloneDX/gh-dotnet-generate-sbom@v1
@@ -146,14 +148,18 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Restore & Build
+        working-directory: TodoWebAPI
         run: |
           dotnet restore
           dotnet build --no-restore -c Release
       - name: Run Unit Tests
+        working-directory: TodoWebAPI
         run: dotnet test --no-build --logger trx --results-directory TestResults
       - name: Publish artifact
+        working-directory: TodoWebAPI
         run: dotnet publish -c Release -o publish_output --no-build
       - name: Zip binaries
+        working-directory: TodoWebAPI
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
@@ -161,7 +167,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
-          path: webapp-binaries.zip
+          path: TodoWebAPI/webapp-binaries.zip
           retention-days: 7
 
   # ------------------------------------------------------------------
@@ -182,6 +188,7 @@ jobs:
           path: deploy/publish
       - name: Create hardened Dockerfile for .NET app
         run: |
+          mkdir -p deploy
           cat > deploy/Dockerfile <<'EOF'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
@@ -245,7 +252,7 @@ jobs:
   infra:
     name: 🏗️ Mock Infrastructure (MiniStack)
     runs-on: [self-hosted, linux, x64]
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && hashFiles('terraform/**') != ''
     outputs:
       s3_bucket: ${{ steps.tf.outputs.s3_bucket }}
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
@@ -306,10 +313,18 @@ jobs:
           path: deploy
       - name: Build .NET application Docker image (todo-webapi)
         run: |
+          mkdir -p deploy
+          cat > deploy/Dockerfile <<'EOF'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          WORKDIR /app
+          RUN adduser -D -u 1000 appuser && chown -R appuser /app
+          USER appuser
+          COPY publish/ .
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          EOF
           docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
       - name: Build EC2 Mock container image
-        run: |
-          docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
+        run: docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
       - name: Run EC2 Mock instance (privileged for DinD)
         run: |
           docker rm -f ec2-mock-staging 2>/dev/null || true
@@ -326,11 +341,8 @@ jobs:
         run: sleep 10
       - name: Deploy application inside EC2 Mock
         run: |
-          # Salin image todo-webapi ke dalam EC2 mock (karena mount docker.sock, image host bisa diakses)
           docker exec ec2-mock-staging docker pull todo-webapi:latest || true
-          # Hentikan container aplikasi lama jika ada
           docker exec ec2-mock-staging docker rm -f todo-webapi-app 2>/dev/null || true
-          # Jalankan aplikasi di dalam EC2 mock
           docker exec ec2-mock-staging docker run -d \
             --name todo-webapi-app \
             -p 5000:5000 \
@@ -402,4 +414,3 @@ jobs:
       - name: Deployment summary
         run: |
           echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
-          echo "EC2 Mock IP: ${{ needs.infra.outputs.ec2_public_ip }}"
