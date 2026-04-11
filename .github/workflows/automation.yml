@@ -108,7 +108,7 @@ jobs:
         uses: github/codeql-action/analyze@v3
 
   # --------------------------------------------------------------------------
-  # SCA & SBOM (audit only)
+  # SCA & SBOM
   # --------------------------------------------------------------------------
   sca:
     name: 📦 SCA & SBOM
@@ -121,7 +121,7 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: 🔍 Audit NuGet vulnerabilities (report only)
+      - name: 🔍 Audit NuGet vulnerabilities
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
@@ -162,7 +162,6 @@ jobs:
       - name: 🩹 Patch Microsoft.Build vulnerability (CVE-2025-55247)
         run: |
           for proj in TodoWebAPI/*.csproj; do
-            echo "🩹 Patching $proj..."
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
@@ -174,8 +173,6 @@ jobs:
 
       - name: ✅ Verify patch
         run: |
-          echo "🔍 Checking Microsoft.Build version in deps.json..."
-          grep -o '"Microsoft.Build/[0-9.]*"' publish_output/TodoWebAPI.deps.json | head -1 || echo "Not found"
           if grep -q '"Microsoft.Build/17.8.43"' publish_output/TodoWebAPI.deps.json; then
             echo "✅ Patch verified: Microsoft.Build 17.8.43"
           else
@@ -318,7 +315,7 @@ jobs:
             echo "✅ Ministack already running."
           fi
 
-          echo "🔍 Checking Ministack health via /_localstack/health..."
+          echo "🔍 Checking Ministack health..."
           for i in $(seq 1 30); do
             if curl -sf "${{ env.MINISTACK_ENDPOINT }}/_localstack/health" | grep -q '"s3":"available"'; then
               echo "✅ Ministack healthy (attempt $i)"
@@ -371,7 +368,7 @@ jobs:
           fi
           echo "✅ Cleanup done."
 
-      - name: 📝 Create Terraform config
+      - name: 📝 Create Terraform config (FIXED syntax)
         run: |
           mkdir -p terraform
           cat > terraform/main.tf <<'TF'
@@ -415,10 +412,31 @@ jobs:
             name        = "web-sg-${var.environment}"
             description = "Allow HTTP/HTTPS and SSH"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
-            ingress { from_port = 22;  to_port = 22;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            ingress { from_port = 80;  to_port = 80;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            ingress { from_port = 443; to_port = 443; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            egress  { from_port = 0;   to_port = 0;   protocol = "-1";  cidr_blocks = ["0.0.0.0/0"] }
+
+            ingress {
+              from_port   = 22
+              to_port     = 22
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 80
+              to_port     = 80
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 443
+              to_port     = 443
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            egress {
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
           }
 
           resource "aws_instance" "web" {
@@ -483,7 +501,6 @@ jobs:
         id: discover
         run: |
           echo "🔎 Discovering MySQL container by image name..."
-          # Find any container running mysql image
           MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
             | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
             | head -1)
