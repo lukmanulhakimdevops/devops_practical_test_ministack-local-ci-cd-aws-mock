@@ -147,11 +147,8 @@ jobs:
       # ──────────────────────────────────────────────────────────
       # ── 🐳 Layer 3: Hardened Dockerfile ──────────────────────
       #
-      # APPROACH: --network host (no port mapping).
-      #   • App (appsettings Kestrel) binds HTTP:5000 and HTTPS:5001
-      #     directly on the host network — no NAT, no iptables needed.
-      #   • Access from the host: http://localhost:5000
-      #   • DAST target: http://localhost:5000
+      # Port mapping: host:80 → container:5000 (Kestrel HTTP).
+      # Requirement from spec: external users access Swagger via port 80.
       # ──────────────────────────────────────────────────────────
       - name: 🐳 Create Secure Dockerfile
         shell: bash
@@ -225,30 +222,28 @@ DOCKERFILE
         shell: bash
         run: |
           set -euo pipefail
-          # --network host: container shares host network stack directly.
-          # No port mapping needed — app is reachable at localhost:5000 (HTTP)
-          # and localhost:5001 (HTTPS) on the host.
+          # Port 80 (external/Swagger) → container port 5000 (Kestrel HTTP).
+          # Requirement: "External Users should be able to access Swagger from port 80/443".
           docker run -d \
-            --name    ${CONTAINER_NAME} \
-            --network host \
-            -e        ASPNETCORE_ENVIRONMENT=Development \
-            -e        ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
-            -e        ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            --cap-drop ALL \
+            --name  ${CONTAINER_NAME} \
+            -p      80:5000 \
+            -e      ASPNETCORE_ENVIRONMENT=Development \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
             --security-opt="no-new-privileges:true" \
             --restart unless-stopped \
             --read-only \
-            --tmpfs   /tmp \
+            --tmpfs /tmp \
             ${APP_NAME}:latest
-          echo "✅ Container started: ${CONTAINER_NAME} (--network host, app on :5000/:5001)"
+          echo "✅ Container started: ${CONTAINER_NAME} (host:80 → container:5000)"
 
       - name: ⏳ Wait for App Readiness
         shell: bash
         run: |
           echo "⏳ Waiting for the app to become ready..."
           for i in $(seq 1 12); do
-            if curl -sf http://localhost:5000/health >/dev/null 2>&1; then
-              echo "✅ App is ready after $((i * 5)) seconds (localhost:5000)."
+            if curl -sf http://localhost:80/health >/dev/null 2>&1; then
+              echo "✅ App is ready after $((i * 5)) seconds."
               exit 0
             fi
             echo "   attempt $i/12 — retrying in 5 s..."
@@ -266,7 +261,7 @@ DOCKERFILE
           docker run --rm --network="host" \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
-              -t http://localhost:5000 \
+              -t http://localhost:80 \
               -l FAIL || {
                 echo "❌ DAST found critical vulnerability — stopping container."
                 docker rm -f ${CONTAINER_NAME}
