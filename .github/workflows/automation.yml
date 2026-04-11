@@ -2,6 +2,10 @@ name: 🛡️ DevSecOps Ministack CI/CD
 
 on:
   push:
+    branches: [main, develop]
+    paths:
+      - 'TodoWebAPI/**'
+  pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -117,7 +121,7 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: 🩹 Auto-patch vulnerable NuGet packages
+      - name: 🩹 Force secure version of Microsoft.Build
         run: |
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
@@ -250,6 +254,8 @@ jobs:
           output: trivy-results.sarif
           severity: 'CRITICAL,HIGH'
           scanners: vuln
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
 
       - name: 📤 Upload Trivy SARIF
         uses: github/codeql-action/upload-sarif@v3
@@ -266,6 +272,8 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
           scanners: vuln
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
 
   # --------------------------------------------------------------------------
   # Mock Infrastructure (Ministack / Terraform)
