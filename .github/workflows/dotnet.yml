@@ -170,17 +170,17 @@ jobs:
           docker rm -f ${CONTAINER_NAME} || true
 
       - name: 🚀 Run Secure Container (Pre-DAST)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${HOST_PORT}:${CONTAINER_PORT} \
-            -e ASPNETCORE_ENVIRONMENT=Development \
-            -e ASPNETCORE_URLS=http://+:80 \            
-            --restart unless-stopped \
-            --security-opt="no-new-privileges:true" \
-            ${APP_NAME}:latest
+              shell: bash
+              run: |
+                set -euo pipefail
+                docker run -d \
+                  --name ${CONTAINER_NAME} \
+                  -p ${HOST_PORT}:${CONTAINER_PORT} \
+                  -e ASPNETCORE_ENVIRONMENT=Development \
+                  -e ASPNETCORE_URLS="http://+:80" \
+                  --restart unless-stopped \
+                  --security-opt="no-new-privileges:true" \
+                  ${APP_NAME}:latest
             
       - name: ⏳ Wait for App to be Ready
         shell: bash
