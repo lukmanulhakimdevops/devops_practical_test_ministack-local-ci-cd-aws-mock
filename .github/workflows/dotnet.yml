@@ -1,4 +1,4 @@
-name: 🛡️ DevSecOps Ministack CI/CD 
+name: 🛡️ DevSecOps Ministack CI/CD
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  # AWS Mock (simulasi)
+  # Konfigurasi AWS Mock (simulasi)
   AWS_REGION:            us-east-1
   AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -17,7 +17,7 @@ env:
   DB_USER:               ${{ secrets.DB_USER }}
   DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
 
-  # Konfigurasi Docker Deploy
+  # Konfigurasi Aplikasi & Container
   APP_DLL:               TodoWebAPI.dll
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
@@ -33,9 +33,11 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # Diperlukan untuk Gitleaks
 
-      # [DevSecOps Layer 1] Secret Scanning
+      # -------------------------------
+      # 🔐 LAYER 1: Secret Scanning
+      # -------------------------------
       - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
@@ -46,22 +48,25 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # [MANUVER PENYELAMATAN 1] Auto-Patching NuGet CVE
+      # -------------------------------
+      # 📦 LAYER 2: SCA & Auto-Patch
+      # -------------------------------
       - name: 🩹 Auto-Patch Vulnerable NuGet Packages
         run: |
           echo "🩹 Menginjeksi patch keamanan untuk Microsoft.Build..."
-          # Menimpa versi yang rentan dengan versi aman sebelum dibuild
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      # [DevSecOps Layer 2] Software Composition Analysis (SCA)
       - name: 📦 SCA - Audit NuGet Dependencies
         run: |
-          echo "🔍 Checking for vulnerable NuGet packages..."
+          echo "🔍 Memeriksa kerentanan package NuGet..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
+      # -------------------------------
+      # ☁️ AWS Mock Configuration
+      # -------------------------------
       - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
@@ -77,6 +82,9 @@ jobs:
           EOF
           echo "✅ AWS mock config created."
 
+      # -------------------------------
+      # 🔨 Build & Publish
+      # -------------------------------
       - name: 🔨 Build and Publish .NET App
         run: |
           echo "🔨 Restoring packages..."
@@ -102,20 +110,20 @@ jobs:
     runs-on: [self-hosted, linux, x64]
 
     steps:
-      - name: 🧪 Check runner prerequisites
+      - name: 🧪 Check Runner Prerequisites
         shell: bash
         run: |
           set -euo pipefail
           docker --version
           unzip -v >/dev/null
 
-      - name: ⬇️ Download workflow artifact
+      - name: ⬇️ Download Workflow Artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: ./artifact
 
-      - name: 📂 Extract artifact
+      - name: 📂 Extract Artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -123,8 +131,9 @@ jobs:
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
 
-      # [DevSecOps Layer 3] Hardened Dockerfile
-      # [MANUVER PENYELAMATAN 2] Injeksi OS Patch di Dockerfile
+      # -------------------------------
+      # 🐳 LAYER 3: Hardened Dockerfile
+      # -------------------------------
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
@@ -134,25 +143,27 @@ jobs:
           WORKDIR /app
           EXPOSE ${CONTAINER_PORT}
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
-          
-          # [PATCH] Memaksa Alpine memperbarui libcrypto & libssl untuk lolos Trivy
+
+          # 🔒 Patch OS untuk menutup CVE (libcrypto, libssl)
           RUN apk update && apk upgrade --no-cache
-          
-          # [SECURITY] Jalankan sebagai non-root
+
+          # 👤 Jalankan sebagai user non-root
           RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
           USER appuser
-          
+
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
 
-      - name: 🏗️ Build Docker image on laptop
+      - name: 🏗️ Build Docker Image
         shell: bash
         run: |
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
 
-      # [DevSecOps Layer 4] Container Vulnerability Scanning
+      # -------------------------------
+      # 🛡️ LAYER 4: Container Scan (Trivy)
+      # -------------------------------
       - name: 🛡️ Container Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
@@ -163,43 +174,59 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      - name: 🧹 Remove old container
+      # -------------------------------
+      # 🧹 Bersihkan Container Lama
+      # -------------------------------
+      - name: 🧹 Remove Old Container
         shell: bash
         run: |
           set -euo pipefail
           docker rm -f ${CONTAINER_NAME} || true
 
+      # -------------------------------
+      # 🚀 Jalankan Container (Pre‑DAST)
+      # -------------------------------
       - name: 🚀 Run Secure Container (Pre-DAST)
-              shell: bash
-              run: |
-                set -euo pipefail
-                docker run -d \
-                  --name ${CONTAINER_NAME} \
-                  -p ${HOST_PORT}:${CONTAINER_PORT} \
-                  -e ASPNETCORE_ENVIRONMENT=Development \
-                  -e ASPNETCORE_URLS="http://+:80" \
-                  --restart unless-stopped \
-                  --security-opt="no-new-privileges:true" \
-                  ${APP_NAME}:latest
-            
-      - name: ⏳ Wait for App to be Ready
         shell: bash
         run: |
-          echo "Menunggu aplikasi hidup sebelum ditembak DAST..."
-          sleep 15 
+          set -euo pipefail
+          docker run -d \
+            --name ${CONTAINER_NAME} \
+            -p ${HOST_PORT}:${CONTAINER_PORT} \
+            -e ASPNETCORE_ENVIRONMENT=Development \
+            -e ASPNETCORE_URLS="http://+:80" \
+            --restart unless-stopped \
+            --security-opt="no-new-privileges:true" \
+            ${APP_NAME}:latest
 
-      # [DevSecOps Layer 5] DAST - Dynamic Application Security Testing
+      - name: ⏳ Wait for App Readiness
+        shell: bash
+        run: |
+          echo "⏳ Menunggu aplikasi siap sebelum DAST..."
+          sleep 15
+
+      # -------------------------------
+      # 🕷️ LAYER 5: DAST (OWASP ZAP)
+      # -------------------------------
       - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
-          echo "💥 MELUNCURKAN SERANGAN DAST KE APLIKASI YANG SEDANG BERJALAN..."
+          echo "💥 Melancarkan serangan DAST ke aplikasi yang sedang berjalan..."
           docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t http://localhost:${HOST_PORT} \
-            -l FAIL || (echo "❌ DAST MENEMUKAN CELAH FATAL! MENGHANCURKAN KONTAINER!" && docker rm -f ${CONTAINER_NAME} && exit 1)
-          echo "✅ DAST SCAN LULUS! Aplikasi aman dari serangan luar."
+            -l FAIL || {
+              echo "❌ DAST menemukan celah fatal! Menghancurkan container..."
+              docker rm -f ${CONTAINER_NAME}
+              exit 1
+            }
+          echo "✅ DAST scan lulus! Aplikasi aman dari serangan luar."
 
-      - name: ✅ Show running container
+      # -------------------------------
+      # ✅ Verifikasi Akhir
+      # -------------------------------
+      - name: ✅ Show Running Container
         shell: bash
         run: |
           set -euo pipefail
           docker ps --filter "name=${CONTAINER_NAME}"
+          docker logs --tail 20 ${CONTAINER_NAME} || true
