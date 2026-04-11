@@ -1,159 +1,246 @@
-name: 🛡️ DevSecOps with RDS Mock + EC2 Mock + DAST
+name: 🛡️ DevSecOps Ministack CI/CD
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'TodoWebAPI/**'
   workflow_dispatch:
 
 env:
-  AWS_REGION:            us-east-1
-  AWS_ACCESS_KEY_ID:     dummy
-  AWS_SECRET_ACCESS_KEY: dummy
-  LOCALSTACK_ENDPOINT:   http://localhost:4566
+  AWS_REGION:            ${{ secrets.AWS_REGION || 'us-east-1' }}
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  S3_BUCKET:             ${{ secrets.S3_BUCKET }}
+  EC2_HOST:              ${{ secrets.EC2_HOST }}
+  RDS_ENDPOINT:          ${{ secrets.RDS_ENDPOINT }}
+  DB_NAME:               ${{ secrets.DB_NAME }}
+  DB_USER:               ${{ secrets.DB_USER }}
+  DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
 
   APP_DLL:               TodoWebAPI.dll
   APP_NAME:              todo-webapi
+  CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
   CONTAINER_PORT:        5000
 
-  DB_NAME:               MyWebApiDB
-  DB_USER:               tempAdmin
-  DB_PASSWORD:           !tempAdmin954*
-
 jobs:
-  build:
-    name: Build and Package
+  # ============================================================
+  # JOB 1 — SAST, SCA & Build (GitHub-hosted runner)
+  # ============================================================
+  security_and_build:
+    name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔐 Secret Scanning (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Build & Publish
+
+      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
+        run: |
+          for proj in TodoWebAPI/*.csproj; do
+            dotnet add "$proj" package Microsoft.Build --version 17.8.43
+          done
+
+      - name: 📦 SCA — Audit NuGet Dependencies
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet list TodoWebAPI/*.csproj package --vulnerable
+
+      - name: ☁️ Configure AWS CLI (mock)
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/config <<EOF
+          [default]
+          region = ${AWS_REGION}
+          output = json
+          EOF
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+          aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+          EOF
+
+      - name: 🔨 Build and Publish .NET App
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
-      - name: Zip artifact
+
+      - name: 📦 Package Artifact (manual zip)
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
           cd ..
-      - name: Upload artifact
+
+      - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
           path: webapp-binaries.zip
 
-  deploy_ec2_mock_with_rds:
-    name: Deploy to EC2 Mock + RDS Mock + DAST
-    needs: build
+  # ============================================================
+  # JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
+  # ============================================================
+  deploy:
+    name: 🐳 Deploy, Scan & DAST
+    needs: security_and_build
     runs-on: [self-hosted, linux, x64]
+
     steps:
-      - name: Start LocalStack (RDS mock)
+      - name: 🧪 Check Runner Prerequisites
+        shell: bash
         run: |
-          docker rm -f localstack 2>/dev/null || true
-          docker run -d --name localstack -p 4566:4566 -e SERVICES=rds,s3 localstack/localstack:latest
-          sleep 10
+          set -euo pipefail
+          docker --version
+          unzip -v >/dev/null
 
-      - name: Create RDS instance in LocalStack
-        run: |
-          aws --endpoint-url=http://localhost:4566 rds create-db-instance \
-            --db-instance-identifier mock-mysql \
-            --db-instance-class db.t3.micro \
-            --engine mysql \
-            --master-username ${DB_USER} \
-            --master-user-password "${DB_PASSWORD}" \
-            --allocated-storage 20 \
-            --db-name ${DB_NAME} \
-            --port 3306 \
-            --region us-east-1 || true
-          # Tidak perlu menunggu, mock langsung siap
-
-      - name: Clean old EC2 mock container
-        run: docker rm -f ec2-mock 2>/dev/null || true
-
-      - name: Start EC2 mock container with network host
-        run: |
-          docker run -d \
-            --name ec2-mock \
-            --privileged \
-            --network host \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            amazonlinux:2 \
-            /bin/bash -c "
-              yum update -y && \
-              yum install -y docker openssh-server unzip curl && \
-              service docker start && \
-              usermod -a -G docker ec2-user && \
-              /usr/sbin/sshd -D
-            "
-          sleep 15
-
-      - name: Download artifact
+      - name: ⬇️ Download Workflow Artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: ./artifact
 
-      - name: Copy artifact to EC2 mock
+      - name: 📂 Extract Artifact
+        shell: bash
         run: |
-          docker cp ./artifact/webapp-binaries.zip ec2-mock:/tmp/
-          docker exec ec2-mock bash -c "
-            mkdir -p /home/ec2-user/app && \
-            cd /home/ec2-user/app && \
-            unzip -q /tmp/webapp-binaries.zip
-          "
+          set -euo pipefail
+          rm -rf deploy_input
+          mkdir -p deploy_input/publish
+          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
+            echo "ERROR: ${APP_DLL} not found in artifact"
+            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
+            exit 1
+          fi
+          echo "✅ Artifact extracted, ${APP_DLL} present."
 
-      - name: Build and run app container inside EC2 mock (connect to RDS mock on host)
+      - name: 🐳 Create Secure Dockerfile
+        shell: bash
         run: |
-          # Karena EC2 mock menggunakan --network host, maka localhost mengarah ke host
-          docker exec ec2-mock bash -c "
-            cd /home/ec2-user/app
-            cat > Dockerfile <<'EOF'
-            FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-            WORKDIR /app
-            RUN apk add --no-cache openssl curl
-            RUN openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem -out /app/cert.pem -days 365 -nodes -subj '/CN=localhost' \
-             && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/key.pem -in /app/cert.pem -passout pass:dev
-            ENV ASPNETCORE_ENVIRONMENT=Development
-            ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-            ENV ASPNETCORE_Kestrel__Certificates__Default__Password=dev
-            RUN adduser -D appuser && chown -R appuser /app
-            USER appuser
-            COPY . .
-            ENTRYPOINT [\"dotnet\", \"TodoWebAPI.dll\"]
-            EOF
-            docker build -t todo-app .
-            docker rm -f todo-webapi 2>/dev/null || true
-            docker run -d --name todo-webapi -p 8080:8080 \
-              -e ConnectionStrings__DefaultConnection=\"Server=localhost;Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};\" \
-              --restart unless-stopped todo-app
-          "
+          cat > deploy_input/Dockerfile <<'DOCKERFILE'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
 
-      - name: Wait for app readiness (from host via localhost:8080)
+          WORKDIR /app
+
+          RUN apk update && apk upgrade --no-cache \
+           && apk add --no-cache openssl
+
+          RUN openssl req -x509 -newkey rsa:4096 \
+                -keyout /app/https-key.pem \
+                -out    /app/https-cert.pem \
+                -days   365 -nodes \
+                -subj   '/CN=localhost' \
+           && openssl pkcs12 -export \
+                -out     /app/aspnetapp.pfx \
+                -inkey   /app/https-key.pem \
+                -in      /app/https-cert.pem \
+                -passout pass:devpassword \
+           && rm /app/https-key.pem /app/https-cert.pem \
+           && apk del openssl
+
+          ENV ASPNETCORE_ENVIRONMENT=Development
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+           && chown -R appuser /app
+          USER appuser
+
+          COPY publish/ /app/
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          DOCKERFILE
+          echo "✅ Dockerfile created."
+
+      - name: 🏗️ Build Docker Image
+        shell: bash
         run: |
-          echo "Waiting for Swagger endpoint on http://localhost:8080/swagger/v1/swagger.json"
-          for i in {1..15}; do
-            if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
-              echo "✅ App ready inside EC2 mock"
+          docker build -t ${APP_NAME}:latest ./deploy_input
+          echo "✅ Docker image built: ${APP_NAME}:latest"
+
+      - name: 🛡️ Container Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.APP_NAME }}:latest'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: 🧹 Remove Old Container
+        shell: bash
+        run: |
+          docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+          echo "✅ Old container removed (if any)."
+
+      - name: 🚀 Run Secure Container (Pre-DAST)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build connection string using secrets (password may contain special chars)
+          CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};"
+          docker run -d \
+            --name  ${CONTAINER_NAME} \
+            -p      ${HOST_PORT}:${CONTAINER_PORT} \
+            -e      ASPNETCORE_ENVIRONMENT=Development \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
+            -e      ConnectionStrings__DefaultConnection="${CONNECTION_STRING}" \
+            --security-opt="no-new-privileges:true" \
+            --restart unless-stopped \
+            --read-only \
+            --tmpfs /tmp \
+            ${APP_NAME}:latest
+          echo "✅ Container started: ${CONTAINER_NAME} (host:${HOST_PORT} → container:${CONTAINER_PORT})"
+
+      - name: ⏳ Wait for App Readiness
+        shell: bash
+        run: |
+          echo "⏳ Waiting for Swagger endpoint..."
+          for i in $(seq 1 12); do
+            if curl -sf http://localhost:${HOST_PORT}/swagger/v1/swagger.json >/dev/null 2>&1; then
+              echo "✅ App is ready after $((i * 5)) seconds."
               exit 0
             fi
-            sleep 4
+            echo "   attempt $i/12 — retrying in 5 s..."
+            sleep 5
           done
-          echo "❌ App not ready"
-          docker exec ec2-mock docker logs todo-webapi
+          echo "❌ App did not become ready in 60 s. Showing logs:"
+          docker logs ${CONTAINER_NAME}
           exit 1
 
-      - name: DAST scan (OWASP ZAP) against app running in EC2 mock
+      - name: 🕷️ DAST Scan (OWASP ZAP)
+        shell: bash
         run: |
-          docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t http://localhost:8080 -l FAIL || {
-            echo "❌ DAST failed"
-            exit 1
-          }
+          echo "💥 Launching DAST scan against the running container..."
+          docker run --rm --network="host" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:${HOST_PORT} \
+              -l FAIL || {
+                echo "❌ DAST found critical vulnerability — stopping container."
+                docker rm -f ${CONTAINER_NAME}
+                exit 1
+              }
+          echo "✅ DAST scan passed. Application is safe."
 
-      - name: Show logs
+      - name: ✅ Show Running Container
+        shell: bash
         run: |
-          echo "=== App container logs ==="
-          docker exec ec2-mock docker logs --tail 20 todo-webapi
+          set -euo pipefail
+          echo "── Container status ────────────────────────────"
+          docker ps --filter "name=${CONTAINER_NAME}"
+          echo "── Last 20 log lines ───────────────────────────"
+          docker logs --tail 20 ${CONTAINER_NAME} || true
