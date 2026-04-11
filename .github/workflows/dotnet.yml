@@ -33,9 +33,9 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Penting untuk scanner keamanan membaca riwayat commit
+          fetch-depth: 0
 
-      # [DevSecOps] Layer 1: Secret Scanning
+      # [DevSecOps Layer 1] Secret Scanning
       - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
@@ -46,7 +46,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # [DevSecOps] Layer 2: Software Composition Analysis (SCA)
+      # [DevSecOps Layer 2] Software Composition Analysis (SCA)
       - name: 📦 SCA - Audit NuGet Dependencies
         run: |
           echo "🔍 Checking for vulnerable NuGet packages..."
@@ -80,7 +80,6 @@ jobs:
           cd publish_output
           zip -r ../webapp-binaries.zip .
           cd ..
-          echo "✅ webapp-binaries.zip created ($(du -h webapp-binaries.zip | cut -f1))"
 
       - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
@@ -88,30 +87,8 @@ jobs:
           name: webapp-binaries
           path: webapp-binaries.zip
 
-      - name: ☁️ Simulate S3 Upload (Mock)
-        run: |
-          echo "☁️  Simulating upload to: s3://${S3_BUCKET}/artifacts/binaries/webapp-binaries.zip"
-
-      - name: 🚀 Simulate EC2 Deploy (Mock)
-        run: |
-          echo "🚀 Simulating deployment to EC2 host: ${EC2_HOST}"
-          RDS_HOST=$(echo "${RDS_ENDPOINT}" | cut -d':' -f1)
-          cat <<EOF
-          ============================================
-          🖥️  EC2 Deployment Simulation:
-          ============================================
-          1. Stopping webapp service...
-          2. Downloading artifact from S3...
-          3. Extracting to /var/www/webapp...
-          4. Updating appsettings.json:
-              "DefaultConnection": "Server=${RDS_HOST};Database=${DB_NAME};User=${DB_USER};Password=******"
-          5. Starting webapp service...
-          ============================================
-          ✅ EC2 simulation completed.
-          EOF
-
   deploy:
-    name: 🐳 Container Scan & Deploy
+    name: 🐳 DAST, Scan & Deploy
     needs: security_and_build
     runs-on: [self-hosted, linux, x64]
 
@@ -136,28 +113,19 @@ jobs:
           rm -rf deploy_input
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: ${APP_DLL} not found in artifact"
-            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
-            exit 1
-          fi
 
-      # [DevSecOps] Layer 3: Hardened Dockerfile
+      # [DevSecOps Layer 3] Hardened Dockerfile
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
-          # Menggunakan Alpine untuk memperkecil attack surface dan menambahkan user non-root
           cat > deploy_input/Dockerfile <<EOF
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
           EXPOSE ${CONTAINER_PORT}
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
-          
-          # Security: Jalankan sebagai non-root user
           RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
           USER appuser
-          
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
@@ -168,13 +136,13 @@ jobs:
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
 
-      # [DevSecOps] Layer 4: Container Vulnerability Scanning
+      # [DevSecOps Layer 4] Container Vulnerability Scanning
       - name: 🛡️ Container Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
           format: 'table'
-          exit-code: '1' # Set 1 agar pipeline GAGAL jika menemukan celah keamanan
+          exit-code: '1'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
@@ -185,11 +153,10 @@ jobs:
           set -euo pipefail
           docker rm -f ${CONTAINER_NAME} || true
 
-      - name: 🚀 Run secure container
+      - name: 🚀 Run Secure Container (Pre-DAST)
         shell: bash
         run: |
           set -euo pipefail
-          # Menambahkan parameter security-opt untuk keamanan ekstra pada runtime
           docker run -d \
             --name ${CONTAINER_NAME} \
             -p ${HOST_PORT}:${CONTAINER_PORT} \
@@ -198,10 +165,27 @@ jobs:
             --restart unless-stopped \
             --security-opt="no-new-privileges:true" \
             ${APP_NAME}:latest
+            
+      - name: ⏳ Wait for App to be Ready
+        shell: bash
+        run: |
+          echo "Menunggu aplikasi hidup sebelum ditembak DAST..."
+          sleep 15 # Beri waktu container untuk fully startup
+
+      # [DevSecOps Layer 5] DAST - Dynamic Application Security Testing
+      - name: 🕷️ DAST Scan (OWASP ZAP)
+        shell: bash
+        run: |
+          echo "💥 MELUNCURKAN SERANGAN DAST KE APLIKASI YANG SEDANG BERJALAN..."
+          # Menjalankan kontainer ZAP dengan network "host" agar bisa menembak localhost:8080 di laptop lo
+          # Parameter -l FAIL memastikan pipeline gagal (exit code 1) jika ditemukan kerentanan
+          docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:${HOST_PORT} \
+            -l FAIL || (echo "❌ DAST MENEMUKAN CELAH FATAL! MENGHANCURKAN KONTAINER!" && docker rm -f ${CONTAINER_NAME} && exit 1)
+          echo "✅ DAST SCAN LULUS! Aplikasi aman dari serangan luar."
 
       - name: ✅ Show running container
         shell: bash
         run: |
           set -euo pipefail
           docker ps --filter "name=${CONTAINER_NAME}"
-          docker logs --tail 20 ${CONTAINER_NAME} || true
