@@ -22,21 +22,21 @@ env:
   HOST_PORT:             8080
   CONTAINER_PORT:        5000   # Kestrel HTTP port inside container
 
-# =============================================================================
-# JOB 1: SAST, SCA & Build (GitHub-hosted runner)
-# =============================================================================
+# ============================================================
+# JOB 1 — SAST, SCA & Build (GitHub-hosted runner)
+# ============================================================
 jobs:
   security_and_build:
     name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🔐 Secret scanning (Gitleaks)
+      - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,20 +46,20 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: 🩹 Auto-patch vulnerable NuGet packages
+      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
         run: |
           echo "🩹 Patching Microsoft.Build to a secure version..."
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      - name: 📦 SCA – Audit NuGet dependencies
+      - name: 📦 SCA — Audit NuGet Dependencies
         run: |
           echo "🔍 Scanning NuGet packages for known vulnerabilities..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      - name: ☁️ Configure AWS CLI (mock)
+      - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/config <<EOF
@@ -74,25 +74,32 @@ jobs:
           EOF
           echo "✅ AWS mock config created."
 
-      - name: 🔨 Build and publish .NET app
+      - name: 🔨 Build and Publish .NET App
         run: |
           echo "📦 Restoring packages..."
           dotnet restore TodoWebAPI/*.csproj
           echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
-      - name: 📤 Upload artifact (publish_output folder)
+      - name: 📦 Package Artifact (manual zip)
+        run: |
+          cd publish_output
+          zip -r ../webapp-binaries.zip .
+          cd ..
+          echo "✅ webapp-binaries.zip created"
+
+      - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
-          path: publish_output
+          path: webapp-binaries.zip
 
-# =============================================================================
-# JOB 2: DAST, Container Scan & Deploy (self-hosted runner)
-# =============================================================================
+# ============================================================
+# JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
+# ============================================================
   deploy:
     name: 🐳 Deploy to Laptop Docker
-    needs: security_and_build   # fixed: was 'build'
+    needs: security_and_build
     runs-on: [self-hosted, linux, x64]
 
     steps:
