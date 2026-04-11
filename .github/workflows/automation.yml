@@ -47,7 +47,6 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   DB_NAME: ${{ secrets.DB_NAME || 'MyWebApiDB' }}
   DR_FALLBACK_REGION: ${{ secrets.DR_FALLBACK_REGION || 'us-east-2' }}
-  # DR simulation thresholds (dalam detik)
   DR_RTO_LIMIT: 120
   DR_RPO_LIMIT: 60
   DR_HEALTH_CHECK_THRESHOLD: 3
@@ -277,7 +276,7 @@ jobs:
           path: sbom.spdx.json
 
   # ------------------------------------------------------------------
-  # DR CHECK - Region Health + RTO/RPO Simulation
+  # DR CHECK
   # ------------------------------------------------------------------
   dr-check:
     name: 🩺 DR Health Check & Failover Decision
@@ -294,61 +293,30 @@ jobs:
           FALLBACK="${{ github.event.inputs.fallback_region || env.DR_FALLBACK_REGION }}"
           if [ -z "$FALLBACK" ]; then FALLBACK="us-east-2"; fi
           echo "fallback_region=$FALLBACK" >> $GITHUB_OUTPUT
-
       - name: Simulate health check and DR decision
         id: dr
         run: |
-          # --- 1. Simulasi health status region target ---
-          # Dalam produksi nyata, ini berasal dari CloudWatch/Route53
           TARGET_REGION="${{ env.AWS_REGION_TARGET }}"
-          echo "Target region: $TARGET_REGION"
-
-          # Simulasi: kadang region target dianggap tidak sehat untuk demo
-          # (Bisa diganti dengan pengecekan DNS seperti sebelumnya)
           ACTIVE_REGION=$(dig +short global.health.amazonaws.com CNAME | sed -n 's/.*health\.\([^.]*\)\.amazonaws\.com\..*/\1/p' | head -1)
-          if [ -z "$ACTIVE_REGION" ]; then
-            ACTIVE_REGION="unknown"
-          fi
-          echo "Active AWS Health region (DNS): $ACTIVE_REGION"
-
-          # Simulasi RTO/RPO breach (dalam detik) - nilai dummy
-          DOWNTIME_SECONDS=0
-          REPLICATION_LAG=0
-
-          # Jika manual override diaktifkan, paksa failover
+          if [ -z "$ACTIVE_REGION" ]; then ACTIVE_REGION="unknown"; fi
           MANUAL_OVERRIDE="${{ github.event.inputs.manual_dr_trigger || 'false' }}"
           FAILOVER_TRIGGERED="false"
-
-          # Logika keputusan failover
+          DOWNTIME_SECONDS=0
           if [ "$MANUAL_OVERRIDE" == "true" ]; then
-            echo "🛑 Manual DR override triggered. Forcing failover."
             FAILOVER_TRIGGERED="true"
             DOWNTIME_SECONDS=999
           elif [ "$ACTIVE_REGION" != "$TARGET_REGION" ] && [ "$ACTIVE_REGION" != "unknown" ]; then
-            echo "⚠️ Health check failed: target region $TARGET_REGION is not active ($ACTIVE_REGION)."
             FAILOVER_TRIGGERED="true"
-            DOWNTIME_SECONDS=300   # simulasi 5 menit downtime
-          else
-            echo "✅ Target region is healthy. No failover needed."
+            DOWNTIME_SECONDS=300
           fi
-
           FINAL_REGION="$TARGET_REGION"
           if [ "$FAILOVER_TRIGGERED" == "true" ]; then
             FINAL_REGION="${{ steps.fallback.outputs.fallback_region }}"
-            echo "🔄 Failover to region: $FINAL_REGION"
           fi
-
           echo "selected_region=$FINAL_REGION" >> $GITHUB_OUTPUT
           echo "failover_triggered=$FAILOVER_TRIGGERED" >> $GITHUB_OUTPUT
           echo "downtime_seconds=$DOWNTIME_SECONDS" >> $GITHUB_OUTPUT
-
-          # Tampilkan ringkasan parameter DR
-          echo "📊 DR Decision Summary:"
-          echo "   - Target Region      : $TARGET_REGION"
-          echo "   - Active Region      : $ACTIVE_REGION"
-          echo "   - Failover Triggered : $FAILOVER_TRIGGERED"
-          echo "   - Selected Region    : $FINAL_REGION"
-          echo "   - Downtime (sim)     : ${DOWNTIME_SECONDS}s"
+          echo "DR Decision: target=$TARGET_REGION, active=$ACTIVE_REGION, failover=$FAILOVER_TRIGGERED, region=$FINAL_REGION"
 
   # ------------------------------------------------------------------
   # MOCK INFRASTRUCTURE (Ministack + Terraform)
@@ -371,18 +339,11 @@ jobs:
       - name: Ensure Ministack container is running
         run: |
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "Ministack container not running. Starting..."
             docker run -d --name ministack -p 4566:4566 nahuelnucera/ministack:latest
-            echo "Waiting for Ministack to be ready..."
             sleep 15
-          else
-            echo "✅ Ministack container is already running."
           fi
           for i in {1..10}; do
-            if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
-              echo "✅ Ministack is healthy."
-              break
-            fi
+            if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then break; fi
             sleep 3
           done
       - name: Clean up leftover resources
@@ -394,18 +355,11 @@ jobs:
         run: |
           ENV_NAME=${{ github.event.inputs.environment || 'staging' }}
           INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" --query "Reservations[].Instances[].InstanceId" --output text)
-          if [ -n "$INSTANCE_ID" ]; then
-            aws ec2 terminate-instances --instance-ids $INSTANCE_ID
-            sleep 10
-          fi
+          if [ -n "$INSTANCE_ID" ]; then aws ec2 terminate-instances --instance-ids $INSTANCE_ID; sleep 10; fi
           SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=web-sg-${ENV_NAME}" --query "SecurityGroups[].GroupId" --output text)
-          if [ -n "$SG_ID" ] && [ "$SG_ID" != "default" ]; then
-            aws ec2 delete-security-group --group-id $SG_ID || true
-          fi
-          for bucket in $(aws s3 ls | awk '{print $3}' | grep "^app-bucket-${ENV_NAME}"); do
-            aws s3 rb s3://$bucket --force || true
-          done
-      - name: Create Terraform files
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "default" ]; then aws ec2 delete-security-group --group-id $SG_ID || true; fi
+          for bucket in $(aws s3 ls | awk '{print $3}' | grep "^app-bucket-${ENV_NAME}"); do aws s3 rb s3://$bucket --force || true; done
+      - name: Create Terraform files (HCL valid)
         run: |
           mkdir -p terraform
           cd terraform
@@ -427,27 +381,48 @@ jobs:
             }
           }
           resource "aws_security_group" "web_sg" {
-            name = "web-sg-${var.environment}"
+            name        = "web-sg-${var.environment}"
             description = "Allow HTTP and SSH"
-            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps-Ministack" }
-            ingress { from_port = 22; to_port = 22; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            ingress { from_port = 5000; to_port = 5000; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            egress { from_port = 0; to_port = 0; protocol = "-1"; cidr_blocks = ["0.0.0.0/0"] }
+            tags = {
+              Name    = "web-sg-${var.environment}"
+              Project = "DevSecOps-Ministack"
+            }
+            ingress {
+              from_port   = 22
+              to_port     = 22
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 5000
+              to_port     = 5000
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            egress {
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
           }
           resource "aws_instance" "web" {
-            ami = "ami-0ff8a91507f77f867"
+            ami           = "ami-0ff8a91507f77f867"
             instance_type = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps-Ministack" }
+            tags = {
+              Name    = "web-server-${var.environment}"
+              Project = "DevSecOps-Ministack"
+            }
           }
           resource "aws_s3_bucket" "app_bucket" {
             bucket = "app-bucket-${var.environment}-${random_id.bucket_suffix.hex}"
             tags = { Project = "DevSecOps-Ministack" }
           }
           resource "random_id" "bucket_suffix" { byte_length = 4 }
-          output "s3_bucket" { value = aws_s3_bucket.app_bucket.bucket }
-          output "rds_endpoint" { value = "${{ secrets.RDS_ENDPOINT }}" }
-          output "ec2_public_ip" { value = aws_instance.web.public_ip }
+          output "s3_bucket"       { value = aws_s3_bucket.app_bucket.bucket }
+          output "rds_endpoint"    { value = "${{ secrets.RDS_ENDPOINT }}" }
+          output "ec2_public_ip"   { value = aws_instance.web.public_ip }
           EOF
       - name: Configure AWS CLI
         run: |
@@ -488,47 +463,35 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # DATABASE INITIALIZATION dengan Health Check
+  # DATABASE INITIALIZATION (dengan health check loop)
   # ------------------------------------------------------------------
   db-init:
-    name: 🗄️ Initialize Database (with MySQL health check)
+    name: 🗄️ Initialize Database
     runs-on: [self-hosted, linux, x64]
     needs: [infra]
     if: github.event_name != 'pull_request'
     steps:
-      - name: Wait for MySQL container and execute DDL
+      - name: Execute SQL DDL on MySQL container
         run: |
-          echo "Waiting for Ministack MySQL container to be ready..."
-          MAX_RETRIES=12
-          RETRY=0
-          while [ $RETRY -lt $MAX_RETRIES ]; do
+          echo "Waiting for MySQL container..."
+          for i in {1..12}; do
             MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E 'ministack.*mysql' | head -1)
-            if [ -n "$MYSQL_CONTAINER" ]; then
-              # Coba ping MySQL
-              if docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} --silent 2>/dev/null; then
-                echo "✅ MySQL container '$MYSQL_CONTAINER' is ready."
-                break
-              fi
+            if [ -n "$MYSQL_CONTAINER" ] && docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} --silent 2>/dev/null; then
+              echo "✅ MySQL ready."
+              break
             fi
-            echo "MySQL not ready yet. Retrying... ($((RETRY+1))/$MAX_RETRIES)"
             sleep 5
-            RETRY=$((RETRY+1))
           done
-          if [ $RETRY -ge $MAX_RETRIES ]; then
-            echo "❌ MySQL container not found or not ready after $MAX_RETRIES attempts."
-            exit 1
-          fi
-
-          cat > init.sql <<'EOF'
+          if [ -z "$MYSQL_CONTAINER" ]; then echo "❌ MySQL not found."; exit 1; fi
+          cat > init.sql <<'EOS'
           CREATE TABLE IF NOT EXISTS TodoItems (
               Id INT PRIMARY KEY AUTO_INCREMENT,
               Name VARCHAR(255) NULL,
               IsComplete TINYINT(1) NOT NULL
           );
-          EOF
-
+          EOS
           docker exec -i $MYSQL_CONTAINER mysql -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} ${{ env.DB_NAME }} < init.sql
-          echo "✅ Database '${{ env.DB_NAME }}' initialized successfully."
+          echo "✅ Database initialized."
 
   # ------------------------------------------------------------------
   # DEPLOY TO STAGING
@@ -548,9 +511,9 @@ jobs:
         with:
           name: webapp-binaries
           path: deploy
-      - name: Build .NET application Docker image
+      - name: Build .NET app image
         run: docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Create EC2 Mock container image
+      - name: Create EC2 Mock image
         run: |
           cat > ec2-mock.Dockerfile <<'EOF'
           FROM alpine:latest
@@ -570,14 +533,13 @@ jobs:
           EOF
           chmod +x ec2-mock-entrypoint.sh
           docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
-      - name: Run EC2 Mock instance
+      - name: Run EC2 Mock
         run: |
           docker rm -f ec2-mock-staging 2>/dev/null || true
           docker run -d --privileged --name ec2-mock-staging -p 8080:5000 -v /var/run/docker.sock:/var/run/docker.sock ec2-mock:latest
-      - name: Wait for EC2 Mock
-        run: sleep 10
       - name: Deploy app inside EC2 Mock
         run: |
+          sleep 10
           docker exec ec2-mock-staging docker pull todo-webapi:latest || true
           docker exec ec2-mock-staging docker rm -f todo-webapi-app 2>/dev/null || true
           docker exec ec2-mock-staging docker run -d --name todo-webapi-app -p 5000:5000 \
@@ -586,10 +548,7 @@ jobs:
       - name: Health check
         run: |
           for i in {1..12}; do
-            if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
-              echo "✅ Staging ready (EC2 mock IP: ${{ needs.infra.outputs.ec2_public_ip }})"
-              exit 0
-            fi
+            if curl -sf http://localhost:8080/swagger/v1/swagger.json; then echo "✅ Staging ready"; exit 0; fi
             sleep 5
           done
           echo "❌ Health check failed"; exit 1
@@ -609,11 +568,11 @@ jobs:
       name: production-mock
       url: http://${{ needs.infra.outputs.ec2_public_ip }}:8081
     steps:
-      - name: Run EC2 Mock instance for production
+      - name: Run EC2 Mock for production
         run: |
           docker rm -f ec2-mock-prod 2>/dev/null || true
           docker run -d --privileged --name ec2-mock-prod -p 8081:5000 -v /var/run/docker.sock:/var/run/docker.sock ec2-mock:latest
-      - name: Deploy app inside production EC2 mock
+      - name: Deploy app inside production EC2 Mock
         run: |
           sleep 10
           docker exec ec2-mock-prod docker pull todo-webapi:latest || true
@@ -636,6 +595,6 @@ jobs:
       - name: Deployment summary
         run: |
           echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
-          echo "Selected region (after DR check): ${{ needs.dr-check.outputs.selected_region }}"
+          echo "Selected region (after DR): ${{ needs.dr-check.outputs.selected_region }}"
           echo "Failover triggered: ${{ needs.dr-check.outputs.failover_triggered }}"
           echo "EC2 Mock IP: ${{ needs.infra.outputs.ec2_public_ip }}"
