@@ -49,9 +49,6 @@ defaults:
     shell: bash
 
 jobs:
-  # ------------------------------------------------------------------
-  # 🔍 LINT
-  # ------------------------------------------------------------------
   lint:
     name: 🔍 Code Linting
     runs-on: ubuntu-latest
@@ -67,9 +64,6 @@ jobs:
       - name: Run dotnet format
         run: dotnet format --verify-no-changes --no-restore
 
-  # ------------------------------------------------------------------
-  # 🛡️ SAST (Gitleaks + CodeQL)
-  # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
     runs-on: ubuntu-latest
@@ -99,9 +93,6 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  # ------------------------------------------------------------------
-  # 📦 SCA
-  # ------------------------------------------------------------------
   sca:
     name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
@@ -129,9 +120,6 @@ jobs:
           name: sbom
           path: TodoWebAPI/sbom.xml
 
-  # ------------------------------------------------------------------
-  # 🔨 BUILD
-  # ------------------------------------------------------------------
   build:
     name: 🔨 Build & Test
     runs-on: ubuntu-latest
@@ -169,9 +157,6 @@ jobs:
           path: TodoWebAPI/webapp-binaries.zip
           retention-days: 7
 
-  # ------------------------------------------------------------------
-  # 🐳 CONTAINER BUILD & TRIVY SCAN
-  # ------------------------------------------------------------------
   container:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
@@ -231,9 +216,6 @@ jobs:
         env:
           DOCKER_HOST: unix:///var/run/docker.sock
 
-  # ------------------------------------------------------------------
-  # 🧠 DR DECISION
-  # ------------------------------------------------------------------
   dr-check:
     name: 🧠 DR Decision
     runs-on: ubuntu-latest
@@ -253,9 +235,6 @@ jobs:
           echo "failover=$FAIL" >> $GITHUB_OUTPUT
           echo "🔄 DR Decision: region=$REGION, failover=$FAIL"
 
-  # ------------------------------------------------------------------
-  # 🏗️ INFRA (MINISTACK + TERRAFORM)
-  # ------------------------------------------------------------------
   infra:
     name: 🏗️ Mock Infrastructure (Ministack)
     runs-on: [self-hosted, linux, x64]
@@ -281,7 +260,6 @@ jobs:
               nahuelnucera/ministack:latest
             sleep 20
           fi
-          
           for i in {1..30}; do
             if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
               echo "✅ Ministack is healthy"
@@ -290,9 +268,7 @@ jobs:
             echo "⏳ Waiting for Ministack... ($i/30)"
             sleep 5
           done
-          
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -i mysql || echo "⚠️ MySQL container not visible yet"
-          
       - name: Clean up leftover resources (force cleanup)
         env:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
@@ -302,7 +278,6 @@ jobs:
         run: |
           ENV_NAME=${{ github.event.inputs.environment || 'staging' }}
           echo "🧹 Cleaning up leftover resources for environment: $ENV_NAME"
-
           INSTANCE_ID=$(aws ec2 describe-instances \
             --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
             --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" \
@@ -312,7 +287,6 @@ jobs:
             aws ec2 terminate-instances --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --instance-ids $INSTANCE_ID
             sleep 10
           fi
-
           SG_ID=$(aws ec2 describe-security-groups \
             --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
             --filters "Name=group-name,Values=web-sg-${ENV_NAME}" \
@@ -321,13 +295,11 @@ jobs:
             echo "🗑️ Deleting existing security group: $SG_ID"
             aws ec2 delete-security-group --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --group-id $SG_ID || true
           fi
-
           BUCKET_NAME=$(aws s3api list-buckets --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --query "Buckets[?contains(Name, 'app-bucket-${ENV_NAME}')].Name" --output text 2>/dev/null || true)
           if [ -n "$BUCKET_NAME" ] && [ "$BUCKET_NAME" != "None" ]; then
             echo "🗑️ Deleting existing S3 bucket: $BUCKET_NAME"
             aws s3 rb s3://$BUCKET_NAME --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --force || true
           fi
-
       - name: Create Terraform files
         run: |
           mkdir -p terraform
@@ -336,7 +308,6 @@ jobs:
           variable "ministack_endpoint" { default = "http://localhost:4566" }
           variable "environment" { default = "staging" }
           variable "aws_region" { default = "us-east-1" }
-          
           provider "aws" {
             region = var.aws_region
             access_key = "test"
@@ -353,12 +324,10 @@ jobs:
               iam = var.ministack_endpoint
             }
           }
-          
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-${var.environment}"
             description = "Allow HTTP and SSH"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps-Ministack" }
-            
             ingress {
               from_port   = 22
               to_port     = 22
@@ -378,25 +347,20 @@ jobs:
               cidr_blocks = ["0.0.0.0/0"]
             }
           }
-          
           resource "aws_instance" "web" {
             ami           = "ami-0ff8a91507f77f867"
             instance_type = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
             tags = { Name = "web-server-${var.environment}", Project = "DevSecOps-Ministack" }
           }
-          
           resource "aws_s3_bucket" "app_bucket" {
             bucket = "app-bucket-${var.environment}-${random_id.bucket_suffix.hex}"
             tags = { Project = "DevSecOps-Ministack" }
           }
-          
           resource "random_id" "bucket_suffix" { byte_length = 4 }
-          
           output "s3_bucket"       { value = aws_s3_bucket.app_bucket.bucket }
           output "ec2_public_ip"   { value = aws_instance.web.public_ip }
           EOF
-          
       - name: Configure AWS CLI for Ministack
         run: |
           mkdir -p ~/.aws
@@ -411,7 +375,6 @@ jobs:
           endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
           output = json
           EOF
-          
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
@@ -429,9 +392,6 @@ jobs:
           echo "s3_bucket=$(terraform output -raw s3_bucket)" >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
-  # ------------------------------------------------------------------
-  # 🗄️ RDS INIT (trigger Ministack API)
-  # ------------------------------------------------------------------
   rds-init:
     name: 🗄️ Init RDS (Ministack)
     runs-on: [self-hosted, linux, x64]
@@ -452,7 +412,6 @@ jobs:
           output = json
           endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
           EOF
-          
       - name: Create RDS MySQL via Ministack API
         run: |
           echo "🗄️ Creating RDS MySQL instance via Ministack API..."
@@ -469,7 +428,6 @@ jobs:
             --no-publicly-accessible \
             --tags Key=Project,Value=DevSecOps-Ministack \
             || echo "⚠️ RDS instance may already exist"
-            
       - name: Wait for RDS to be available
         run: |
           echo "⏳ Waiting for RDS instance to become available..."
@@ -478,9 +436,7 @@ jobs:
             STATUS=$(aws --endpoint-url=${{ env.MINISTACK_ENDPOINT }} rds describe-db-instances \
               --db-instance-identifier ministack-mysql \
               --query "DBInstances[0].DBInstanceStatus" --output text 2>/dev/null || echo "unknown")
-            
             echo "📊 Attempt $i/$MAX_RETRIES - Status: $STATUS"
-            
             if [[ "$STATUS" == "available" ]]; then
               echo "✅ RDS instance is available"
               exit 0
@@ -495,9 +451,6 @@ jobs:
           echo "❌ Timeout waiting for RDS instance"
           exit 1
 
-  # ------------------------------------------------------------------
-  # 🗄️ DB INIT (Create tables) - ROBUST VERSION
-  # ------------------------------------------------------------------
   db-init:
     name: 🗂️ Initialize DB Tables
     runs-on: [self-hosted, linux, x64]
@@ -506,17 +459,10 @@ jobs:
     outputs:
       mysql_endpoint: ${{ steps.discover-endpoint.outputs.endpoint }}
     steps:
-      - name: Debug - List Running Containers
-        run: |
-          echo "🔍 Listing all containers for debugging..."
-          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
-          docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -iE 'mysql|ministack' || echo "⚠️ No MySQL-related containers found"
-          
       - name: Discover MySQL Endpoint
         id: discover-endpoint
         run: |
           echo "🔎 Discovering MySQL endpoint..."
-          
           MYSQL_CONTAINER=""
           for pattern in ".*mysql.*" "^mysql$" "ministack.*mysql" "localstack.*mysql" ".*_mysql_.*"; do
             MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE "$pattern" | head -1)
@@ -525,16 +471,13 @@ jobs:
               break
             fi
           done
-          
           if [ -z "$MYSQL_CONTAINER" ]; then
             echo "❌ ERROR: MySQL container not found!"
             echo "📋 All running containers:"
             docker ps --format '{{.Names}} ({{.Image}})'
             exit 1
           fi
-          
           EXPOSED_PORT=$(docker port $MYSQL_CONTAINER 3306/tcp 2>/dev/null | cut -d: -f2 | head -1)
-          
           if [ -n "$EXPOSED_PORT" ]; then
             ENDPOINT="localhost:$EXPOSED_PORT"
             echo "✅ MySQL endpoint (exposed port): $ENDPOINT"
@@ -542,18 +485,18 @@ jobs:
             ENDPOINT="${MYSQL_CONTAINER}:3306"
             echo "✅ MySQL endpoint (container name): $ENDPOINT"
           fi
-          
           echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
           echo "container=$MYSQL_CONTAINER" >> $GITHUB_OUTPUT
-          
+          # Debugging - List all containers
+          echo "🔍 Listing all containers for debugging..."
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
+          docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -iE 'mysql|ministack' || echo "⚠️ No MySQL-related containers found"
       - name: Wait for MySQL to be ready
         run: |
           MYSQL_CONTAINER="${{ steps.discover-endpoint.outputs.container }}"
           echo "⏳ Waiting for MySQL in container '$MYSQL_CONTAINER' to accept connections..."
-          
           MAX_RETRIES=60
           RETRY_COUNT=0
-          
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             if docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ env.DB_USER }} --silent 2>/dev/null || \
                docker exec $MYSQL_CONTAINER mysqladmin ping -uroot --silent 2>/dev/null || \
@@ -562,7 +505,6 @@ jobs:
               echo "✅ MySQL is ready and accepting connections"
               break
             fi
-            
             RETRY_COUNT=$((RETRY_COUNT + 1))
             if [ $((RETRY_COUNT % 10)) -eq 0 ]; then
               echo "⏳ Still waiting... ($RETRY_COUNT/$MAX_RETRIES)"
@@ -570,33 +512,27 @@ jobs:
             fi
             sleep 5
           done
-          
           if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
             echo "❌ ERROR: MySQL failed to become ready after $MAX_RETRIES attempts"
             echo "📋 Last 50 lines of MySQL container logs:"
             docker logs $MYSQL_CONTAINER --tail 50 2>&1 || echo "⚠️ Could not fetch logs"
             exit 1
           fi
-          
       - name: Create database and tables
-        env:
-          DB_PASSWORD_QUOTED: '${{ env.DB_PASSWORD }}'
         run: |
           MYSQL_CONTAINER="${{ steps.discover-endpoint.outputs.container }}"
           echo "🗄️ Creating database ${{ env.DB_NAME }} and tables..."
-          
-          echo "📦 Creating database..."
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"$DB_PASSWORD_QUOTED" \
+          # Create database
+          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" \
             -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>&1 || {
               echo "⚠️ Fallback: Trying with root user..."
               docker exec -i $MYSQL_CONTAINER mysql -uroot \
                 -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            }
-          
+          }
+          # Create tables
           cat > /tmp/init.sql <<'EOSQL'
           SET NAMES utf8mb4;
           SET FOREIGN_KEY_CHECKS = 0;
-          
           CREATE TABLE IF NOT EXISTS TodoItems (
               Id INT PRIMARY KEY AUTO_INCREMENT,
               Name VARCHAR(255) NULL,
@@ -606,31 +542,24 @@ jobs:
               INDEX idx_iscomplete (IsComplete),
               INDEX idx_name (Name)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-          
           SET FOREIGN_KEY_CHECKS = 1;
           EOSQL
-          
           echo "📋 Creating tables..."
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"$DB_PASSWORD_QUOTED" ${{ env.DB_NAME }} < /tmp/init.sql 2>&1 || {
+          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" ${{ env.DB_NAME }} < /tmp/init.sql 2>&1 || {
             echo "⚠️ Fallback: Trying with root user..."
             docker exec -i $MYSQL_CONTAINER mysql -uroot ${{ env.DB_NAME }} < /tmp/init.sql
           }
-          
           echo "✅ Database and tables initialized successfully."
-          
+          # Verify setup
           echo "🔍 Verifying setup..."
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"$DB_PASSWORD_QUOTED" ${{ env.DB_NAME }} -e "SHOW TABLES; SELECT COUNT(*) as row_count FROM TodoItems;" 2>/dev/null || \
+          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" ${{ env.DB_NAME }} -e "SHOW TABLES; SELECT COUNT(*) as row_count FROM TodoItems;" 2>/dev/null || \
           docker exec -i $MYSQL_CONTAINER mysql -uroot ${{ env.DB_NAME }} -e "SHOW TABLES; SELECT COUNT(*) as row_count FROM TodoItems;"
-          
       - name: Update RDS_ENDPOINT for downstream jobs
         run: |
           ENDPOINT="${{ steps.discover-endpoint.outputs.endpoint }}"
           echo "🔄 Setting RDS_ENDPOINT=$ENDPOINT for downstream jobs"
           echo "RDS_ENDPOINT=$ENDPOINT" >> $GITHUB_ENV
 
-  # ------------------------------------------------------------------
-  # 🔁 DB REPLICATION MOCK
-  # ------------------------------------------------------------------
   db-replication:
     name: 🔁 DB Replication Mock
     runs-on: [self-hosted, linux, x64]
@@ -644,9 +573,6 @@ jobs:
           fi
           echo "✅ Replication mock completed"
 
-  # ------------------------------------------------------------------
-  # 🚀 DEPLOY (EC2 Mock container)
-  # ------------------------------------------------------------------
   deploy:
     name: 🚀 Deploy Application
     runs-on: [self-hosted, linux, x64]
@@ -677,7 +603,6 @@ jobs:
           set -e
           echo "🚀 Starting Docker daemon in EC2 mock..."
           dockerd > /var/log/docker.log 2>&1 &
-          
           for i in {1..30}; do
             if [ -S /var/run/docker.sock ]; then
               echo "✅ Docker socket ready"
@@ -685,13 +610,11 @@ jobs:
             fi
             sleep 2
           done
-          
           echo "🔄 EC2 mock container ready. Keeping alive..."
           tail -f /dev/null
           EOF
           chmod +x ec2-mock-entrypoint.sh
           docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
-          
       - name: Run EC2 Mock and deploy app
         run: |
           BASE_PORT=8080
@@ -701,16 +624,13 @@ jobs:
           else
             echo "✅ Primary region: Using port $BASE_PORT"
           fi
-          
           docker rm -f ec2-mock-app todo-webapi-app 2>/dev/null || true
-          
           echo "🖥️  Starting EC2 mock container..."
           docker run -d --privileged \
             --name ec2-mock-app \
             -p $BASE_PORT:5000 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             ec2-mock:latest
-          
           echo "⏳ Waiting for DinD to be ready..."
           for i in {1..20}; do
             if docker exec ec2-mock-app docker info &>/dev/null; then
@@ -719,14 +639,11 @@ jobs:
             fi
             sleep 3
           done
-          
           echo "📦 Deploying application container..."
           docker exec ec2-mock-app docker pull todo-webapi:latest || true
           docker exec ec2-mock-app docker rm -f todo-webapi-app 2>/dev/null || true
-          
           MYSQL_ENDPOINT="${{ env.RDS_ENDPOINT }}"
           echo "🔗 Connecting to MySQL at: $MYSQL_ENDPOINT"
-          
           docker exec ec2-mock-app docker run -d --name todo-webapi-app \
             -p 5000:5000 \
             -e ASPNETCORE_ENVIRONMENT=Production \
@@ -734,7 +651,6 @@ jobs:
             -e DB_NAME=${{ env.DB_NAME }} \
             -e DB_USER=${{ env.DB_USER }} \
             todo-webapi:latest
-          
           echo "⏳ Waiting for application to be healthy..."
           for i in {1..30}; do
             if curl -sf http://localhost:$BASE_PORT/health 2>/dev/null | grep -q "Healthy" || \
@@ -746,37 +662,28 @@ jobs:
             echo "⏳ Health check attempt $i/30..."
             sleep 5
           done
-          
           echo "🚀 Deployment complete!"
           echo "🌐 App URL: http://localhost:$BASE_PORT"
           echo "🔗 Health: http://localhost:$BASE_PORT/health"
-          
       - name: Smoke test deployment
         run: |
           PORT=8080
           [ "${{ needs.dr-check.outputs.failover }}" == "true" ] && PORT=8081
-          
           echo "🧪 Running smoke tests on port $PORT..."
-          
           if curl -sf --max-time 10 http://localhost:$PORT/health; then
             echo "✅ Health check passed"
           else
             echo "⚠️ Health check failed (non-blocking)"
           fi
-          
           if curl -sf --max-time 10 http://localhost:$PORT/api/todo 2>/dev/null || \
              curl -sf --max-time 10 http://localhost:$PORT/swagger/index.html 2>/dev/null; then
             echo "✅ API responsiveness check passed"
           else
             echo "⚠️ API check failed (may be expected if no routes defined)"
           fi
-          
           echo "📋 Application logs (last 20 lines):"
           docker exec ec2-mock-app docker logs --tail 20 todo-webapi-app 2>&1 || true
 
-  # ------------------------------------------------------------------
-  # 🌐 TRAFFIC SWITCH (Simulasi)
-  # ------------------------------------------------------------------
   traffic:
     name: 🌐 Traffic Switch
     runs-on: ubuntu-latest
@@ -797,9 +704,6 @@ jobs:
           echo "================================"
           echo "🎯 Traffic switch simulation complete"
 
-  # ------------------------------------------------------------------
-  # 🔐 DAST (OWASP ZAP)
-  # ------------------------------------------------------------------
   dast:
     name: 🔐 DAST Scan
     runs-on: ubuntu-latest
@@ -819,14 +723,11 @@ jobs:
             sleep 10
           done
           echo "⚠️ Application may not be fully ready, proceeding with scan anyway"
-          
       - name: Run OWASP ZAP baseline scan
         run: |
           PORT=8080
           [ "${{ needs.dr-check.outputs.failover }}" == "true" ] && PORT=8081
-          
           echo "🔐 Starting OWASP ZAP baseline scan on http://localhost:$PORT"
-          
           docker run --rm --network host \
             -v $(pwd)/zap-reports:/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
@@ -836,11 +737,9 @@ jobs:
             -J zap-report.json \
             -l FAIL \
             -I || SCAN_EXIT_CODE=$?
-          
           if [ -f zap-report.html ]; then
             echo "📄 ZAP report generated"
           fi
-          
           if [ "${SCAN_EXIT_CODE:-0}" -ne 0 ]; then
             echo "⚠️ ZAP scan found issues (exit code: $SCAN_EXIT_CODE). Review report for details."
             echo "📋 This does not block deployment but should be reviewed."
@@ -848,9 +747,6 @@ jobs:
             echo "✅ ZAP baseline scan completed with no critical issues"
           fi
 
-  # ------------------------------------------------------------------
-  # 📢 NOTIFY
-  # ------------------------------------------------------------------
   notify:
     name: 📢 Notify Deployment Status
     runs-on: ubuntu-latest
@@ -867,7 +763,6 @@ jobs:
           else
             echo "status=❌ FAILED" >> $GITHUB_OUTPUT
           fi
-          
       - run: |
           echo "🚀 Pipeline Execution Summary"
           echo "=============================="
@@ -879,5 +774,4 @@ jobs:
           echo "📍 Active Region: ${{ needs.dr-check.outputs.active_region }}"
           echo "📊 Final Status: ${{ steps.status.outputs.status }}"
           echo "=============================="
-          
           echo "✅ Notification step completed"
