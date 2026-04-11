@@ -156,4 +156,3 @@ Pipeline ini dibagi menjadi dua formasi tempur (*Jobs*):
 Proyek ini dibangun sebagai demonstrasi arsitektur **Enterprise DevSecOps**. Kontribusi dalam bentuk *Pull Request* sangat dipersilakan.
 
 Didistribusikan di bawah lisensi [MIT License](LICENSE).
-```
