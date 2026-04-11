@@ -1,4 +1,4 @@
-name: 🏢 Enterprise DevSecOps Pipeline (Mock AWS)
+name: 🏢 Enterprise DevSecOps Pipeline (MiniStack AWS Mock)
 
 on:
   push:
@@ -20,7 +20,7 @@ on:
 
 env:
   DOTNET_VERSION: '8.0.x'
-  LOCALSTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
+  MINISTACK_ENDPOINT: ${{ secrets.MINISTACK_ENDPOINT || 'http://localhost:4566' }}
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -38,7 +38,7 @@ defaults:
 
 jobs:
   # ------------------------------------------------------------------
-  # CODE QUALITY & LINTING
+  # CODE QUALITY & LINTING (GitHub-hosted)
   # ------------------------------------------------------------------
   lint:
     name: 🔍 Code Linting
@@ -53,7 +53,7 @@ jobs:
         run: dotnet format --verify-no-changes --no-restore
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING
+  # SAST & SECRET SCANNING (GitHub-hosted)
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -76,7 +76,7 @@ jobs:
           sarif_file: results.sarif
 
   # ------------------------------------------------------------------
-  # SCA & SBOM GENERATION
+  # SCA & SBOM GENERATION (GitHub-hosted)
   # ------------------------------------------------------------------
   sca:
     name: 📦 SCA & SBOM
@@ -115,7 +115,7 @@ jobs:
           path: reports
 
   # ------------------------------------------------------------------
-  # BUILD & UNIT TESTS
+  # BUILD & UNIT TESTS (GitHub-hosted)
   # ------------------------------------------------------------------
   build:
     name: 🔨 Build & Test
@@ -152,7 +152,7 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN
+  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN (GitHub-hosted)
   # ------------------------------------------------------------------
   container:
     name: 🐳 Container Build & Scan
@@ -187,7 +187,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: localhost:5000/todo-webapi
+          images: todo-webapi
           tags: |
             type=sha,format=short
             type=raw,value=latest
@@ -227,64 +227,73 @@ jobs:
           path: sbom.spdx.json
 
   # ------------------------------------------------------------------
-  # MOCK INFRASTRUCTURE (LocalStack + Terraform)
+  # MOCK INFRASTRUCTURE (MiniStack + Terraform) - SELF-HOSTED RUNNER
   # ------------------------------------------------------------------
   infra:
-    name: 🏗️ Mock Infrastructure (LocalStack)
+    name: 🏗️ Mock Infrastructure (MiniStack)
     runs-on: [self-hosted, linux, x64]
     if: github.event_name != 'pull_request'
     outputs:
       s3_bucket: ${{ steps.tf.outputs.s3_bucket }}
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
+      ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-      - name: Start LocalStack
+      - name: Verify MiniStack is running
         run: |
-          docker rm -f localstack 2>/dev/null || true
-          docker run -d --name localstack -p 4566:4566 -e SERVICES=s3,rds localstack/localstack:latest
-          sleep 10
-      - name: Configure mock AWS CLI
+          echo "Checking MiniStack at ${{ env.MINISTACK_ENDPOINT }}"
+          curl -s ${{ env.MINISTACK_ENDPOINT }}/health || echo "Warning: MiniStack health check failed, proceeding anyway"
+      - name: Configure AWS CLI for MiniStack
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/credentials <<EOF
           [default]
-          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_access_key_id = ${{ env.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
+          EOF
+          cat > ~/.aws/config <<EOF
+          [default]
+          region = ${{ env.AWS_REGION }}
+          endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
           EOF
       - name: Terraform Apply
         id: tf
         working-directory: terraform
+        env:
+          AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
+          TF_VAR_ministack_endpoint: ${{ env.MINISTACK_ENDPOINT }}
         run: |
           terraform init
           terraform apply -auto-approve -var="environment=${{ github.event.inputs.environment || 'staging' }}"
           echo "s3_bucket=$(terraform output -raw s3_bucket)" >> $GITHUB_OUTPUT
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
+          echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # DEPLOY TO STAGING (MOCK)
+  # DEPLOY TO STAGING (MOCK) - SELF-HOSTED RUNNER (laptop)
   # ------------------------------------------------------------------
   deploy-staging:
-    name: 🚀 Deploy to Staging (Mock)
+    name: 🚀 Deploy to Staging (MiniStack EC2)
     runs-on: [self-hosted, linux, x64]
     needs: [container, infra]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
     environment:
       name: staging-mock
-      url: http://localhost:8080
+      url: http://${{ needs.infra.outputs.ec2_public_ip }}:8080
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: deploy
-      - name: Build Docker image (or load)
+      - name: Build Docker image
         run: |
           docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Run container on staging
+      - name: Run container on staging (simulate EC2)
         run: |
           docker rm -f todo-webapi-staging 2>/dev/null || true
           docker run -d \
@@ -293,11 +302,11 @@ jobs:
             -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             --restart unless-stopped \
             todo-webapi:latest
-      - name: Health check
+      - name: Health check (akses via localhost laptop)
         run: |
           for i in {1..12}; do
             if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
-              echo "✅ Staging ready"
+              echo "✅ Staging ready (EC2 mock IP: ${{ needs.infra.outputs.ec2_public_ip }})"
               exit 0
             fi
             sleep 5
@@ -310,16 +319,16 @@ jobs:
             zap-baseline.py -t http://localhost:8080 -l FAIL || exit 1
 
   # ------------------------------------------------------------------
-  # DEPLOY TO PRODUCTION (MOCK) - WITH APPROVAL GATE
+  # DEPLOY TO PRODUCTION (MOCK) - SELF-HOSTED RUNNER (laptop)
   # ------------------------------------------------------------------
   deploy-prod:
-    name: 🚀 Deploy to Production (Mock)
+    name: 🚀 Deploy to Production (MiniStack EC2)
     runs-on: [self-hosted, linux, x64]
     needs: [deploy-staging]
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     environment:
       name: production-mock
-      url: http://localhost:8081
+      url: http://${{ needs.infra.outputs.ec2_public_ip }}:8081
     steps:
       - name: Run container on production port
         run: |
@@ -343,12 +352,8 @@ jobs:
     needs: [deploy-staging, deploy-prod]
     if: always()
     steps:
-      - name: Slack notification (optional)
+      - name: Deployment summary
         run: |
           echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
-      # Uncomment if you have Slack webhook secret
-      # - uses: slackapi/slack-github-action@v1.25
-      #   with:
-      #     payload: '{"text": "Deployment to ${{ github.event.inputs.environment }} completed: ${{ job.status }}"}'
-      #   env:
-      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          echo "EC2 Mock IP: ${{ needs.infra.outputs.ec2_public_ip }}"
+      # - uses: slackapi/slack-github-action@v1.25 ...
