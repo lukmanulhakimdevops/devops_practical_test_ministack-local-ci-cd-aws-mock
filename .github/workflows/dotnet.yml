@@ -195,13 +195,14 @@ jobs:
             -p ${HOST_PORT}:${APP_PORT} \
             -e ASPNETCORE_ENVIRONMENT=Development \
             -e ASPNETCORE_URLS="http://+:${APP_PORT}" \
+            -e ASPNETCORE_Kestrel__Endpoints__Https__Url="" \
             --restart unless-stopped \
             --read-only \
             --tmpfs /tmp \
             --security-opt="no-new-privileges:true" \
             ${APP_NAME}:latest
           echo "✅ Container started on host port ${HOST_PORT} → container port ${APP_PORT}"
-
+          
       - name: ⏳ Wait for App Readiness
         shell: bash
         run: |
