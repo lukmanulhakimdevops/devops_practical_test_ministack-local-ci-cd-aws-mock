@@ -142,6 +142,7 @@ jobs:
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
           EXPOSE ${CONTAINER_PORT}
+          ENV ASPNETCORE_ENVIRONMENT=Development
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
 
           # 🔒 Patch OS untuk menutup CVE (libcrypto, libssl)
@@ -194,7 +195,7 @@ jobs:
             --name ${CONTAINER_NAME} \
             -p ${HOST_PORT}:${CONTAINER_PORT} \
             -e ASPNETCORE_ENVIRONMENT=Development \
-            -e ASPNETCORE_URLS="http://+:80" \
+            -e ASPNETCORE_URLS="http://+:${CONTAINER_PORT}" \
             --restart unless-stopped \
             --security-opt="no-new-privileges:true" \
             ${APP_NAME}:latest
