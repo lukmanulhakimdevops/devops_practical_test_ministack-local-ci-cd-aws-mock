@@ -22,21 +22,21 @@ env:
   HOST_PORT:             8080
   CONTAINER_PORT:        5000   # Kestrel HTTP port inside container
 
-# ============================================================
-# JOB 1 — SAST, SCA & Build (GitHub-hosted runner)
-# ============================================================
+# =============================================================================
+# JOB 1: SAST, SCA & Build (GitHub-hosted runner)
+# =============================================================================
 jobs:
   security_and_build:
     name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout Repository
+      - name: 📥 Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🔐 Secret Scanning (Gitleaks)
+      - name: 🔐 Secret scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -46,20 +46,20 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
+      - name: 🩹 Auto-patch vulnerable NuGet packages
         run: |
           echo "🩹 Patching Microsoft.Build to a secure version..."
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      - name: 📦 SCA — Audit NuGet Dependencies
+      - name: 📦 SCA – Audit NuGet dependencies
         run: |
           echo "🔍 Scanning NuGet packages for known vulnerabilities..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      - name: ☁️ Configure AWS CLI (Mock)
+      - name: ☁️ Configure AWS CLI (mock)
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/config <<EOF
@@ -74,25 +74,25 @@ jobs:
           EOF
           echo "✅ AWS mock config created."
 
-      - name: 🔨 Build and Publish .NET App
+      - name: 🔨 Build and publish .NET app
         run: |
           echo "📦 Restoring packages..."
           dotnet restore TodoWebAPI/*.csproj
           echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
-      - name: 📤 Upload Artifact (publish_output folder)
+      - name: 📤 Upload artifact (publish_output folder)
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
           path: publish_output
 
-# ============================================================
-# JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
-# ============================================================
+# =============================================================================
+# JOB 2: DAST, Container Scan & Deploy (self-hosted runner)
+# =============================================================================
   deploy:
     name: 🐳 Deploy to Laptop Docker
-    needs: build
+    needs: security_and_build   # fixed: was 'build'
     runs-on: [self-hosted, linux, x64]
 
     steps:
@@ -102,6 +102,7 @@ jobs:
           set -euo pipefail
           docker --version
           unzip -v >/dev/null
+
       - name: ⬇️ Download workflow artifact
         uses: actions/download-artifact@v4
         with:
@@ -120,9 +121,9 @@ jobs:
             find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
             exit 1
           fi
+          echo "✅ Artifact extracted, ${APP_DLL} present."
 
-      # ----- Hardened Dockerfile with self-signed cert -----
-      - name: 🐳 Create Secure Dockerfile
+      - name: 🐳 Create secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
@@ -160,14 +161,14 @@ jobs:
           DOCKERFILE
           echo "✅ Dockerfile created."
 
-      - name: 🏗️ Build Docker Image
+      - name: 🏗️ Build Docker image
         shell: bash
         run: |
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
           echo "✅ Docker image built: ${APP_NAME}:latest"
 
-      - name: 🛡️ Container Scan (Trivy)
+      - name: 🛡️ Container scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
@@ -177,13 +178,13 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      - name: 🧹 Remove Old Container
+      - name: 🧹 Remove old container
         shell: bash
         run: |
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
           echo "✅ Old container removed (if any)."
 
-      - name: 🚀 Run Secure Container (Pre-DAST)
+      - name: 🚀 Run secure container (pre-DAST)
         shell: bash
         run: |
           set -euo pipefail
@@ -202,7 +203,7 @@ jobs:
             ${APP_NAME}:latest
           echo "✅ Container started: ${CONTAINER_NAME} (host:${HOST_PORT} → container:${CONTAINER_PORT})"
 
-      - name: ⏳ Wait for App Readiness
+      - name: ⏳ Wait for app readiness
         shell: bash
         run: |
           echo "⏳ Waiting for the app to become ready..."
@@ -218,7 +219,7 @@ jobs:
           docker logs ${CONTAINER_NAME}
           exit 1
 
-      - name: 🕷️ DAST Scan (OWASP ZAP)
+      - name: 🕷️ DAST scan (OWASP ZAP)
         shell: bash
         run: |
           echo "💥 Launching DAST scan against the running container..."
@@ -233,7 +234,7 @@ jobs:
               }
           echo "✅ DAST scan passed. Application is safe."
 
-      - name: ✅ Show Running Container
+      - name: ✅ Show running container
         shell: bash
         run: |
           set -euo pipefail
