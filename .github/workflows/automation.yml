@@ -24,7 +24,7 @@ env:
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  STATIC_RDS_ENDPOINT: 'localhost:15433'   # Sesuaikan dengan port MySQL container
+  DB_NAME: ${{ secrets.DB_NAME || 'MyWebApiDB' }}
 
 permissions:
   contents: write
@@ -38,7 +38,7 @@ defaults:
 
 jobs:
   # ------------------------------------------------------------------
-  # CODE QUALITY & LINTING
+  # CODE QUALITY & LINTING (Auto-fix & commit)
   # ------------------------------------------------------------------
   lint:
     name: 🔍 Code Linting & Format
@@ -65,7 +65,7 @@ jobs:
           git diff --quiet && git diff --staged --quiet || (git commit -m "style: apply dotnet format" && git push)
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING
+  # SAST & SECRET SCANNING (Gitleaks + CodeQL)
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -215,7 +215,7 @@ jobs:
           context: deploy
           load: true
           tags: todo-webapi:latest
-      - name: Create .trivyignore (abaikan private key dev)
+      - name: Create .trivyignore (ignore dev private key)
         run: |
           cat > .trivyignore <<'EOF'
           /app/key.pem
@@ -280,7 +280,6 @@ jobs:
           else
             echo "✅ Ministack container is already running."
           fi
-          # Health check
           for i in {1..10}; do
             if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
               echo "✅ Ministack is healthy."
@@ -288,7 +287,7 @@ jobs:
             fi
             sleep 3
           done
-      - name: Create Terraform files (dengan tagging)
+      - name: Create Terraform files (with tagging)
         run: |
           mkdir -p terraform
           cd terraform
@@ -362,7 +361,7 @@ jobs:
             value = aws_s3_bucket.app_bucket.bucket
           }
           output "rds_endpoint" {
-            value = "${{ env.STATIC_RDS_ENDPOINT }}"
+            value = "${{ secrets.RDS_ENDPOINT }}"
           }
           output "ec2_public_ip" {
             value = aws_instance.web.public_ip
@@ -384,7 +383,7 @@ jobs:
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
-      - name: Terraform Destroy (bersihkan resource sebelumnya)
+      - name: Terraform Destroy (clean up previous resources)
         working-directory: terraform
         env:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
@@ -404,12 +403,44 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # DEPLOY TO STAGING (MOCK) - KE DALAM EC2 MOCK CONTAINER
+  # DATABASE INITIALIZATION (DDL) on Ministack MySQL container
+  # ------------------------------------------------------------------
+  db-init:
+    name: 🗄️ Initialize Database (Create Tables)
+    runs-on: [self-hosted, linux, x64]
+    needs: [infra]
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Execute SQL DDL on Ministack RDS MySQL container
+        run: |
+          echo "Waiting for Ministack MySQL container to be ready..."
+          sleep 5
+          MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E 'ministack.*mysql' | head -1)
+          if [ -z "$MYSQL_CONTAINER" ]; then
+            echo "❌ MySQL container not found. Is Ministack running with RDS service?"
+            exit 1
+          fi
+          echo "✅ Found MySQL container: $MYSQL_CONTAINER"
+          
+          cat > init.sql <<'EOF'
+          -- SQL DDL for TodoItem table
+          CREATE TABLE IF NOT EXISTS TodoItems (
+              Id INT PRIMARY KEY AUTO_INCREMENT,
+              Name VARCHAR(255) NULL,
+              IsComplete TINYINT(1) NOT NULL
+          );
+          EOF
+          
+          docker exec -i $MYSQL_CONTAINER mysql -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} ${{ env.DB_NAME }} < init.sql
+          echo "✅ Database '${{ env.DB_NAME }}' initialized successfully."
+
+  # ------------------------------------------------------------------
+  # DEPLOY TO STAGING (MOCK) - inside EC2 Mock container
   # ------------------------------------------------------------------
   deploy-staging:
     name: 🚀 Deploy to Staging (EC2 Mock)
     runs-on: [self-hosted, linux, x64]
-    needs: [container, infra]
+    needs: [container, db-init]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
     environment:
       name: staging-mock
@@ -424,7 +455,7 @@ jobs:
       - name: Build .NET application Docker image
         run: |
           docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Create EC2 Mock container image
+      - name: Create EC2 Mock container image (DinD)
         run: |
           cat > ec2-mock.Dockerfile <<'EOF'
           FROM alpine:latest
@@ -461,7 +492,7 @@ jobs:
           docker exec ec2-mock-staging docker run -d \
             --name todo-webapi-app \
             -p 5000:5000 \
-            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
+            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Database=${{ env.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             todo-webapi:latest
       - name: Health check
         run: |
@@ -480,7 +511,7 @@ jobs:
             zap-baseline.py -t http://localhost:8080 -l FAIL || exit 1
 
   # ------------------------------------------------------------------
-  # DEPLOY TO PRODUCTION (MOCK)
+  # DEPLOY TO PRODUCTION (MOCK) - with approval gate
   # ------------------------------------------------------------------
   deploy-prod:
     name: 🚀 Deploy to Production (EC2 Mock)
@@ -507,7 +538,7 @@ jobs:
           docker exec ec2-mock-prod docker run -d \
             --name todo-webapi-app \
             -p 5000:5000 \
-            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
+            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Database=${{ env.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             todo-webapi:latest
       - name: Smoke test
         run: |
