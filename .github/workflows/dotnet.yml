@@ -22,7 +22,7 @@ env:
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
-  CONTAINER_PORT:        80
+  APP_PORT:              5000          # port yang digunakan aplikasi (sesuai appsettings)
 
 jobs:
   # ═══════════════════════════════════════════════════════════════
@@ -130,63 +130,38 @@ jobs:
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
 
-      # ── Layer 3: Hardened Dockerfile ─────────────────────
+      # ── Layer 3: Hardened Dockerfile (Simplified, No iptables) ─
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
-
-          # entrypoint script (iptables redirect + privilege drop)
-          cat > deploy_input/entrypoint.sh <<'SH'
-          #!/bin/sh
-          set -e
-          echo "🔒 [iptables] Redirecting TCP 80 → 5000"
-          iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 5000
-          iptables -t nat -A OUTPUT     -p tcp --dport 80 -j REDIRECT --to-port 5000
-          echo "✅ iptables rules applied."
-          exec su-exec appuser dotnet /app/TodoWebAPI.dll
-          SH
-          chmod +x deploy_input/entrypoint.sh
-
-          # Dockerfile
           cat > deploy_input/Dockerfile <<'DOCKERFILE'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
 
           WORKDIR /app
 
-          # Install tools & generate self‑signed cert for Kestrel HTTPS endpoint
-          RUN apk update && apk upgrade --no-cache \
-              && apk add --no-cache iptables su-exec openssl \
-              && openssl req -x509 -newkey rsa:4096 \
-                  -keyout /app/https-key.pem \
-                  -out    /app/https-cert.pem \
-                  -days   365 -nodes \
-                  -subj   '/CN=localhost' \
-              && openssl pkcs12 -export \
-                  -out     /app/aspnetapp.pfx \
-                  -inkey   /app/https-key.pem \
-                  -in      /app/https-cert.pem \
-                  -passout pass:devpassword \
-              && rm /app/https-key.pem /app/https-cert.pem \
-              && apk del openssl
+          # 🔒 OS hardening + cleanup
+          RUN apk update && apk upgrade --no-cache
 
-          # Environment for Kestrel
-          ENV ASPNETCORE_ENVIRONMENT=Development
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
-
-          # Non‑root user
+          # 👤 Create non‑root user
           RUN adduser -u 1000 --disabled-password --gecos "" appuser \
               && chown -R appuser /app
 
-          EXPOSE 80
+          # ⚙️ Environment: force HTTP only, disable HTTPS redirect
+          ENV ASPNETCORE_ENVIRONMENT=Development
+          ENV ASPNETCORE_URLS=http://+:5000
+          # (Opsional) matikan HTTPS redirection jika ada di kode
+          # ENV ASPNETCORE_HTTPS_PORT=
 
-          COPY publish/       /app/
-          COPY entrypoint.sh  /entrypoint.sh
+          USER appuser
 
-          ENTRYPOINT ["/entrypoint.sh"]
+          EXPOSE 5000
+
+          COPY publish/ /app/
+
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
-          echo "✅ Dockerfile + entrypoint.sh created."
+          echo "✅ Dockerfile created."
 
       - name: 🏗️ Build Docker Image
         shell: bash
@@ -211,25 +186,21 @@ jobs:
         run: |
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
 
-      # ── Run Container (Pre‑DAST) ─────────────────────────
+      # ── Run Container (Direct Port Mapping) ──────────────
       - name: 🚀 Run Secure Container (Pre‑DAST)
         shell: bash
         run: |
           docker run -d \
-            --name     ${CONTAINER_NAME} \
-            -p         ${HOST_PORT}:80 \
-            -e         ASPNETCORE_ENVIRONMENT=Development \
-            -e         ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
-            -e         ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            --cap-drop ALL \
-            --cap-add  NET_ADMIN \
-            --cap-add  SETUID \
-            --cap-add  SETGID \
-            --restart  unless-stopped \
+            --name ${CONTAINER_NAME} \
+            -p ${HOST_PORT}:${APP_PORT} \
+            -e ASPNETCORE_ENVIRONMENT=Development \
+            -e ASPNETCORE_URLS="http://+:${APP_PORT}" \
+            --restart unless-stopped \
             --read-only \
-            --tmpfs    /tmp \
+            --tmpfs /tmp \
+            --security-opt="no-new-privileges:true" \
             ${APP_NAME}:latest
-          echo "✅ Container started (host:${HOST_PORT} → container:80 → app:5000)"
+          echo "✅ Container started on host port ${HOST_PORT} → container port ${APP_PORT}"
 
       - name: ⏳ Wait for App Readiness
         shell: bash
@@ -237,7 +208,12 @@ jobs:
           echo "⏳ Waiting for app to become ready..."
           for i in {1..12}; do
             if curl -sf http://localhost:${HOST_PORT}/health >/dev/null 2>&1; then
-              echo "✅ App ready."
+              echo "✅ App ready after $((i * 5)) seconds."
+              exit 0
+            fi
+            # Jika endpoint /health tidak ada, coba root
+            if curl -sf http://localhost:${HOST_PORT}/ >/dev/null 2>&1; then
+              echo "✅ App responded on root endpoint."
               exit 0
             fi
             sleep 5
@@ -250,7 +226,7 @@ jobs:
       - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
-          echo "💥 Launching DAST scan..."
+          echo "💥 Launching DAST scan against http://localhost:${HOST_PORT}"
           docker run --rm --network="host" \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py -t http://localhost:${HOST_PORT} -l FAIL || {
