@@ -66,8 +66,8 @@ jobs:
             FAIL="true"
             REGION="${{ env.DR_FALLBACK_REGION }}"
           fi
-          echo "region=$REGION"   >> $GITHUB_OUTPUT
-          echo "failover=$FAIL"   >> $GITHUB_OUTPUT
+          echo "region=$REGION"  >> $GITHUB_OUTPUT
+          echo "failover=$FAIL"  >> $GITHUB_OUTPUT
           echo "🔄 DR Decision: region=$REGION | failover=$FAIL"
 
   # --------------------------------------------------------------------------
@@ -108,7 +108,7 @@ jobs:
         uses: github/codeql-action/analyze@v3
 
   # --------------------------------------------------------------------------
-  # SCA & SBOM
+  # SCA & SBOM (audit only)
   # --------------------------------------------------------------------------
   sca:
     name: 📦 SCA & SBOM
@@ -121,13 +121,7 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: 🩹 Force secure version of Microsoft.Build
-        run: |
-          for proj in TodoWebAPI/*.csproj; do
-            dotnet add "$proj" package Microsoft.Build --version 17.8.43
-          done
-
-      - name: 🔍 Audit NuGet vulnerabilities
+      - name: 🔍 Audit NuGet vulnerabilities (report only)
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
@@ -165,11 +159,28 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
+      - name: 🩹 Patch Microsoft.Build vulnerability (CVE-2025-55247)
+        run: |
+          for proj in TodoWebAPI/*.csproj; do
+            echo "🩹 Patching $proj..."
+            dotnet add "$proj" package Microsoft.Build --version 17.8.43
+          done
+
       - name: 🔨 Restore, Build & Publish
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet build   TodoWebAPI/*.csproj -c Release --no-restore
           dotnet publish TodoWebAPI/*.csproj -c Release --no-build -o publish_output
+
+      - name: ✅ Verify patch
+        run: |
+          echo "🔍 Checking Microsoft.Build version in deps.json..."
+          grep -o '"Microsoft.Build/[0-9.]*"' publish_output/TodoWebAPI.deps.json | head -1 || echo "Not found"
+          if grep -q '"Microsoft.Build/17.8.43"' publish_output/TodoWebAPI.deps.json; then
+            echo "✅ Patch verified: Microsoft.Build 17.8.43"
+          else
+            echo "⚠️  Patch may not have applied correctly"
+          fi
 
       - name: ☁️ Configure AWS CLI (mock)
         run: |
@@ -246,7 +257,7 @@ jobs:
           load: true
           tags: todo-webapi:latest
 
-      - name: 🛡️ Trivy scan – upload to GitHub Security
+      - name: 🛡️ Trivy scan – upload SARIF
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: todo-webapi:latest
@@ -296,53 +307,87 @@ jobs:
       - name: 🐳 Ensure Ministack is running
         run: |
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "🚀 Starting Ministack..."
+            echo "🚀 Starting Ministack container..."
             docker run -d --name ministack \
               -p 4566:4566 \
               -e SERVICES=rds,ec2,s3,sts,iam \
               nahuelnucera/ministack:latest
-            sleep 20
+            echo "⏳ Waiting 30s for Ministack to initialize..."
+            sleep 30
+          else
+            echo "✅ Ministack already running."
           fi
+
+          echo "🔍 Checking Ministack health via /_localstack/health..."
           for i in $(seq 1 30); do
-            if curl -sf ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
-              echo "✅ Ministack healthy"
+            if curl -sf "${{ env.MINISTACK_ENDPOINT }}/_localstack/health" | grep -q '"s3":"available"'; then
+              echo "✅ Ministack healthy (attempt $i)"
               break
             fi
-            echo "⏳ Waiting for Ministack... ($i/30)"
+            echo "⏳ Waiting... ($i/30)"
             sleep 5
           done
 
       - name: 🧹 Clean up leftover Ministack resources
         env:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
-          AWS_REGION: ${{ needs.dr-check.outputs.active_region }}
+          AWS_REGION:       ${{ needs.dr-check.outputs.active_region }}
         run: |
-          ENV_NAME=${{ github.event.inputs.environment || 'staging' }}
+          ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
+          echo "🧹 Cleaning leftovers for env: $ENV_NAME"
           # EC2
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
             --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" \
-            --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
-          [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] && \
-            aws ec2 terminate-instances --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --instance-ids $INSTANCE_ID && sleep 10 || true
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "🗑️ Terminating EC2: $INSTANCE_ID"
+            aws ec2 terminate-instances \
+              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
+              --instance-ids "$INSTANCE_ID" && sleep 10
+          fi
           # Security Group
           SG_ID=$(aws ec2 describe-security-groups \
-            --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
             --filters "Name=group-name,Values=web-sg-${ENV_NAME}" \
-            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
-          [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ] && \
-            aws ec2 delete-security-group --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --group-id $SG_ID || true
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || echo "")
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            echo "🗑️ Deleting SG: $SG_ID"
+            aws ec2 delete-security-group \
+              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
+              --group-id "$SG_ID" || true
+          fi
           # S3
           BUCKET=$(aws s3api list-buckets \
-            --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
             --query "Buckets[?contains(Name,'app-bucket-${ENV_NAME}')].Name" \
-            --output text 2>/dev/null || true)
-          [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && \
-            aws s3 rb s3://$BUCKET --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --force || true
+            --output text 2>/dev/null || echo "")
+          if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
+            echo "🗑️ Deleting S3: $BUCKET"
+            aws s3 rb "s3://$BUCKET" \
+              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --force || true
+          fi
+          echo "✅ Cleanup done."
 
       - name: 📝 Create Terraform config
         run: |
-          mkdir -p terraform && cat > terraform/main.tf <<'TF'
+          mkdir -p terraform
+          cat > terraform/main.tf <<'TF'
+          terraform {
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = "~> 5.0"
+              }
+              random = {
+                source  = "hashicorp/random"
+                version = "~> 3.0"
+              }
+            }
+          }
+
           variable "ministack_endpoint" { default = "http://localhost:4566" }
           variable "environment"        { default = "staging" }
           variable "aws_region"         { default = "us-east-1" }
@@ -363,6 +408,8 @@ jobs:
               iam = var.ministack_endpoint
             }
           }
+
+          resource "random_id" "suffix" { byte_length = 4 }
 
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-${var.environment}"
@@ -385,8 +432,6 @@ jobs:
             bucket = "app-bucket-${var.environment}-${random_id.suffix.hex}"
             tags   = { Project = "DevSecOps" }
           }
-
-          resource "random_id" "suffix" { byte_length = 4 }
 
           output "s3_bucket"     { value = aws_s3_bucket.app_bucket.bucket }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
@@ -423,53 +468,62 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # --------------------------------------------------------------------------
-  # DB Init (Create schema)
+  # DB Init
   # --------------------------------------------------------------------------
   db-init:
     name: 🗄️ Initialize Database
     runs-on: [self-hosted, linux, x64]
     needs: infra
     outputs:
-      mysql_endpoint: ${{ steps.discover.outputs.endpoint }}
-      mysql_port:     ${{ steps.discover.outputs.port }}
+      mysql_endpoint:  ${{ steps.discover.outputs.endpoint }}
+      mysql_port:      ${{ steps.discover.outputs.port }}
+      mysql_container: ${{ steps.discover.outputs.container }}
     steps:
       - name: 🔎 Discover MySQL container
         id: discover
         run: |
           echo "🔎 Discovering MySQL container by image name..."
+          # Find any container running mysql image
           MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
             | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
             | head -1)
+
           if [ -z "$MYSQL_CONTAINER" ]; then
             echo "❌ No running container with a mysql image found!"
-            echo "📋 Running containers:"
             docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
             exit 1
           fi
-          echo "✅ Found: $MYSQL_CONTAINER"
+
+          echo "✅ Found MySQL container: $MYSQL_CONTAINER"
+
           EXPOSED_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp 2>/dev/null \
             | grep -oE '[0-9]+$' | head -1)
+
           if [ -n "$EXPOSED_PORT" ]; then
             ENDPOINT="localhost:$EXPOSED_PORT"
-            echo "✅ Endpoint (exposed): $ENDPOINT"
+            echo "✅ Endpoint (exposed port): $ENDPOINT"
           else
             ENDPOINT="${MYSQL_CONTAINER}:3306"
             EXPOSED_PORT="3306"
             echo "✅ Endpoint (container network): $ENDPOINT"
           fi
+
           echo "endpoint=$ENDPOINT"         >> $GITHUB_OUTPUT
           echo "port=$EXPOSED_PORT"         >> $GITHUB_OUTPUT
           echo "container=$MYSQL_CONTAINER" >> $GITHUB_OUTPUT
-          echo "📋 All containers:"
+
+          echo "📋 All running containers:"
           docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
 
       - name: ⏳ Wait for MySQL to accept connections
         run: |
           CONTAINER="${{ steps.discover.outputs.container }}"
-          echo "⏳ Waiting for MySQL in $CONTAINER..."
+          echo "⏳ Waiting for MySQL in: $CONTAINER"
           for i in $(seq 1 60); do
-            if docker exec "$CONTAINER" mysqladmin ping -u"${{ env.DB_USER }}" \
-                -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+            if docker exec "$CONTAINER" mysqladmin ping \
+                -u"${{ env.DB_USER }}" \
+                -p"${{ env.DB_PASSWORD }}" \
+                --silent 2>/dev/null; then
               echo "✅ MySQL ready after $((i * 3))s"
               exit 0
             fi
@@ -483,12 +537,18 @@ jobs:
       - name: 🗂️ Create database and tables
         run: |
           CONTAINER="${{ steps.discover.outputs.container }}"
+
+          echo "📦 Creating database ${{ env.DB_NAME }}..."
           docker exec "$CONTAINER" mysql \
-            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            -u"${{ env.DB_USER }}" \
+            -p"${{ env.DB_PASSWORD }}" \
             -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\`
                 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+          echo "📋 Creating tables..."
           docker exec -i "$CONTAINER" mysql \
-            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            -u"${{ env.DB_USER }}" \
+            -p"${{ env.DB_PASSWORD }}" \
             "${{ env.DB_NAME }}" <<'SQL'
           SET NAMES utf8mb4;
           CREATE TABLE IF NOT EXISTS TodoItems (
@@ -501,14 +561,16 @@ jobs:
             INDEX idx_name (Name)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
+
           echo "✅ DB initialized. Verifying..."
           docker exec "$CONTAINER" mysql \
-            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            -u"${{ env.DB_USER }}" \
+            -p"${{ env.DB_PASSWORD }}" \
             "${{ env.DB_NAME }}" \
             -e "SHOW TABLES; SELECT COUNT(*) AS rows FROM TodoItems;"
 
   # --------------------------------------------------------------------------
-  # Deploy Application (with EC2 mock simulation)
+  # Deploy
   # --------------------------------------------------------------------------
   deploy:
     name: 🚀 Deploy Application
@@ -572,8 +634,8 @@ jobs:
       - name: 🚀 Run container
         run: |
           set -euo pipefail
+
           DB_PORT="${{ env.DB_PORT }}"
-          DB_HOST="127.0.0.1"
           if [ -z "$DB_PORT" ]; then
             MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
               | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' | head -1)
@@ -581,26 +643,28 @@ jobs:
               | grep -oE '[0-9]+$' | head -1)
             echo "🔎 Auto-detected DB_PORT: $DB_PORT"
           fi
+
           docker run -d \
             --name    ${CONTAINER_NAME} \
             --network host \
             -e        ASPNETCORE_ENVIRONMENT=Production \
             -e        ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
             -e        ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            -e        "ConnectionStrings__DefaultConnection=Server=${DB_HOST};Port=${DB_PORT};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+            -e        "ConnectionStrings__DefaultConnection=Server=127.0.0.1;Port=${DB_PORT};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" \
             --restart unless-stopped \
             --read-only \
             --tmpfs   /tmp \
             ${APP_NAME}:latest
+
           echo "✅ Container started"
-          echo "   App:    http://localhost:${HOST_PORT}"
-          echo "   Swagger: http://localhost:${HOST_PORT}/swagger"
-          echo "   DB:     ${DB_HOST}:${DB_PORT}/${{ env.DB_NAME }}"
+          echo "   App:     http://localhost:${HOST_PORT}"
+          echo "   Swagger: http://localhost:${HOST_PORT}/api-docs"
+          echo "   DB:      127.0.0.1:${DB_PORT}/${{ env.DB_NAME }}"
 
       - name: ⏳ Wait for app readiness
         run: |
-          echo "⏳ Waiting for Swagger endpoint..."
+          echo "⏳ Polling Swagger endpoint..."
           for i in $(seq 1 12); do
             if curl -sf "http://localhost:${HOST_PORT}/swagger/v1/swagger.json" >/dev/null 2>&1; then
               echo "✅ App ready after $((i * 5))s."
@@ -626,7 +690,7 @@ jobs:
           docker run --rm --network host \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
-              -t http://localhost:${HOST_PORT} \
+              -t "http://localhost:${HOST_PORT}" \
               -l FAIL || {
                 echo "❌ DAST found critical issues — stopping container."
                 docker rm -f ${CONTAINER_NAME}
