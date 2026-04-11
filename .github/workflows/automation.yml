@@ -463,7 +463,7 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # DATABASE INITIALIZATION (dengan health check loop)
+  # DATABASE INITIALIZATION (dengan health check loop yang lebih baik)
   # ------------------------------------------------------------------
   db-init:
     name: 🗄️ Initialize Database
@@ -471,18 +471,34 @@ jobs:
     needs: [infra]
     if: github.event_name != 'pull_request'
     steps:
-      - name: Execute SQL DDL on MySQL container
+      - name: Wait for MySQL container and initialize DB
         run: |
-          echo "Waiting for MySQL container..."
-          for i in {1..12}; do
+          echo "Waiting for Ministack MySQL container to be ready..."
+          MAX_RETRIES=20
+          RETRY=0
+          MYSQL_CONTAINER=""
+          
+          while [ $RETRY -lt $MAX_RETRIES ]; do
             MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E 'ministack.*mysql' | head -1)
-            if [ -n "$MYSQL_CONTAINER" ] && docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} --silent 2>/dev/null; then
-              echo "✅ MySQL ready."
-              break
+            if [ -n "$MYSQL_CONTAINER" ]; then
+              if docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} --silent 2>/dev/null; then
+                echo "✅ MySQL container '$MYSQL_CONTAINER' is ready."
+                break
+              fi
             fi
-            sleep 5
+            echo "MySQL not ready yet. Retry $((RETRY+1))/$MAX_RETRIES..."
+            sleep 10
+            RETRY=$((RETRY+1))
           done
-          if [ -z "$MYSQL_CONTAINER" ]; then echo "❌ MySQL not found."; exit 1; fi
+          
+          if [ -z "$MYSQL_CONTAINER" ]; then
+            echo "❌ MySQL container not found after $MAX_RETRIES attempts."
+            exit 1
+          fi
+          
+          # Buat database jika belum ada
+          docker exec -i $MYSQL_CONTAINER mysql -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} -e "CREATE DATABASE IF NOT EXISTS ${{ env.DB_NAME }};"
+          
           cat > init.sql <<'EOS'
           CREATE TABLE IF NOT EXISTS TodoItems (
               Id INT PRIMARY KEY AUTO_INCREMENT,
@@ -490,8 +506,9 @@ jobs:
               IsComplete TINYINT(1) NOT NULL
           );
           EOS
+          
           docker exec -i $MYSQL_CONTAINER mysql -u${{ secrets.DB_USER }} -p${{ secrets.DB_PASSWORD }} ${{ env.DB_NAME }} < init.sql
-          echo "✅ Database initialized."
+          echo "✅ Database '${{ env.DB_NAME }}' initialized successfully."
 
   # ------------------------------------------------------------------
   # DEPLOY TO STAGING
