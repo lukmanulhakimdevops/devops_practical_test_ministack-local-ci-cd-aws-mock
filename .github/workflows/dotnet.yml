@@ -195,7 +195,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};"
+          CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd='${DB_PASSWORD}';"
           docker run -d \
             --name  ${CONTAINER_NAME} \
             -p      ${HOST_PORT}:${CONTAINER_PORT} \
