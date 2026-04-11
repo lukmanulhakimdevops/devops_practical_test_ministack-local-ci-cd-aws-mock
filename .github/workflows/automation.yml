@@ -1,9 +1,18 @@
-name: 🛡️ DevSecOps Ministack CI/CD
+name: 🛡️ DevSecOps CI/CD with EC2 Mock
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deployment target'
+        required: true
+        default: 'ec2-mock'
+        type: choice
+        options:
+          - mock
+          - ec2-mock
 
 env:
   AWS_REGION:            ${{ secrets.AWS_REGION || 'us-east-1' }}
@@ -13,7 +22,6 @@ env:
 
   APP_DLL:               TodoWebAPI.dll
   APP_NAME:              todo-webapi
-  CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
   CONTAINER_PORT:        5000
 
@@ -30,287 +38,187 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
       - name: 🩹 Auto-Patch Vulnerable NuGet Packages
         run: |
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
-
       - name: 📦 SCA — Audit NuGet Dependencies
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
-
-      - name: ☁️ Configure AWS CLI (mock)
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/config <<EOF
-          [default]
-          region = ${AWS_REGION}
-          output = json
-          EOF
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
-          aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
-          EOF
-
       - name: 🔨 Build and Publish .NET App
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
-
       - name: 📦 Package Artifact (manual zip)
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
           cd ..
-
       - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
           path: webapp-binaries.zip
 
-  deploy:
-    name: 🐳 Deploy with LocalStack RDS
+  # ============================================================
+  # DEPLOY TO MOCK (LANGSUNG DI RUNNER)
+  # ============================================================
+  deploy_mock:
+    name: 🐳 Deploy to Local Runner
     needs: security_and_build
     runs-on: [self-hosted, linux, x64]
-
+    if: github.event.inputs.target == 'mock'
     steps:
-      - name: 🧪 Check runner prerequisites
+      - name: ⬇️ Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-binaries
+          path: ./artifact
+      - name: 📂 Extract & Docker build
+        run: |
+          mkdir -p deploy_input/publish
+          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+          cat > deploy_input/Dockerfile <<'DOCKERFILE'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          WORKDIR /app
+          RUN apk add --no-cache openssl
+          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem -out /app/cert.pem -days 365 -nodes -subj '/CN=localhost' \
+           && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/key.pem -in /app/cert.pem -passout pass:dev
+          ENV ASPNETCORE_ENVIRONMENT=Development
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=dev
+          RUN adduser -D appuser && chown -R appuser /app
+          USER appuser
+          COPY publish/ /app/
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          DOCKERFILE
+          docker build -t ${APP_NAME}:latest ./deploy_input
+      - name: 🚀 Run container
+        run: |
+          docker rm -f ${APP_NAME} 2>/dev/null || true
+          docker run -d --name ${APP_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} \
+            -e ConnectionStrings__DefaultConnection="Server=localhost;Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};" \
+            ${APP_NAME}:latest
+      - name: Health check & DAST
+        run: |
+          for i in {1..12}; do
+            curl -sf http://localhost:${HOST_PORT}/swagger/v1/swagger.json && break || sleep 5
+          done
+          docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://localhost:${HOST_PORT} -l FAIL
+
+  # ============================================================
+  # DEPLOY TO EC2 MOCK (CONTAINER DI DALAM CONTAINER)
+  # ============================================================
+  deploy_ec2_mock:
+    name: 🐳 Deploy to EC2 Mock (DinD)
+    needs: security_and_build
+    runs-on: [self-hosted, linux, x64]
+    if: github.event.inputs.target == 'ec2-mock'
+    steps:
+      - name: 🧹 Clean old mock EC2 container
         shell: bash
         run: |
-          set -euo pipefail
-          docker --version
-          unzip -v >/dev/null
-          terraform --version || echo "Terraform not installed"
+          docker rm -f ec2-mock 2>/dev/null || true
 
-      - name: 🐳 Start LocalStack (if not running)
+      - name: 🐳 Start EC2 mock container (Amazon Linux with Docker)
         shell: bash
         run: |
-          if ! docker ps --format '{{.Names}}' | grep -q "ministack"; then
-            docker run -d --name ministack -p 4566:4566 -e SERVICES=s3,rds,ec2 --restart unless-stopped nahuelnucera/ministack:latest
-            sleep 5
-          fi
+          docker run -d \
+            --name ec2-mock \
+            --privileged \
+            -p 2222:22 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            amazonlinux:2 \
+            /bin/bash -c "
+              yum update -y && \
+              yum install -y docker openssh-server unzip && \
+              service docker start && \
+              usermod -a -G docker ec2-user && \
+              /usr/sbin/sshd -D
+            "
+          sleep 15
 
-      - name: 🔧 Setup Terraform (if missing)
-        shell: bash
-        run: |
-          if ! command -v terraform &> /dev/null; then
-            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-            sudo apt update && sudo apt install terraform -y
-          fi
-
-      - name: 🧹 Clean old Docker container
-        shell: bash
-        run: |
-          docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-
-      - name: 🗑️ Destroy old infrastructure (Terraform) + remove state files
-        shell: bash
-        run: |
-          cd .tf 2>/dev/null || true
-          rm -rf .terraform terraform.tfstate* .terraform.lock.hcl main.tf
-          cd ..
-          mkdir -p .tf
-          cd .tf
-          cat > main.tf <<'EOF'
-          terraform {
-            required_providers {
-              aws = {
-                source  = "hashicorp/aws"
-                version = "~> 5.0"
-              }
-            }
-          }
-
-          provider "aws" {
-            region                      = var.aws_region
-            access_key                  = var.aws_access_key
-            secret_key                  = var.aws_secret_key
-            skip_credentials_validation = true
-            skip_metadata_api_check     = true
-            skip_requesting_account_id  = true
-            s3_use_path_style           = true
-            endpoints {
-              s3  = var.localstack_endpoint
-              rds = var.localstack_endpoint
-            }
-          }
-
-          resource "aws_s3_bucket" "app_bucket" {
-            bucket = "my-app-bucket-${formatdate("YYYYMMDDhhmmss", timestamp())}"
-          }
-
-          resource "aws_db_instance" "mysql" {
-            identifier          = "ministack-mysql"
-            engine              = "mysql"
-            engine_version      = "8.0"
-            instance_class      = "db.t3.micro"
-            allocated_storage   = 20
-            db_name             = var.db_name
-            username            = var.db_user
-            password            = var.db_password
-            port                = 3306
-            skip_final_snapshot = true
-            apply_immediately   = true
-          }
-
-          output "s3_bucket" {
-            value = aws_s3_bucket.app_bucket.id
-          }
-
-          output "rds_endpoint" {
-            value = aws_db_instance.mysql.endpoint
-          }
-
-          variable "aws_region" { type = string }
-          variable "aws_access_key" { type = string }
-          variable "aws_secret_key" { type = string }
-          variable "localstack_endpoint" { type = string }
-          variable "db_name" { type = string }
-          variable "db_user" { type = string }
-          variable "db_password" { type = string }
-          EOF
-          terraform init -reconfigure
-          terraform destroy -auto-approve \
-            -var="aws_region=${AWS_REGION}" \
-            -var="aws_access_key=${AWS_ACCESS_KEY_ID}" \
-            -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}" \
-            -var="localstack_endpoint=${LOCALSTACK_ENDPOINT}" \
-            -var="db_name=${DB_NAME}" \
-            -var="db_user=${DB_USER}" \
-            -var="db_password=${DB_PASSWORD}" \
-            2>/dev/null || true
-          cd ..
-
-      - name: 🏗️ Create fresh S3 bucket and RDS via Terraform
-        shell: bash
-        run: |
-          cd .tf
-          terraform apply -auto-approve \
-            -var="aws_region=${AWS_REGION}" \
-            -var="aws_access_key=${AWS_ACCESS_KEY_ID}" \
-            -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}" \
-            -var="localstack_endpoint=${LOCALSTACK_ENDPOINT}" \
-            -var="db_name=${DB_NAME}" \
-            -var="db_user=${DB_USER}" \
-            -var="db_password=${DB_PASSWORD}"
-          echo "S3_BUCKET=$(terraform output -raw s3_bucket)" >> $GITHUB_ENV
-          echo "RDS_ENDPOINT=$(terraform output -raw rds_endpoint)" >> $GITHUB_ENV
-          cd ..
-
-      - name: ⬇️ Download workflow artifact
+      - name: ⬇️ Download artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: ./artifact
 
-      - name: 📂 Extract artifact
+      - name: 📂 Copy artifact to EC2 mock
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf deploy_input
-          mkdir -p deploy_input/publish
-          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: ${APP_DLL} not found"
-            exit 1
-          fi
+          docker cp ./artifact/webapp-binaries.zip ec2-mock:/tmp/
+          docker exec ec2-mock bash -c "
+            mkdir -p /home/ec2-user/app && \
+            cd /home/ec2-user/app && \
+            unzip -q /tmp/webapp-binaries.zip
+          "
 
-      - name: 🐳 Create secure Dockerfile
+      - name: 🐳 Build and run app container inside EC2 mock
         shell: bash
         run: |
-          cat > deploy_input/Dockerfile <<'DOCKERFILE'
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-          WORKDIR /app
-          RUN apk update && apk upgrade --no-cache && apk add --no-cache openssl
-          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/https-key.pem -out /app/https-cert.pem -days 365 -nodes -subj '/CN=localhost' \
-           && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/https-key.pem -in /app/https-cert.pem -passout pass:devpassword \
-           && rm /app/https-key.pem /app/https-cert.pem && apk del openssl
-          ENV ASPNETCORE_ENVIRONMENT=Development
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
-          RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
-          USER appuser
-          COPY publish/ /app/
-          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          DOCKERFILE
+          docker exec ec2-mock bash -c "
+            cd /home/ec2-user/app
+            cat > Dockerfile <<'EOF'
+            FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+            WORKDIR /app
+            RUN apk add --no-cache openssl
+            RUN openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem -out /app/cert.pem -days 365 -nodes -subj '/CN=localhost' \
+             && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/key.pem -in /app/cert.pem -passout pass:dev
+            ENV ASPNETCORE_ENVIRONMENT=Development
+            ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+            ENV ASPNETCORE_Kestrel__Certificates__Default__Password=dev
+            RUN adduser -D appuser && chown -R appuser /app
+            USER appuser
+            COPY . .
+            ENTRYPOINT [\"dotnet\", \"TodoWebAPI.dll\"]
+            EOF
+            docker build -t todo-app .
+            docker rm -f todo-webapi 2>/dev/null || true
+            docker run -d --name todo-webapi -p 8080:8080 --restart unless-stopped todo-app
+          "
 
-      - name: 🏗️ Build Docker image
+      - name: ⏳ Wait for app readiness (from host to mock EC2)
         shell: bash
         run: |
-          docker build -t ${APP_NAME}:latest ./deploy_input
-
-      - name: 🛡️ Container scan (Trivy)
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ env.APP_NAME }}:latest'
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
-
-      - name: 🚀 Run secure container
-        shell: bash
-        run: |
-          RDS_HOST=$(echo ${RDS_ENDPOINT} | cut -d: -f1)
-          RDS_PORT=$(echo ${RDS_ENDPOINT} | cut -d: -f2)
-          CONNECTION_STRING="Server=${RDS_HOST};Port=${RDS_PORT};Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};"
-          docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${HOST_PORT}:${CONTAINER_PORT} \
-            -e ASPNETCORE_ENVIRONMENT=Development \
-            -e ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
-            -e ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            -e ConnectionStrings__DefaultConnection="${CONNECTION_STRING}" \
-            --security-opt="no-new-privileges:true" \
-            --restart unless-stopped \
-            --read-only \
-            --tmpfs /tmp \
-            ${APP_NAME}:latest
-          echo "✅ Container started"
-
-      - name: ⏳ Wait for app readiness
-        shell: bash
-        run: |
+          # Dapatkan IP container mock EC2
+          MOCK_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ec2-mock)
+          echo "Mock EC2 IP: ${MOCK_IP}"
           for i in {1..12}; do
-            if curl -sf http://localhost:${HOST_PORT}/swagger/v1/swagger.json >/dev/null 2>&1; then
-              echo "✅ App ready"
+            if curl -sf http://${MOCK_IP}:8080/swagger/v1/swagger.json; then
+              echo "✅ App ready inside EC2 mock"
               exit 0
             fi
             sleep 5
           done
           echo "❌ App not ready"
-          docker logs ${CONTAINER_NAME}
+          docker exec ec2-mock docker logs todo-webapi
           exit 1
 
-      - name: 🕷️ DAST scan (OWASP ZAP)
+      - name: 🕷️ DAST scan (from host to mock EC2)
         shell: bash
         run: |
+          MOCK_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ec2-mock)
           docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t http://localhost:${HOST_PORT} -l FAIL || {
+            zap-baseline.py -t http://${MOCK_IP}:8080 -l FAIL || {
             echo "❌ DAST failed"
-            docker rm -f ${CONTAINER_NAME}
             exit 1
           }
 
-      - name: ✅ Show running container
+      - name: ✅ Show running containers inside EC2 mock
         shell: bash
         run: |
-          docker ps --filter "name=${CONTAINER_NAME}"
-          docker logs --tail 20 ${CONTAINER_NAME} || true
+          echo "=== Containers inside EC2 mock ==="
+          docker exec ec2-mock docker ps
+          echo "=== App logs ==="
+          docker exec ec2-mock docker logs --tail 20 todo-webapi
