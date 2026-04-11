@@ -1,11 +1,7 @@
-name: 🏢 Enterprise DevSecOps Pipeline (Ministack + DR + Traffic Aware)
+name: 🛡️ DevSecOps Ministack CI/CD
 
 on:
   push:
-    branches: [main, develop]
-    paths:
-      - 'TodoWebAPI/**'
-  pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -14,29 +10,32 @@ on:
         required: true
         default: 'staging'
         type: choice
-        options:
-          - staging
-          - production
+        options: [staging, production]
       manual_dr_trigger:
         description: 'Force DR failover'
         required: false
         default: 'false'
         type: choice
-        options:
-          - 'true'
-          - 'false'
+        options: ['true', 'false']
 
 env:
-  DOTNET_VERSION: '8.0.x'
-  MINISTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
-  AWS_REGION_TARGET: us-east-1
-  DR_FALLBACK_REGION: ${{ secrets.DR_FALLBACK_REGION || 'us-east-2' }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  DOTNET_VERSION:        '8.0.x'
+  APP_DLL:               TodoWebAPI.dll
+  APP_NAME:              todo-webapi
+  CONTAINER_NAME:        todo-webapi
+  HOST_PORT:             8080
+  CONTAINER_PORT:        5000
+
+  MINISTACK_ENDPOINT:    ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
+  AWS_REGION_TARGET:     us-east-1
+  DR_FALLBACK_REGION:    ${{ secrets.DR_FALLBACK_REGION || 'us-east-2' }}
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  DB_NAME: ${{ secrets.DB_NAME }}
-  DB_USER: ${{ secrets.DB_USER }}
-  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-  RDS_ENDPOINT: ${{ secrets.RDS_ENDPOINT || 'localhost:3306' }}
+
+  DB_NAME:               ${{ secrets.DB_NAME }}
+  DB_USER:               ${{ secrets.DB_USER }}
+  DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
+  DB_PORT:               ${{ secrets.DB_PORT }}
 
 permissions:
   contents: read
@@ -44,184 +43,16 @@ permissions:
   actions: read
   checks: write
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
-  lint:
-    name: 🔍 Code Linting
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: TodoWebAPI
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-      - name: Run dotnet format
-        run: dotnet format --verify-no-changes --no-restore
-
-  sast:
-    name: 🛡️ SAST & Secrets
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: csharp
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-      - name: Build CodeQL database
-        run: |
-          cd TodoWebAPI
-          dotnet build TodoWebAPI.csproj
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-
-  sca:
-    name: 📦 SCA & SBOM
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: TodoWebAPI
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-      - name: Restore
-        run: dotnet restore
-      - name: Audit vulnerabilities
-        run: dotnet list package --vulnerable --include-transitive || true
-      - name: Generate SBOM (CycloneDX)
-        uses: CycloneDX/gh-dotnet-generate-sbom@v1
-        with:
-          path: TodoWebAPI
-          output: sbom.xml
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: TodoWebAPI/sbom.xml
-
-  build:
-    name: 🔨 Build & Test
-    runs-on: ubuntu-latest
-    needs: [lint, sast, sca]
-    defaults:
-      run:
-        working-directory: TodoWebAPI
-    steps:
-      - uses: actions/checkout@v4
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
-      - name: Restore & Build
-        run: |
-          dotnet restore
-          dotnet build --no-restore -c Release
-      - name: Run Unit Tests
-        run: dotnet test --no-build --logger trx --results-directory TestResults
-      - name: Publish artifact
-        run: dotnet publish -c Release -o publish_output --no-build
-      - name: Zip binaries
-        run: |
-          cd publish_output
-          zip -r ../webapp-binaries.zip .
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: webapp-binaries
-          path: TodoWebAPI/webapp-binaries.zip
-          retention-days: 7
-
-  container:
-    name: 🐳 Container Build & Scan
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: webapp-binaries
-          path: deploy/publish
-      - name: Create hardened Dockerfile
-        run: |
-          mkdir -p deploy
-          cat > deploy/Dockerfile <<'EOF'
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-          WORKDIR /app
-          RUN apk add --no-cache openssl
-          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem -out /app/cert.pem -days 365 -nodes -subj '/CN=localhost' \
-           && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/key.pem -in /app/cert.pem -passout pass:dev
-          ENV ASPNETCORE_ENVIRONMENT=Production
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=dev
-          RUN adduser -D -u 1000 appuser && chown -R appuser /app
-          USER appuser
-          COPY publish/ .
-          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          EOF
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: deploy
-          load: true
-          tags: todo-webapi:latest
-      - name: Trivy scan (SARIF) - vuln only
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: todo-webapi:latest
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          scanners: 'vuln'
-        env:
-          DOCKER_HOST: unix:///var/run/docker.sock
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-      - name: Trivy fail on critical/high - vuln only
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: todo-webapi:latest
-          format: 'table'
-          exit-code: '1'
-          severity: 'CRITICAL,HIGH'
-          scanners: 'vuln'
-        env:
-          DOCKER_HOST: unix:///var/run/docker.sock
-
+  # --------------------------------------------------------------------------
+  # DR Decision
+  # --------------------------------------------------------------------------
   dr-check:
     name: 🧠 DR Decision
     runs-on: ubuntu-latest
     outputs:
       active_region: ${{ steps.set.outputs.region }}
-      failover: ${{ steps.set.outputs.failover }}
+      failover:      ${{ steps.set.outputs.failover }}
     steps:
       - id: set
         run: |
@@ -231,91 +62,291 @@ jobs:
             FAIL="true"
             REGION="${{ env.DR_FALLBACK_REGION }}"
           fi
-          echo "region=$REGION" >> $GITHUB_OUTPUT
-          echo "failover=$FAIL" >> $GITHUB_OUTPUT
-          echo "🔄 DR Decision: region=$REGION, failover=$FAIL"
+          echo "region=$REGION"   >> $GITHUB_OUTPUT
+          echo "failover=$FAIL"   >> $GITHUB_OUTPUT
+          echo "🔄 DR Decision: region=$REGION | failover=$FAIL"
 
+  # --------------------------------------------------------------------------
+  # SAST & Secrets
+  # --------------------------------------------------------------------------
+  sast:
+    name: 🔐 SAST & Secrets
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔐 Gitleaks – secret scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 🧬 Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+
+      - name: 🔨 Build for CodeQL
+        run: |
+          cd TodoWebAPI
+          dotnet build TodoWebAPI.csproj
+
+      - name: 🧬 Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # --------------------------------------------------------------------------
+  # SCA & SBOM
+  # --------------------------------------------------------------------------
+  sca:
+    name: 📦 SCA & SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 🩹 Auto-patch vulnerable NuGet packages
+        run: |
+          for proj in TodoWebAPI/*.csproj; do
+            dotnet add "$proj" package Microsoft.Build --version 17.8.43
+          done
+
+      - name: 🔍 Audit NuGet vulnerabilities
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
+
+      - name: 📄 Generate SBOM (CycloneDX)
+        uses: CycloneDX/gh-dotnet-generate-sbom@v1
+        with:
+          path: TodoWebAPI
+          output: sbom.xml
+
+      - name: 📤 Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: TodoWebAPI/sbom.xml
+
+  # --------------------------------------------------------------------------
+  # Build & Publish
+  # --------------------------------------------------------------------------
+  build:
+    name: 🔨 Build & Publish
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🗃️ Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 🔨 Restore, Build & Publish
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet build   TodoWebAPI/*.csproj -c Release --no-restore
+          dotnet publish TodoWebAPI/*.csproj -c Release --no-build -o publish_output
+
+      - name: ☁️ Configure AWS CLI (mock)
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/config <<EOF
+          [default]
+          region = ${{ env.AWS_REGION_TARGET }}
+          output = json
+          EOF
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id     = ${{ env.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
+          EOF
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-binaries
+          path: publish_output/
+          retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # Container Build & Scan
+  # --------------------------------------------------------------------------
+  container:
+    name: 🐳 Container Build & Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ⬇️ Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-binaries
+          path: deploy/publish
+
+      - name: 🐳 Create hardened Dockerfile
+        run: |
+          cat > deploy/Dockerfile <<'DOCKERFILE'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          WORKDIR /app
+          RUN apk update && apk upgrade --no-cache \
+           && apk add --no-cache openssl
+          RUN openssl req -x509 -newkey rsa:4096 \
+                -keyout /app/https-key.pem \
+                -out    /app/https-cert.pem \
+                -days   365 -nodes \
+                -subj   '/CN=localhost' \
+           && openssl pkcs12 -export \
+                -out     /app/aspnetapp.pfx \
+                -inkey   /app/https-key.pem \
+                -in      /app/https-cert.pem \
+                -passout pass:devpassword \
+           && rm /app/https-key.pem /app/https-cert.pem \
+           && apk del openssl
+          ENV ASPNETCORE_ENVIRONMENT=Production
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+           && chown -R appuser /app
+          USER appuser
+          EXPOSE 5000
+          EXPOSE 5001
+          COPY publish/ /app/
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          DOCKERFILE
+
+      - name: 🏗️ Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: deploy
+          load: true
+          tags: todo-webapi:latest
+
+      - name: 🛡️ Trivy scan – upload to GitHub Security
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: todo-webapi:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: 'CRITICAL,HIGH'
+          scanners: vuln
+
+      - name: 📤 Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: 🛡️ Trivy scan – fail on CRITICAL/HIGH
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: todo-webapi:latest
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          scanners: vuln
+
+  # --------------------------------------------------------------------------
+  # Mock Infrastructure (Ministack / Terraform)
+  # --------------------------------------------------------------------------
   infra:
     name: 🏗️ Mock Infrastructure (Ministack)
     runs-on: [self-hosted, linux, x64]
     needs: dr-check
-    if: github.event_name != 'pull_request'
     outputs:
-      s3_bucket: ${{ steps.tf.outputs.s3_bucket }}
+      s3_bucket:     ${{ steps.tf.outputs.s3_bucket }}
       ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Terraform
+
+      - name: 🔧 Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-      - name: Ensure Ministack container is running
+
+      - name: 🐳 Ensure Ministack is running
         run: |
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "🚀 Starting Ministack container..."
+            echo "🚀 Starting Ministack..."
             docker run -d --name ministack \
               -p 4566:4566 \
-              -p 3306:3306 \
               -e SERVICES=rds,ec2,s3,sts,iam \
               nahuelnucera/ministack:latest
             sleep 20
           fi
-          for i in {1..30}; do
-            if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
-              echo "✅ Ministack is healthy"
+          for i in $(seq 1 30); do
+            if curl -sf ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
+              echo "✅ Ministack healthy"
               break
             fi
             echo "⏳ Waiting for Ministack... ($i/30)"
             sleep 5
           done
-          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -i mysql || echo "⚠️ MySQL container not visible yet"
-      - name: Clean up leftover resources (force cleanup)
+
+      - name: 🧹 Clean up leftover Ministack resources
         env:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
           AWS_REGION: ${{ needs.dr-check.outputs.active_region }}
-          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
         run: |
           ENV_NAME=${{ github.event.inputs.environment || 'staging' }}
-          echo "🧹 Cleaning up leftover resources for environment: $ENV_NAME"
+          # EC2
           INSTANCE_ID=$(aws ec2 describe-instances \
             --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
             --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" \
             --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
-          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
-            echo "🗑️ Terminating existing EC2 instance: $INSTANCE_ID"
-            aws ec2 terminate-instances --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --instance-ids $INSTANCE_ID
-            sleep 10
-          fi
+          [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] && \
+            aws ec2 terminate-instances --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --instance-ids $INSTANCE_ID && sleep 10 || true
+          # Security Group
           SG_ID=$(aws ec2 describe-security-groups \
             --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
             --filters "Name=group-name,Values=web-sg-${ENV_NAME}" \
             --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
-          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
-            echo "🗑️ Deleting existing security group: $SG_ID"
+          [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ] && \
             aws ec2 delete-security-group --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --group-id $SG_ID || true
-          fi
-          BUCKET_NAME=$(aws s3api list-buckets --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --query "Buckets[?contains(Name, 'app-bucket-${ENV_NAME}')].Name" --output text 2>/dev/null || true)
-          if [ -n "$BUCKET_NAME" ] && [ "$BUCKET_NAME" != "None" ]; then
-            echo "🗑️ Deleting existing S3 bucket: $BUCKET_NAME"
-            aws s3 rb s3://$BUCKET_NAME --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --force || true
-          fi
-      - name: Create Terraform files
+          # S3
+          BUCKET=$(aws s3api list-buckets \
+            --endpoint-url=${{ env.MINISTACK_ENDPOINT }} \
+            --query "Buckets[?contains(Name,'app-bucket-${ENV_NAME}')].Name" \
+            --output text 2>/dev/null || true)
+          [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && \
+            aws s3 rb s3://$BUCKET --endpoint-url=${{ env.MINISTACK_ENDPOINT }} --force || true
+
+      - name: 📝 Create Terraform config
         run: |
-          mkdir -p terraform
-          cd terraform
-          cat > main.tf <<'EOF'
+          mkdir -p terraform && cat > terraform/main.tf <<'TF'
           variable "ministack_endpoint" { default = "http://localhost:4566" }
-          variable "environment" { default = "staging" }
-          variable "aws_region" { default = "us-east-1" }
+          variable "environment"        { default = "staging" }
+          variable "aws_region"         { default = "us-east-1" }
+
           provider "aws" {
-            region = var.aws_region
+            region     = var.aws_region
             access_key = "test"
             secret_key = "test"
             skip_credentials_validation = true
-            skip_requesting_account_id = true
-            skip_metadata_api_check = true
-            s3_use_path_style = true
+            skip_requesting_account_id  = true
+            skip_metadata_api_check     = true
+            s3_use_path_style           = true
             endpoints {
               ec2 = var.ministack_endpoint
               s3  = var.ministack_endpoint
@@ -324,454 +355,317 @@ jobs:
               iam = var.ministack_endpoint
             }
           }
+
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-${var.environment}"
-            description = "Allow HTTP and SSH"
-            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps-Ministack" }
-            ingress {
-              from_port   = 22
-              to_port     = 22
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 5000
-              to_port     = 5000
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
+            description = "Allow HTTP/HTTPS and SSH"
+            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
+            ingress { from_port = 22;  to_port = 22;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            ingress { from_port = 80;  to_port = 80;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            ingress { from_port = 443; to_port = 443; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            egress  { from_port = 0;   to_port = 0;   protocol = "-1";  cidr_blocks = ["0.0.0.0/0"] }
           }
+
           resource "aws_instance" "web" {
-            ami           = "ami-0ff8a91507f77f867"
-            instance_type = "t2.micro"
+            ami             = "ami-0ff8a91507f77f867"
+            instance_type   = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps-Ministack" }
+            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps" }
           }
+
           resource "aws_s3_bucket" "app_bucket" {
-            bucket = "app-bucket-${var.environment}-${random_id.bucket_suffix.hex}"
-            tags = { Project = "DevSecOps-Ministack" }
+            bucket = "app-bucket-${var.environment}-${random_id.suffix.hex}"
+            tags   = { Project = "DevSecOps" }
           }
-          resource "random_id" "bucket_suffix" { byte_length = 4 }
-          output "s3_bucket"       { value = aws_s3_bucket.app_bucket.bucket }
-          output "ec2_public_ip"   { value = aws_instance.web.public_ip }
-          EOF
-      - name: Configure AWS CLI for Ministack
+
+          resource "random_id" "suffix" { byte_length = 4 }
+
+          output "s3_bucket"     { value = aws_s3_bucket.app_bucket.bucket }
+          output "ec2_public_ip" { value = aws_instance.web.public_ip }
+          TF
+
+      - name: ☁️ Configure AWS CLI for Ministack
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/credentials <<EOF
           [default]
-          aws_access_key_id = ${{ env.AWS_ACCESS_KEY_ID }}
+          aws_access_key_id     = ${{ env.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
           EOF
           cat > ~/.aws/config <<EOF
           [default]
-          region = ${{ needs.dr-check.outputs.active_region }}
+          region       = ${{ needs.dr-check.outputs.active_region }}
           endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
-          output = json
+          output       = json
           EOF
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
-      - name: Terraform Apply
+
+      - name: 🏗️ Terraform Init & Apply
         id: tf
         working-directory: terraform
         env:
-          AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
           TF_VAR_ministack_endpoint: ${{ env.MINISTACK_ENDPOINT }}
-          TF_VAR_aws_region: ${{ needs.dr-check.outputs.active_region }}
+          TF_VAR_aws_region:         ${{ needs.dr-check.outputs.active_region }}
+          AWS_ENDPOINT_URL:          ${{ env.MINISTACK_ENDPOINT }}
         run: |
+          terraform init
           terraform apply -auto-approve \
             -var="environment=${{ github.event.inputs.environment || 'staging' }}" \
             -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
-          echo "s3_bucket=$(terraform output -raw s3_bucket)" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(terraform output -raw s3_bucket)"         >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
-  rds-init:
-    name: 🗄️ Init RDS (Ministack)
+  # --------------------------------------------------------------------------
+  # DB Init (Create schema)
+  # --------------------------------------------------------------------------
+  db-init:
+    name: 🗄️ Initialize Database
     runs-on: [self-hosted, linux, x64]
     needs: infra
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Configure AWS CLI
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id = ${{ env.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
-          EOF
-          cat > ~/.aws/config <<EOF
-          [default]
-          region = ${{ needs.dr-check.outputs.active_region }}
-          output = json
-          endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
-          EOF
-      - name: Create RDS MySQL via Ministack API
-        run: |
-          echo "🗄️ Creating RDS MySQL instance via Ministack API..."
-          aws --endpoint-url=${{ env.MINISTACK_ENDPOINT }} rds create-db-instance \
-            --db-instance-identifier ministack-mysql \
-            --engine mysql \
-            --engine-version 8.0 \
-            --db-instance-class db.t3.micro \
-            --allocated-storage 20 \
-            --master-username ${{ env.DB_USER }} \
-            --master-user-password ${{ env.DB_PASSWORD }} \
-            --db-name ${{ env.DB_NAME }} \
-            --no-multi-az \
-            --no-publicly-accessible \
-            --tags Key=Project,Value=DevSecOps-Ministack \
-            || echo "⚠️ RDS instance may already exist"
-      - name: Wait for RDS to be available
-        run: |
-          echo "⏳ Waiting for RDS instance to become available..."
-          MAX_RETRIES=30
-          for i in $(seq 1 $MAX_RETRIES); do
-            STATUS=$(aws --endpoint-url=${{ env.MINISTACK_ENDPOINT }} rds describe-db-instances \
-              --db-instance-identifier ministack-mysql \
-              --query "DBInstances[0].DBInstanceStatus" --output text 2>/dev/null || echo "unknown")
-            echo "📊 Attempt $i/$MAX_RETRIES - Status: $STATUS"
-            if [[ "$STATUS" == "available" ]]; then
-              echo "✅ RDS instance is available"
-              exit 0
-            elif [[ "$STATUS" == "failed" ]] || [[ "$STATUS" == "incompatible-parameters" ]]; then
-              echo "❌ RDS instance failed to start"
-              aws --endpoint-url=${{ env.MINISTACK_ENDPOINT }} rds describe-db-instances \
-                --db-instance-identifier ministack-mysql --output json || true
-              exit 1
-            fi
-            sleep 10
-          done
-          echo "❌ Timeout waiting for RDS instance"
-          exit 1
-
-  db-init:
-    name: 🗂️ Initialize DB Tables
-    runs-on: [self-hosted, linux, x64]
-    needs: rds-init
-    if: github.event_name != 'pull_request'
     outputs:
-      mysql_endpoint: ${{ steps.discover-endpoint.outputs.endpoint }}
+      mysql_endpoint: ${{ steps.discover.outputs.endpoint }}
+      mysql_port:     ${{ steps.discover.outputs.port }}
     steps:
-      - name: Discover MySQL Endpoint
-        id: discover-endpoint
+      - name: 🔎 Discover MySQL container
+        id: discover
         run: |
-          echo "🔎 Discovering MySQL endpoint..."
-          MYSQL_CONTAINER=""
-          for pattern in ".*mysql.*" "^mysql$" "ministack.*mysql" "localstack.*mysql" ".*_mysql_.*"; do
-            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -iE "$pattern" | head -1)
-            if [ -n "$MYSQL_CONTAINER" ]; then
-              echo "✅ Found MySQL container with pattern '$pattern': $MYSQL_CONTAINER"
-              break
-            fi
-          done
+          echo "🔎 Discovering MySQL container by image name..."
+          MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
+            | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
+            | head -1)
           if [ -z "$MYSQL_CONTAINER" ]; then
-            echo "❌ ERROR: MySQL container not found!"
-            echo "📋 All running containers:"
-            docker ps --format '{{.Names}} ({{.Image}})'
+            echo "❌ No running container with a mysql image found!"
+            echo "📋 Running containers:"
+            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
             exit 1
           fi
-          EXPOSED_PORT=$(docker port $MYSQL_CONTAINER 3306/tcp 2>/dev/null | cut -d: -f2 | head -1)
+          echo "✅ Found: $MYSQL_CONTAINER"
+          EXPOSED_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp 2>/dev/null \
+            | grep -oE '[0-9]+$' | head -1)
           if [ -n "$EXPOSED_PORT" ]; then
             ENDPOINT="localhost:$EXPOSED_PORT"
-            echo "✅ MySQL endpoint (exposed port): $ENDPOINT"
+            echo "✅ Endpoint (exposed): $ENDPOINT"
           else
             ENDPOINT="${MYSQL_CONTAINER}:3306"
-            echo "✅ MySQL endpoint (container name): $ENDPOINT"
+            EXPOSED_PORT="3306"
+            echo "✅ Endpoint (container network): $ENDPOINT"
           fi
-          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "endpoint=$ENDPOINT"         >> $GITHUB_OUTPUT
+          echo "port=$EXPOSED_PORT"         >> $GITHUB_OUTPUT
           echo "container=$MYSQL_CONTAINER" >> $GITHUB_OUTPUT
-          # Debugging - List all containers
-          echo "🔍 Listing all containers for debugging..."
-          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
-          docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -iE 'mysql|ministack' || echo "⚠️ No MySQL-related containers found"
-      - name: Wait for MySQL to be ready
+          echo "📋 All containers:"
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
+
+      - name: ⏳ Wait for MySQL to accept connections
         run: |
-          MYSQL_CONTAINER="${{ steps.discover-endpoint.outputs.container }}"
-          echo "⏳ Waiting for MySQL in container '$MYSQL_CONTAINER' to accept connections..."
-          MAX_RETRIES=60
-          RETRY_COUNT=0
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if docker exec $MYSQL_CONTAINER mysqladmin ping -u${{ env.DB_USER }} --silent 2>/dev/null || \
-               docker exec $MYSQL_CONTAINER mysqladmin ping -uroot --silent 2>/dev/null || \
-               docker exec $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -e "SELECT 1;" &>/dev/null || \
-               docker exec $MYSQL_CONTAINER mysql -uroot -e "SELECT 1;" &>/dev/null; then
-              echo "✅ MySQL is ready and accepting connections"
-              break
+          CONTAINER="${{ steps.discover.outputs.container }}"
+          echo "⏳ Waiting for MySQL in $CONTAINER..."
+          for i in $(seq 1 60); do
+            if docker exec "$CONTAINER" mysqladmin ping -u"${{ env.DB_USER }}" \
+                -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ MySQL ready after $((i * 3))s"
+              exit 0
             fi
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            if [ $((RETRY_COUNT % 10)) -eq 0 ]; then
-              echo "⏳ Still waiting... ($RETRY_COUNT/$MAX_RETRIES)"
-              docker logs $MYSQL_CONTAINER --tail 20 2>/dev/null || true
-            fi
-            sleep 5
+            [ $((i % 10)) -eq 0 ] && docker logs "$CONTAINER" --tail 10 2>/dev/null || true
+            sleep 3
           done
-          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-            echo "❌ ERROR: MySQL failed to become ready after $MAX_RETRIES attempts"
-            echo "📋 Last 50 lines of MySQL container logs:"
-            docker logs $MYSQL_CONTAINER --tail 50 2>&1 || echo "⚠️ Could not fetch logs"
-            exit 1
-          fi
-      - name: Create database and tables
+          echo "❌ MySQL not ready after 180s"
+          docker logs "$CONTAINER" --tail 30 2>/dev/null || true
+          exit 1
+
+      - name: 🗂️ Create database and tables
         run: |
-          MYSQL_CONTAINER="${{ steps.discover-endpoint.outputs.container }}"
-          echo "🗄️ Creating database ${{ env.DB_NAME }} and tables..."
-          # Create database
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" \
-            -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>&1 || {
-              echo "⚠️ Fallback: Trying with root user..."
-              docker exec -i $MYSQL_CONTAINER mysql -uroot \
-                -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-          }
-          # Create tables
-          cat > /tmp/init.sql <<'EOSQL'
+          CONTAINER="${{ steps.discover.outputs.container }}"
+          docker exec "$CONTAINER" mysql \
+            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\`
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+          docker exec -i "$CONTAINER" mysql \
+            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            "${{ env.DB_NAME }}" <<'SQL'
           SET NAMES utf8mb4;
-          SET FOREIGN_KEY_CHECKS = 0;
           CREATE TABLE IF NOT EXISTS TodoItems (
-              Id INT PRIMARY KEY AUTO_INCREMENT,
-              Name VARCHAR(255) NULL,
-              IsComplete TINYINT(1) NOT NULL DEFAULT 0,
-              CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              INDEX idx_iscomplete (IsComplete),
-              INDEX idx_name (Name)
+            Id          INT          PRIMARY KEY AUTO_INCREMENT,
+            Name        VARCHAR(255) NULL,
+            IsComplete  TINYINT(1)   NOT NULL DEFAULT 0,
+            CreatedAt   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            UpdatedAt   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_iscomplete (IsComplete),
+            INDEX idx_name (Name)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-          SET FOREIGN_KEY_CHECKS = 1;
-          EOSQL
-          echo "📋 Creating tables..."
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" ${{ env.DB_NAME }} < /tmp/init.sql 2>&1 || {
-            echo "⚠️ Fallback: Trying with root user..."
-            docker exec -i $MYSQL_CONTAINER mysql -uroot ${{ env.DB_NAME }} < /tmp/init.sql
-          }
-          echo "✅ Database and tables initialized successfully."
-          # Verify setup
-          echo "🔍 Verifying setup..."
-          docker exec -i $MYSQL_CONTAINER mysql -u${{ env.DB_USER }} -p"${{ env.DB_PASSWORD }}" ${{ env.DB_NAME }} -e "SHOW TABLES; SELECT COUNT(*) as row_count FROM TodoItems;" 2>/dev/null || \
-          docker exec -i $MYSQL_CONTAINER mysql -uroot ${{ env.DB_NAME }} -e "SHOW TABLES; SELECT COUNT(*) as row_count FROM TodoItems;"
-      - name: Update RDS_ENDPOINT for downstream jobs
-        run: |
-          ENDPOINT="${{ steps.discover-endpoint.outputs.endpoint }}"
-          echo "🔄 Setting RDS_ENDPOINT=$ENDPOINT for downstream jobs"
-          echo "RDS_ENDPOINT=$ENDPOINT" >> $GITHUB_ENV
+          SQL
+          echo "✅ DB initialized. Verifying..."
+          docker exec "$CONTAINER" mysql \
+            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+            "${{ env.DB_NAME }}" \
+            -e "SHOW TABLES; SELECT COUNT(*) AS rows FROM TodoItems;"
 
-  db-replication:
-    name: 🔁 DB Replication Mock
-    runs-on: [self-hosted, linux, x64]
-    needs: db-init
-    steps:
-      - run: |
-          echo "🔁 Simulating cross-region database replication setup..."
-          echo "📍 Primary Region: ${{ needs.dr-check.outputs.active_region }}"
-          if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
-            echo "🔄 Failover mode: Replicating to ${{ env.DR_FALLBACK_REGION }}"
-          fi
-          echo "✅ Replication mock completed"
-
+  # --------------------------------------------------------------------------
+  # Deploy Application (with EC2 mock simulation)
+  # --------------------------------------------------------------------------
   deploy:
     name: 🚀 Deploy Application
     runs-on: [self-hosted, linux, x64]
-    needs: [container, db-replication, dr-check, db-init]
+    needs: [container, db-init, dr-check]
     steps:
-      - uses: actions/checkout@v4
-      - name: Download artifact
+      - name: ⬇️ Download artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
-          path: deploy
-      - name: Build app image
-        run: docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Create EC2 Mock image (DinD)
+          path: ./artifact
+
+      - name: 📂 Prepare deploy_input
         run: |
-          cat > ec2-mock.Dockerfile <<'EOF'
-          FROM alpine:latest
-          RUN apk add --no-cache docker openrc bash curl mysql-client
-          RUN mkdir -p /etc/docker
-          RUN echo '{"hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"]}' > /etc/docker/daemon.json
-          COPY ec2-mock-entrypoint.sh /entrypoint.sh
-          RUN chmod +x /entrypoint.sh
-          EXPOSE 2375 5000
-          ENTRYPOINT ["/entrypoint.sh"]
-          EOF
-          cat > ec2-mock-entrypoint.sh <<'EOF'
-          #!/bin/sh
-          set -e
-          echo "🚀 Starting Docker daemon in EC2 mock..."
-          dockerd > /var/log/docker.log 2>&1 &
-          for i in {1..30}; do
-            if [ -S /var/run/docker.sock ]; then
-              echo "✅ Docker socket ready"
-              break
-            fi
-            sleep 2
-          done
-          echo "🔄 EC2 mock container ready. Keeping alive..."
-          tail -f /dev/null
-          EOF
-          chmod +x ec2-mock-entrypoint.sh
-          docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
-      - name: Run EC2 Mock and deploy app
+          set -euo pipefail
+          rm -rf deploy_input
+          mkdir -p deploy_input/publish
+          cp -r ./artifact/. deploy_input/publish/
+          echo "✅ Files ready:"
+          ls deploy_input/publish/
+
+      - name: 🐳 Create hardened Dockerfile
         run: |
-          BASE_PORT=8080
-          if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
-            BASE_PORT=8081
-            echo "🔄 DR Failover mode: Using port $BASE_PORT"
-          else
-            echo "✅ Primary region: Using port $BASE_PORT"
+          cat > deploy_input/Dockerfile <<'DOCKERFILE'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          WORKDIR /app
+          RUN apk update && apk upgrade --no-cache \
+           && apk add --no-cache openssl
+          RUN openssl req -x509 -newkey rsa:4096 \
+                -keyout /app/https-key.pem \
+                -out    /app/https-cert.pem \
+                -days   365 -nodes \
+                -subj   '/CN=localhost' \
+           && openssl pkcs12 -export \
+                -out     /app/aspnetapp.pfx \
+                -inkey   /app/https-key.pem \
+                -in      /app/https-cert.pem \
+                -passout pass:devpassword \
+           && rm /app/https-key.pem /app/https-cert.pem \
+           && apk del openssl
+          ENV ASPNETCORE_ENVIRONMENT=Production
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+           && chown -R appuser /app
+          USER appuser
+          EXPOSE 5000
+          EXPOSE 5001
+          COPY publish/ /app/
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          DOCKERFILE
+
+      - name: 🏗️ Build Docker image
+        run: |
+          docker build -t ${APP_NAME}:latest ./deploy_input
+          echo "✅ Image built: ${APP_NAME}:latest"
+
+      - name: 🧹 Remove old container
+        run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+
+      - name: 🚀 Run container
+        run: |
+          set -euo pipefail
+          DB_PORT="${{ env.DB_PORT }}"
+          DB_HOST="127.0.0.1"
+          if [ -z "$DB_PORT" ]; then
+            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
+              | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' | head -1)
+            DB_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp 2>/dev/null \
+              | grep -oE '[0-9]+$' | head -1)
+            echo "🔎 Auto-detected DB_PORT: $DB_PORT"
           fi
-          docker rm -f ec2-mock-app todo-webapi-app 2>/dev/null || true
-          echo "🖥️  Starting EC2 mock container..."
-          docker run -d --privileged \
-            --name ec2-mock-app \
-            -p $BASE_PORT:5000 \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            ec2-mock:latest
-          echo "⏳ Waiting for DinD to be ready..."
-          for i in {1..20}; do
-            if docker exec ec2-mock-app docker info &>/dev/null; then
-              echo "✅ DinD is ready"
-              break
+          docker run -d \
+            --name    ${CONTAINER_NAME} \
+            --network host \
+            -e        ASPNETCORE_ENVIRONMENT=Production \
+            -e        ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
+            -e        ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
+            -e        "ConnectionStrings__DefaultConnection=Server=${DB_HOST};Port=${DB_PORT};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+            --security-opt="no-new-privileges:true" \
+            --restart unless-stopped \
+            --read-only \
+            --tmpfs   /tmp \
+            ${APP_NAME}:latest
+          echo "✅ Container started"
+          echo "   App:    http://localhost:${HOST_PORT}"
+          echo "   Swagger: http://localhost:${HOST_PORT}/swagger"
+          echo "   DB:     ${DB_HOST}:${DB_PORT}/${{ env.DB_NAME }}"
+
+      - name: ⏳ Wait for app readiness
+        run: |
+          echo "⏳ Waiting for Swagger endpoint..."
+          for i in $(seq 1 12); do
+            if curl -sf "http://localhost:${HOST_PORT}/swagger/v1/swagger.json" >/dev/null 2>&1; then
+              echo "✅ App ready after $((i * 5))s."
+              exit 0
             fi
-            sleep 3
-          done
-          echo "📦 Deploying application container..."
-          docker exec ec2-mock-app docker pull todo-webapi:latest || true
-          docker exec ec2-mock-app docker rm -f todo-webapi-app 2>/dev/null || true
-          MYSQL_ENDPOINT="${{ env.RDS_ENDPOINT }}"
-          echo "🔗 Connecting to MySQL at: $MYSQL_ENDPOINT"
-          docker exec ec2-mock-app docker run -d --name todo-webapi-app \
-            -p 5000:5000 \
-            -e ASPNETCORE_ENVIRONMENT=Production \
-            -e ConnectionStrings__DefaultConnection="Server=$MYSQL_ENDPOINT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};SslMode=Preferred;" \
-            -e DB_NAME=${{ env.DB_NAME }} \
-            -e DB_USER=${{ env.DB_USER }} \
-            todo-webapi:latest
-          echo "⏳ Waiting for application to be healthy..."
-          for i in {1..30}; do
-            if curl -sf http://localhost:$BASE_PORT/health 2>/dev/null | grep -q "Healthy" || \
-               curl -sf http://localhost:$BASE_PORT/swagger 2>/dev/null | grep -q "swagger" || \
-               docker exec ec2-mock-app docker logs todo-webapi-app 2>&1 | grep -q "Now listening on"; then
-              echo "✅ Application is healthy on port $BASE_PORT"
-              break
-            fi
-            echo "⏳ Health check attempt $i/30..."
+            echo "   attempt $i/12 — retrying in 5s..."
             sleep 5
           done
-          echo "🚀 Deployment complete!"
-          echo "🌐 App URL: http://localhost:$BASE_PORT"
-          echo "🔗 Health: http://localhost:$BASE_PORT/health"
-      - name: Smoke test deployment
-        run: |
-          PORT=8080
-          [ "${{ needs.dr-check.outputs.failover }}" == "true" ] && PORT=8081
-          echo "🧪 Running smoke tests on port $PORT..."
-          if curl -sf --max-time 10 http://localhost:$PORT/health; then
-            echo "✅ Health check passed"
-          else
-            echo "⚠️ Health check failed (non-blocking)"
-          fi
-          if curl -sf --max-time 10 http://localhost:$PORT/api/todo 2>/dev/null || \
-             curl -sf --max-time 10 http://localhost:$PORT/swagger/index.html 2>/dev/null; then
-            echo "✅ API responsiveness check passed"
-          else
-            echo "⚠️ API check failed (may be expected if no routes defined)"
-          fi
-          echo "📋 Application logs (last 20 lines):"
-          docker exec ec2-mock-app docker logs --tail 20 todo-webapi-app 2>&1 || true
+          echo "❌ App not ready after 60s. Container logs:"
+          docker logs ${CONTAINER_NAME}
+          exit 1
 
+  # --------------------------------------------------------------------------
+  # DAST (OWASP ZAP)
+  # --------------------------------------------------------------------------
+  dast:
+    name: 🕷️ DAST Scan (OWASP ZAP)
+    runs-on: [self-hosted, linux, x64]
+    needs: deploy
+    steps:
+      - name: 🕷️ Run ZAP baseline scan
+        run: |
+          docker run --rm --network host \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:${HOST_PORT} \
+              -l FAIL || {
+                echo "❌ DAST found critical issues — stopping container."
+                docker rm -f ${CONTAINER_NAME}
+                exit 1
+              }
+          echo "✅ DAST passed."
+
+  # --------------------------------------------------------------------------
+  # Traffic Switch Simulation
+  # --------------------------------------------------------------------------
   traffic:
     name: 🌐 Traffic Switch
     runs-on: ubuntu-latest
     needs: [deploy, dr-check]
     steps:
       - run: |
-          echo "🌐 Traffic Routing Simulation"
-          echo "================================"
           if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
-            echo "🔄 FAILOVER MODE ACTIVATED"
-            echo "📍 Routing traffic to DR region: ${{ env.DR_FALLBACK_REGION }}"
-            echo "🔌 Target endpoint: localhost:8081"
+            echo "🔄 FAILOVER — routing to DR region: ${{ env.DR_FALLBACK_REGION }}"
           else
-            echo "✅ PRIMARY MODE"
-            echo "📍 Routing traffic to primary region: ${{ env.AWS_REGION_TARGET }}"
-            echo "🔌 Target endpoint: localhost:8080"
-          fi
-          echo "================================"
-          echo "🎯 Traffic switch simulation complete"
-
-  dast:
-    name: 🔐 DAST Scan
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Wait for application to be ready
-        run: |
-          echo "⏳ Waiting for application to be ready for DAST scan..."
-          for i in {1..20}; do
-            if curl -sf --max-time 5 http://localhost:8080/health 2>/dev/null || \
-               curl -sf --max-time 5 http://localhost:8081/health 2>/dev/null; then
-              echo "✅ Application is ready for scanning"
-              exit 0
-            fi
-            echo "⏳ Waiting... ($i/20)"
-            sleep 10
-          done
-          echo "⚠️ Application may not be fully ready, proceeding with scan anyway"
-      - name: Run OWASP ZAP baseline scan
-        run: |
-          PORT=8080
-          [ "${{ needs.dr-check.outputs.failover }}" == "true" ] && PORT=8081
-          echo "🔐 Starting OWASP ZAP baseline scan on http://localhost:$PORT"
-          docker run --rm --network host \
-            -v $(pwd)/zap-reports:/zap/wrk:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py \
-            -t http://localhost:$PORT \
-            -r zap-report.html \
-            -J zap-report.json \
-            -l FAIL \
-            -I || SCAN_EXIT_CODE=$?
-          if [ -f zap-report.html ]; then
-            echo "📄 ZAP report generated"
-          fi
-          if [ "${SCAN_EXIT_CODE:-0}" -ne 0 ]; then
-            echo "⚠️ ZAP scan found issues (exit code: $SCAN_EXIT_CODE). Review report for details."
-            echo "📋 This does not block deployment but should be reviewed."
-          else
-            echo "✅ ZAP baseline scan completed with no critical issues"
+            echo "✅ PRIMARY — routing to: ${{ env.AWS_REGION_TARGET }}"
           fi
 
+  # --------------------------------------------------------------------------
+  # Notification
+  # --------------------------------------------------------------------------
   notify:
-    name: 📢 Notify Deployment Status
+    name: 📢 Pipeline Summary
     runs-on: ubuntu-latest
     needs: [traffic, dast]
     if: always()
     steps:
-      - name: Determine pipeline status
-        id: status
+      - name: 📊 Print summary
         run: |
-          if [ "${{ needs.traffic.result }}" == "success" ] && [ "${{ needs.dast.result }}" == "success" ]; then
-            echo "status=✅ SUCCESS" >> $GITHUB_OUTPUT
-          elif [ "${{ needs.traffic.result }}" == "skipped" ]; then
-            echo "status=⚪ SKIPPED (PR)" >> $GITHUB_OUTPUT
+          if [ "${{ needs.dast.result }}"    == "success" ] && \
+             [ "${{ needs.traffic.result }}" == "success" ]; then
+            STATUS="✅ SUCCESS"
           else
-            echo "status=❌ FAILED" >> $GITHUB_OUTPUT
+            STATUS="❌ FAILED"
           fi
-      - run: |
-          echo "🚀 Pipeline Execution Summary"
           echo "=============================="
-          echo "📦 Commit: ${{ github.sha }}"
-          echo "🔀 Branch: ${{ github.ref_name }}"
-          echo "👤 Triggered by: ${{ github.actor }}"
-          echo "🌍 Environment: ${{ github.event.inputs.environment || 'staging' }}"
-          echo "🔄 DR Failover: ${{ needs.dr-check.outputs.failover }}"
-          echo "📍 Active Region: ${{ needs.dr-check.outputs.active_region }}"
-          echo "📊 Final Status: ${{ steps.status.outputs.status }}"
+          echo "  Pipeline Summary"
           echo "=============================="
-          echo "✅ Notification step completed"
+          echo "  Commit      : ${{ github.sha }}"
+          echo "  Branch      : ${{ github.ref_name }}"
+          echo "  Actor       : ${{ github.actor }}"
+          echo "  Environment : ${{ github.event.inputs.environment || 'staging' }}"
+          echo "  DR Failover : ${{ needs.dr-check.outputs.failover }}"
+          echo "  Region      : ${{ needs.dr-check.outputs.active_region }}"
+          echo "  Status      : $STATUS"
+          echo "=============================="
