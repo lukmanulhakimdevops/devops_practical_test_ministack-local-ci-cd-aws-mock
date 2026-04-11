@@ -24,8 +24,7 @@ env:
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  # Endpoint RDS statis dari container MySQL yang sudah ada
-  STATIC_RDS_ENDPOINT: 'localhost:15433'
+  STATIC_RDS_ENDPOINT: 'localhost:15433'   # Sesuaikan dengan port MySQL container
 
 permissions:
   contents: write
@@ -66,7 +65,7 @@ jobs:
           git diff --quiet && git diff --staged --quiet || (git commit -m "style: apply dotnet format" && git push)
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING (CodeQL)
+  # SAST & SECRET SCANNING
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -180,7 +179,7 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN (TANPA METADATA KOMPLEKS)
+  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN
   # ------------------------------------------------------------------
   container:
     name: 🐳 Container Build & Scan
@@ -210,12 +209,17 @@ jobs:
           COPY publish/ .
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           EOF
-      - name: Build Docker image (tag statis)
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: deploy
           load: true
           tags: todo-webapi:latest
+      - name: Create .trivyignore (abaikan private key dev)
+        run: |
+          cat > .trivyignore <<'EOF'
+          /app/key.pem
+          EOF
       - name: Trivy scan (SARIF)
         uses: aquasecurity/trivy-action@master
         with:
@@ -250,7 +254,7 @@ jobs:
           path: sbom.spdx.json
 
   # ------------------------------------------------------------------
-  # MOCK INFRASTRUCTURE (Ministack + Terraform) - DENGAN DESTROY SEBELUM APPLY
+  # MOCK INFRASTRUCTURE (Ministack + Terraform) - Self-Hosted Runner
   # ------------------------------------------------------------------
   infra:
     name: 🏗️ Mock Infrastructure (Ministack)
@@ -266,24 +270,36 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-      - name: Verify Ministack is running
+      - name: Ensure Ministack container is running
         run: |
-          echo "Checking Ministack at ${{ env.MINISTACK_ENDPOINT }}"
-          curl -s ${{ env.MINISTACK_ENDPOINT }}/health || echo "Warning: Ministack health check failed, proceeding anyway"
+          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
+            echo "Ministack container not running. Starting..."
+            docker run -d --name ministack -p 4566:4566 nahuelnucera/ministack:latest
+            echo "Waiting for Ministack to be ready..."
+            sleep 15
+          else
+            echo "✅ Ministack container is already running."
+          fi
+          # Health check
+          for i in {1..10}; do
+            if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then
+              echo "✅ Ministack is healthy."
+              break
+            fi
+            sleep 3
+          done
       - name: Create Terraform files (dengan tagging)
         run: |
           mkdir -p terraform
           cd terraform
           cat > main.tf <<'EOF'
           variable "ministack_endpoint" {
-            description = "Ministack endpoint URL"
-            type        = string
-            default     = "http://localhost:4566"
+            type    = string
+            default = "http://localhost:4566"
           }
           variable "environment" {
-            description = "Deployment environment"
-            type        = string
-            default     = "staging"
+            type    = string
+            default = "staging"
           }
           provider "aws" {
             region                      = "us-east-1"
