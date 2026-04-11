@@ -1,4 +1,4 @@
-name: 🏢 Enterprise DevSecOps Pipeline (MiniStack AWS Mock)
+name: 🏢 Enterprise DevSecOps Pipeline (MiniStack + EC2 Mock)
 
 on:
   push:
@@ -38,7 +38,7 @@ defaults:
 
 jobs:
   # ------------------------------------------------------------------
-  # CODE QUALITY & LINTING (GitHub-hosted)
+  # CODE QUALITY & LINTING
   # ------------------------------------------------------------------
   lint:
     name: 🔍 Code Linting
@@ -53,7 +53,7 @@ jobs:
         run: dotnet format --verify-no-changes --no-restore
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING (GitHub-hosted)
+  # SAST & SECRET SCANNING
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -76,7 +76,7 @@ jobs:
           sarif_file: results.sarif
 
   # ------------------------------------------------------------------
-  # SCA & SBOM GENERATION (GitHub-hosted)
+  # SCA & SBOM GENERATION
   # ------------------------------------------------------------------
   sca:
     name: 📦 SCA & SBOM
@@ -115,7 +115,7 @@ jobs:
           path: reports
 
   # ------------------------------------------------------------------
-  # BUILD & UNIT TESTS (GitHub-hosted)
+  # BUILD & UNIT TESTS
   # ------------------------------------------------------------------
   build:
     name: 🔨 Build & Test
@@ -152,7 +152,7 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN (GitHub-hosted)
+  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN
   # ------------------------------------------------------------------
   container:
     name: 🐳 Container Build & Scan
@@ -167,7 +167,7 @@ jobs:
         with:
           name: webapp-binaries
           path: deploy/publish
-      - name: Create hardened Dockerfile
+      - name: Create hardened Dockerfile for .NET app
         run: |
           cat > deploy/Dockerfile <<'EOF'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
@@ -274,10 +274,10 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
-  # DEPLOY TO STAGING (MOCK) - SELF-HOSTED RUNNER (laptop)
+  # DEPLOY TO STAGING (MOCK) - KE DALAM EC2 MOCK CONTAINER
   # ------------------------------------------------------------------
   deploy-staging:
-    name: 🚀 Deploy to Staging (MiniStack EC2)
+    name: 🚀 Deploy to Staging (EC2 Mock)
     runs-on: [self-hosted, linux, x64]
     needs: [container, infra]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
@@ -285,24 +285,45 @@ jobs:
       name: staging-mock
       url: http://${{ needs.infra.outputs.ec2_public_ip }}:8080
     steps:
+      - uses: actions/checkout@v4
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: deploy
-      - name: Build Docker image
+      - name: Build .NET application Docker image (todo-webapi)
         run: |
           docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Run container on staging (simulate EC2)
+      - name: Build EC2 Mock container image
         run: |
-          docker rm -f todo-webapi-staging 2>/dev/null || true
-          docker run -d \
-            --name todo-webapi-staging \
+          docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
+      - name: Run EC2 Mock instance (privileged for DinD)
+        run: |
+          docker rm -f ec2-mock-staging 2>/dev/null || true
+          docker run -d --privileged \
+            --name ec2-mock-staging \
             -p 8080:5000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e MINISTACK_ENDPOINT=${{ env.MINISTACK_ENDPOINT }} \
+            -e RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}" \
+            -e DB_USER="${{ secrets.DB_USER }}" \
+            -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            ec2-mock:latest
+      - name: Wait for EC2 Mock to be ready
+        run: sleep 10
+      - name: Deploy application inside EC2 Mock
+        run: |
+          # Salin image todo-webapi ke dalam EC2 mock (karena mount docker.sock, image host bisa diakses)
+          docker exec ec2-mock-staging docker pull todo-webapi:latest || true
+          # Hentikan container aplikasi lama jika ada
+          docker exec ec2-mock-staging docker rm -f todo-webapi-app 2>/dev/null || true
+          # Jalankan aplikasi di dalam EC2 mock
+          docker exec ec2-mock-staging docker run -d \
+            --name todo-webapi-app \
+            -p 5000:5000 \
             -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
-            --restart unless-stopped \
             todo-webapi:latest
-      - name: Health check (akses via localhost laptop)
+      - name: Health check (akses Swagger via EC2 Mock port)
         run: |
           for i in {1..12}; do
             if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
@@ -319,10 +340,10 @@ jobs:
             zap-baseline.py -t http://localhost:8080 -l FAIL || exit 1
 
   # ------------------------------------------------------------------
-  # DEPLOY TO PRODUCTION (MOCK) - SELF-HOSTED RUNNER (laptop)
+  # DEPLOY TO PRODUCTION (MOCK) - KE DALAM EC2 MOCK CONTAINER
   # ------------------------------------------------------------------
   deploy-prod:
-    name: 🚀 Deploy to Production (MiniStack EC2)
+    name: 🚀 Deploy to Production (EC2 Mock)
     runs-on: [self-hosted, linux, x64]
     needs: [deploy-staging]
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
@@ -330,21 +351,34 @@ jobs:
       name: production-mock
       url: http://${{ needs.infra.outputs.ec2_public_ip }}:8081
     steps:
-      - name: Run container on production port
+      - name: Run EC2 Mock instance for production
         run: |
-          docker rm -f todo-webapi-prod 2>/dev/null || true
-          docker run -d \
-            --name todo-webapi-prod \
+          docker rm -f ec2-mock-prod 2>/dev/null || true
+          docker run -d --privileged \
+            --name ec2-mock-prod \
             -p 8081:5000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e MINISTACK_ENDPOINT=${{ env.MINISTACK_ENDPOINT }} \
+            -e RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}" \
+            -e DB_USER="${{ secrets.DB_USER }}" \
+            -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            ec2-mock:latest
+      - name: Wait and deploy app inside production EC2 mock
+        run: |
+          sleep 10
+          docker exec ec2-mock-prod docker pull todo-webapi:latest || true
+          docker exec ec2-mock-prod docker rm -f todo-webapi-app 2>/dev/null || true
+          docker exec ec2-mock-prod docker run -d \
+            --name todo-webapi-app \
+            -p 5000:5000 \
             -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
-            --restart unless-stopped \
             todo-webapi:latest
       - name: Smoke test
         run: |
           curl -sf http://localhost:8081/swagger/v1/swagger.json || exit 1
 
   # ------------------------------------------------------------------
-  # NOTIFICATION (SLACK / WEBHOOK)
+  # NOTIFICATION
   # ------------------------------------------------------------------
   notify:
     name: 📢 Notify Deployment Status
@@ -356,4 +390,3 @@ jobs:
         run: |
           echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
           echo "EC2 Mock IP: ${{ needs.infra.outputs.ec2_public_ip }}"
-      # - uses: slackapi/slack-github-action@v1.25 ...
