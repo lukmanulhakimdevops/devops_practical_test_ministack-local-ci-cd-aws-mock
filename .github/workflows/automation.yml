@@ -1,4 +1,4 @@
-name: 🏢 Enterprise DevSecOps Pipeline (MiniStack + EC2 Mock)
+name: 🏢 Enterprise DevSecOps Pipeline (Ministack + EC2 Mock)
 
 on:
   push:
@@ -24,9 +24,11 @@ env:
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  # Endpoint RDS statis dari container MySQL yang sudah ada
+  STATIC_RDS_ENDPOINT: 'localhost:15433'
 
 permissions:
-  contents: write          # untuk commit auto-format
+  contents: write
   security-events: write
   actions: read
   checks: write
@@ -178,14 +180,12 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN
+  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN (TANPA METADATA KOMPLEKS)
   # ------------------------------------------------------------------
   container:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
     needs: build
-    outputs:
-      image_tag: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
       - name: Download build artifact
@@ -210,27 +210,21 @@ jobs:
           COPY publish/ .
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           EOF
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: todo-webapi
-          tags: |
-            type=sha,format=short
-            type=raw,value=latest
-      - name: Build Docker image
+      - name: Build Docker image (tag statis)
         uses: docker/build-push-action@v5
         with:
           context: deploy
           load: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: todo-webapi:latest
       - name: Trivy scan (SARIF)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ steps.meta.outputs.tags }}
+          image-ref: todo-webapi:latest
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -238,14 +232,16 @@ jobs:
       - name: Trivy fail on critical/high
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ steps.meta.outputs.tags }}
+          image-ref: todo-webapi:latest
           format: 'table'
           exit-code: '1'
           severity: 'CRITICAL,HIGH'
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
       - name: Generate SBOM for container
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ steps.meta.outputs.tags }}
+          image: todo-webapi:latest
           path: ./sbom.spdx.json
       - name: Upload container SBOM
         uses: actions/upload-artifact@v4
@@ -254,10 +250,10 @@ jobs:
           path: sbom.spdx.json
 
   # ------------------------------------------------------------------
-  # MOCK INFRASTRUCTURE (MiniStack + Terraform) - SELF-HOSTED RUNNER
+  # MOCK INFRASTRUCTURE (Ministack + Terraform) - DENGAN DESTROY SEBELUM APPLY
   # ------------------------------------------------------------------
   infra:
-    name: 🏗️ Mock Infrastructure (MiniStack)
+    name: 🏗️ Mock Infrastructure (Ministack)
     runs-on: [self-hosted, linux, x64]
     if: github.event_name != 'pull_request'
     outputs:
@@ -270,17 +266,17 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.5.0
-      - name: Verify MiniStack is running
+      - name: Verify Ministack is running
         run: |
-          echo "Checking MiniStack at ${{ env.MINISTACK_ENDPOINT }}"
-          curl -s ${{ env.MINISTACK_ENDPOINT }}/health || echo "Warning: MiniStack health check failed, proceeding anyway"
-      - name: Create Terraform files dynamically
+          echo "Checking Ministack at ${{ env.MINISTACK_ENDPOINT }}"
+          curl -s ${{ env.MINISTACK_ENDPOINT }}/health || echo "Warning: Ministack health check failed, proceeding anyway"
+      - name: Create Terraform files (dengan tagging)
         run: |
           mkdir -p terraform
           cd terraform
           cat > main.tf <<'EOF'
           variable "ministack_endpoint" {
-            description = "MiniStack endpoint URL"
+            description = "Ministack endpoint URL"
             type        = string
             default     = "http://localhost:4566"
           }
@@ -288,13 +284,6 @@ jobs:
             description = "Deployment environment"
             type        = string
             default     = "staging"
-          }
-          variable "db_username" {
-            default = "admin"
-          }
-          variable "db_password" {
-            default = "password123"
-            sensitive = true
           }
           provider "aws" {
             region                      = "us-east-1"
@@ -306,13 +295,16 @@ jobs:
             s3_use_path_style           = true
             endpoints {
               ec2 = var.ministack_endpoint
-              rds = var.ministack_endpoint
               s3  = var.ministack_endpoint
             }
           }
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-${var.environment}"
             description = "Allow HTTP and SSH"
+            tags = {
+              Name    = "web-sg-${var.environment}"
+              Project = "DevSecOps-Ministack"
+            }
             ingress {
               from_port   = 22
               to_port     = 22
@@ -337,37 +329,30 @@ jobs:
             instance_type = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
             tags = {
-              Name = "web-server-${var.environment}"
+              Name    = "web-server-${var.environment}"
+              Project = "DevSecOps-Ministack"
             }
           }
           resource "aws_s3_bucket" "app_bucket" {
             bucket = "app-bucket-${var.environment}-${random_id.bucket_suffix.hex}"
+            tags = {
+              Project = "DevSecOps-Ministack"
+            }
           }
           resource "random_id" "bucket_suffix" {
             byte_length = 4
-          }
-          resource "aws_db_instance" "app_db" {
-            allocated_storage    = 20
-            engine               = "mysql"
-            engine_version       = "8.0"
-            instance_class       = "db.t3.micro"
-            db_name              = "MyWebApiDB"
-            username             = var.db_username
-            password             = var.db_password
-            skip_final_snapshot  = true
-            publicly_accessible  = true
           }
           output "s3_bucket" {
             value = aws_s3_bucket.app_bucket.bucket
           }
           output "rds_endpoint" {
-            value = aws_db_instance.app_db.address
+            value = "${{ env.STATIC_RDS_ENDPOINT }}"
           }
           output "ec2_public_ip" {
             value = aws_instance.web.public_ip
           }
           EOF
-      - name: Configure AWS CLI for MiniStack
+      - name: Configure AWS CLI for Ministack
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/credentials <<EOF
@@ -380,6 +365,16 @@ jobs:
           region = ${{ env.AWS_REGION }}
           endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
           EOF
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+      - name: Terraform Destroy (bersihkan resource sebelumnya)
+        working-directory: terraform
+        env:
+          AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
+          TF_VAR_ministack_endpoint: ${{ env.MINISTACK_ENDPOINT }}
+        run: |
+          terraform destroy -auto-approve -var="environment=${{ github.event.inputs.environment || 'staging' }}" || true
       - name: Terraform Apply
         id: tf
         working-directory: terraform
@@ -387,7 +382,6 @@ jobs:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
           TF_VAR_ministack_endpoint: ${{ env.MINISTACK_ENDPOINT }}
         run: |
-          terraform init
           terraform apply -auto-approve -var="environment=${{ github.event.inputs.environment || 'staging' }}"
           echo "s3_bucket=$(terraform output -raw s3_bucket)" >> $GITHUB_OUTPUT
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
