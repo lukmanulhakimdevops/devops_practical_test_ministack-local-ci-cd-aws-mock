@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Konfigurasi AWS Mock (simulasi)
   AWS_REGION:            us-east-1
   AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -17,13 +16,15 @@ env:
   DB_USER:               ${{ secrets.DB_USER }}
   DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
 
-  # Konfigurasi Aplikasi & Container
   APP_DLL:               TodoWebAPI.dll
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
   CONTAINER_PORT:        80
 
+# ============================================================
+# JOB 1 — SAST, SCA & Build  (runs on GitHub-hosted runner)
+# ============================================================
 jobs:
   security_and_build:
     name: 🛡️ SAST, SCA & Build
@@ -33,70 +34,63 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # Diperlukan untuk Gitleaks
+          fetch-depth: 0   # required by Gitleaks
 
-      # -------------------------------
-      # 🔐 LAYER 1: Secret Scanning
-      # -------------------------------
+      # ── 🔐 Layer 1: Secret Scanning ─────────────────────────
       - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── ⚙️  Setup .NET ────────────────────────────────────────
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # -------------------------------
-      # 📦 LAYER 2: SCA & Auto-Patch
-      # -------------------------------
+      # ── 📦 Layer 2: SCA & Auto-Patch ─────────────────────────
       - name: 🩹 Auto-Patch Vulnerable NuGet Packages
         run: |
-          echo "🩹 Menginjeksi patch keamanan untuk Microsoft.Build..."
+          echo "🩹 Patching Microsoft.Build to a secure version..."
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      - name: 📦 SCA - Audit NuGet Dependencies
+      - name: 📦 SCA — Audit NuGet Dependencies
         run: |
-          echo "🔍 Memeriksa kerentanan package NuGet..."
+          echo "🔍 Scanning NuGet packages for known vulnerabilities..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      # -------------------------------
-      # ☁️ AWS Mock Configuration
-      # -------------------------------
+      # ── ☁️  AWS Mock Config ───────────────────────────────────
       - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/config <<EOF
           [default]
-          region = ${AWS_REGION}
-          output = json
+          region     = ${AWS_REGION}
+          output     = json
           EOF
           cat > ~/.aws/credentials <<EOF
           [default]
-          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+          aws_access_key_id     = ${AWS_ACCESS_KEY_ID}
           aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
           EOF
           echo "✅ AWS mock config created."
 
-      # -------------------------------
-      # 🔨 Build & Publish
-      # -------------------------------
+      # ── 🔨 Build & Publish ────────────────────────────────────
       - name: 🔨 Build and Publish .NET App
         run: |
-          echo "🔨 Restoring packages..."
+          echo "📦 Restoring packages..."
           dotnet restore TodoWebAPI/*.csproj
-          echo "📦 Publishing to 'publish_output'..."
+
+          echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
       - name: 📦 Package Artifact
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
-          cd ..
 
       - name: 📤 Upload Artifact
         uses: actions/upload-artifact@v4
@@ -104,6 +98,9 @@ jobs:
           name: webapp-binaries
           path: webapp-binaries.zip
 
+# ============================================================
+# JOB 2 — DAST, Container Scan & Deploy  (self-hosted runner)
+# ============================================================
   deploy:
     name: 🐳 DAST, Scan & Deploy
     needs: security_and_build
@@ -114,8 +111,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "── Docker version ──────────────────────────────"
           docker --version
+          echo "── unzip version ───────────────────────────────"
           unzip -v >/dev/null
+          echo "✅ All prerequisites OK."
 
       - name: ⬇️ Download Workflow Artifact
         uses: actions/download-artifact@v4
@@ -130,41 +130,81 @@ jobs:
           rm -rf deploy_input
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
+          echo "✅ Artifact extracted to deploy_input/publish/"
 
-      # -------------------------------
-      # 🐳 LAYER 3: Hardened Dockerfile
-      # -------------------------------
+      # ── 🐳 Layer 3: Hardened Dockerfile ──────────────────────
+      #
+      # ROOT CAUSE FIX:
+      #   The app's appsettings.json configures Kestrel with both an HTTP
+      #   (port 5000) and an HTTPS (port 5001) endpoint.  Even when
+      #   ASPNETCORE_URLS overrides the port, Kestrel still tries to
+      #   initialise the HTTPS endpoint and crashes because no certificate
+      #   exists inside the container.
+      #
+      # SOLUTION:
+      #   Generate a self-signed PFX certificate with openssl at image-build
+      #   time and point Kestrel to it via environment variables.  The app
+      #   starts on HTTP:80 for external traffic while the internal HTTPS
+      #   listener uses the self-signed cert — no crash, no restart loop.
+      # ──────────────────────────────────────────────────────────
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
-          cat > deploy_input/Dockerfile <<EOF
+          cat > deploy_input/Dockerfile <<'DOCKERFILE'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-          WORKDIR /app
-          EXPOSE ${CONTAINER_PORT}
-          ENV ASPNETCORE_ENVIRONMENT=Development
-          ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
 
-          # 🔒 Patch OS untuk menutup CVE (libcrypto, libssl)
+          WORKDIR /app
+
+          # ── 🔒 OS hardening: patch libcrypto / libssl CVEs ──────
           RUN apk update && apk upgrade --no-cache
 
-          # 👤 Jalankan sebagai user non-root
-          RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
+          # ── 🔑 Generate self-signed cert so Kestrel HTTPS doesn't crash ──
+          # This is required because appsettings.json configures an HTTPS
+          # endpoint. Without a cert the process exits immediately.
+          RUN apk add --no-cache openssl \
+           && openssl req -x509 -newkey rsa:4096 \
+                -keyout /app/https-key.pem \
+                -out    /app/https-cert.pem \
+                -days   365 -nodes \
+                -subj   '/CN=localhost' \
+           && openssl pkcs12 -export \
+                -out     /app/aspnetapp.pfx \
+                -inkey   /app/https-key.pem \
+                -in      /app/https-cert.pem \
+                -passout pass:devpassword \
+           && rm /app/https-key.pem /app/https-cert.pem \
+           && apk del openssl
+
+          # ── ⚙️  Runtime environment ─────────────────────────────
+          # External traffic → HTTP on CONTAINER_PORT (mapped from HOST_PORT)
+          # Internal Kestrel HTTPS listener → use the self-signed PFX
+          ENV ASPNETCORE_ENVIRONMENT=Development
+          ENV ASPNETCORE_URLS="http://+:80;https://+:5001"
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+
+          EXPOSE 80
+          EXPOSE 5001
+
+          # ── 👤 Run as non-root ──────────────────────────────────
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+           && chown -R appuser /app
           USER appuser
 
           COPY publish/ /app/
-          ENTRYPOINT ["dotnet", "${APP_DLL}"]
-          EOF
+          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
+          DOCKERFILE
+          echo "✅ Dockerfile created."
 
       - name: 🏗️ Build Docker Image
         shell: bash
         run: |
           set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
+          echo "✅ Docker image built: ${APP_NAME}:latest"
 
-      # -------------------------------
-      # 🛡️ LAYER 4: Container Scan (Trivy)
-      # -------------------------------
+      # ── 🛡️ Layer 4: Container Scan (Trivy) ───────────────────
       - name: 🛡️ Container Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
@@ -175,59 +215,70 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      # -------------------------------
-      # 🧹 Bersihkan Container Lama
-      # -------------------------------
+      # ── 🧹 Remove Old Container ───────────────────────────────
       - name: 🧹 Remove Old Container
         shell: bash
         run: |
-          set -euo pipefail
-          docker rm -f ${CONTAINER_NAME} || true
+          docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+          echo "✅ Old container removed (if any)."
 
-      # -------------------------------
-      # 🚀 Jalankan Container (Pre‑DAST)
-      # -------------------------------
+      # ── 🚀 Run Container (Pre-DAST) ───────────────────────────
       - name: 🚀 Run Secure Container (Pre-DAST)
         shell: bash
         run: |
           set -euo pipefail
           docker run -d \
-            --name ${CONTAINER_NAME} \
-            -p ${HOST_PORT}:${CONTAINER_PORT} \
-            -e ASPNETCORE_ENVIRONMENT=Development \
-            -e ASPNETCORE_URLS="http://+:${CONTAINER_PORT}" \
+            --name  ${CONTAINER_NAME} \
+            -p      ${HOST_PORT}:80 \
+            -e      ASPNETCORE_ENVIRONMENT=Development \
+            -e      ASPNETCORE_URLS="http://+:80;https://+:5001" \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
+            -e      ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
             --restart unless-stopped \
             --security-opt="no-new-privileges:true" \
+            --read-only \
+            --tmpfs /tmp \
             ${APP_NAME}:latest
+          echo "✅ Container started: ${CONTAINER_NAME}"
 
       - name: ⏳ Wait for App Readiness
         shell: bash
         run: |
-          echo "⏳ Menunggu aplikasi siap sebelum DAST..."
-          sleep 15
+          echo "⏳ Waiting for the app to become ready..."
+          for i in $(seq 1 12); do
+            if curl -sf http://localhost:${HOST_PORT}/health >/dev/null 2>&1; then
+              echo "✅ App is ready after $((i * 5)) seconds."
+              exit 0
+            fi
+            echo "   attempt $i/12 — retrying in 5 s..."
+            sleep 5
+          done
+          echo "❌ App did not become ready in 60 s. Showing logs:"
+          docker logs ${CONTAINER_NAME}
+          exit 1
 
-      # -------------------------------
-      # 🕷️ LAYER 5: DAST (OWASP ZAP)
-      # -------------------------------
+      # ── 🕷️ Layer 5: DAST (OWASP ZAP) ─────────────────────────
       - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
-          echo "💥 Melancarkan serangan DAST ke aplikasi yang sedang berjalan..."
-          docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-            -t http://localhost:${HOST_PORT} \
-            -l FAIL || {
-              echo "❌ DAST menemukan celah fatal! Menghancurkan container..."
-              docker rm -f ${CONTAINER_NAME}
-              exit 1
-            }
-          echo "✅ DAST scan lulus! Aplikasi aman dari serangan luar."
+          echo "💥 Launching DAST scan against the running container..."
+          docker run --rm --network="host" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:${HOST_PORT} \
+              -l FAIL || {
+                echo "❌ DAST found critical vulnerability — stopping container."
+                docker rm -f ${CONTAINER_NAME}
+                exit 1
+              }
+          echo "✅ DAST scan passed. Application is safe."
 
-      # -------------------------------
-      # ✅ Verifikasi Akhir
-      # -------------------------------
+      # ── ✅ Final Verification ─────────────────────────────────
       - name: ✅ Show Running Container
         shell: bash
         run: |
           set -euo pipefail
+          echo "── Container status ────────────────────────────"
           docker ps --filter "name=${CONTAINER_NAME}"
+          echo "── Last 20 log lines ───────────────────────────"
           docker logs --tail 20 ${CONTAINER_NAME} || true
