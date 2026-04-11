@@ -46,6 +46,15 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      # [MANUVER PENYELAMATAN 1] Auto-Patching NuGet CVE
+      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
+        run: |
+          echo "🩹 Menginjeksi patch keamanan untuk Microsoft.Build..."
+          # Menimpa versi yang rentan dengan versi aman sebelum dibuild
+          for proj in TodoWebAPI/*.csproj; do
+            dotnet add "$proj" package Microsoft.Build --version 17.8.43
+          done
+
       # [DevSecOps Layer 2] Software Composition Analysis (SCA)
       - name: 📦 SCA - Audit NuGet Dependencies
         run: |
@@ -115,6 +124,7 @@ jobs:
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
 
       # [DevSecOps Layer 3] Hardened Dockerfile
+      # [MANUVER PENYELAMATAN 2] Injeksi OS Patch di Dockerfile
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
@@ -124,8 +134,14 @@ jobs:
           WORKDIR /app
           EXPOSE ${CONTAINER_PORT}
           ENV ASPNETCORE_URLS=http://+:${CONTAINER_PORT}
+          
+          # [PATCH] Memaksa Alpine memperbarui libcrypto & libssl untuk lolos Trivy
+          RUN apk update && apk upgrade --no-cache
+          
+          # [SECURITY] Jalankan sebagai non-root
           RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
           USER appuser
+          
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "${APP_DLL}"]
           EOF
@@ -170,15 +186,13 @@ jobs:
         shell: bash
         run: |
           echo "Menunggu aplikasi hidup sebelum ditembak DAST..."
-          sleep 15 # Beri waktu container untuk fully startup
+          sleep 15 
 
       # [DevSecOps Layer 5] DAST - Dynamic Application Security Testing
       - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
           echo "💥 MELUNCURKAN SERANGAN DAST KE APLIKASI YANG SEDANG BERJALAN..."
-          # Menjalankan kontainer ZAP dengan network "host" agar bisa menembak localhost:8080 di laptop lo
-          # Parameter -l FAIL memastikan pipeline gagal (exit code 1) jika ditemukan kerentanan
           docker run --rm --network="host" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t http://localhost:${HOST_PORT} \
             -l FAIL || (echo "❌ DAST MENEMUKAN CELAH FATAL! MENGHANCURKAN KONTAINER!" && docker rm -f ${CONTAINER_NAME} && exit 1)
