@@ -20,7 +20,6 @@ env:
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
-  # Container internal port (Kestrel HTTP) is 5000, not 80
   CONTAINER_PORT:        5000
 
 # ============================================================================
@@ -37,19 +36,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ----- Secret scanning -----
       - name: 🔐 Secret scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ----- Setup .NET -----
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # ----- SCA & auto-patch -----
       - name: 🩹 Auto-patch vulnerable NuGet packages
         run: |
           echo "🩹 Patching Microsoft.Build to a secure version..."
@@ -63,7 +59,6 @@ jobs:
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      # ----- Mock AWS config (for potential future use) -----
       - name: ☁️ Configure AWS CLI (mock)
         run: |
           mkdir -p ~/.aws
@@ -79,7 +74,6 @@ jobs:
           EOF
           echo "✅ AWS mock config created."
 
-      # ----- Build & publish -----
       - name: 🔨 Build and publish .NET app
         run: |
           echo "📦 Restoring packages..."
@@ -88,16 +82,11 @@ jobs:
           echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
-      - name: 📦 Package artifact
-        run: |
-          cd publish_output
-          zip -r ../webapp-binaries.zip .
-
-      - name: 📤 Upload artifact
+      - name: 📤 Upload artifact (publish_output folder)
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
-          path: webapp-binaries.zip
+          path: publish_output
 
 # ============================================================================
 # JOB 2: DAST, Container Scan & Deploy (self-hosted runner)
@@ -124,19 +113,16 @@ jobs:
           name: webapp-binaries
           path: ./artifact
 
-      - name: 📂 Extract artifact
+      - name: 📂 Extract artifact (GitHub auto‑zip)
         shell: bash
         run: |
           set -euo pipefail
           rm -rf deploy_input
           mkdir -p deploy_input/publish
+          # The downloaded artifact is a zip file named 'webapp-binaries.zip'
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
           echo "✅ Artifact extracted to deploy_input/publish/"
 
-      # ----- Create hardened Dockerfile (no iptables needed) -----
-      # The app binds to HTTP:5000 and HTTPS:5001 by default.
-      # We map host port 8080 directly to container port 5000.
-      # A self‑signed certificate is generated to satisfy Kestrel's HTTPS endpoint.
       - name: 🐳 Create secure Dockerfile
         shell: bash
         run: |
@@ -146,11 +132,9 @@ jobs:
 
           WORKDIR /app
 
-          # OS hardening + openssl for cert generation
           RUN apk update && apk upgrade --no-cache \
            && apk add --no-cache openssl
 
-          # Generate self‑signed certificate for Kestrel HTTPS endpoint
           RUN openssl req -x509 -newkey rsa:4096 \
                 -keyout /app/https-key.pem \
                 -out    /app/https-cert.pem \
@@ -164,12 +148,10 @@ jobs:
            && rm /app/https-key.pem /app/https-cert.pem \
            && apk del openssl
 
-          # Runtime configuration for Kestrel
           ENV ASPNETCORE_ENVIRONMENT=Development
           ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
           ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
 
-          # Create non‑root user
           RUN adduser -u 1000 --disabled-password --gecos "" appuser \
            && chown -R appuser /app
           USER appuser
@@ -186,7 +168,6 @@ jobs:
           docker build -t ${APP_NAME}:latest ./deploy_input
           echo "✅ Docker image built: ${APP_NAME}:latest"
 
-      # ----- Container vulnerability scan (Trivy) -----
       - name: 🛡️ Container scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
@@ -197,19 +178,16 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      # ----- Clean up old container -----
       - name: 🧹 Remove old container
         shell: bash
         run: |
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
           echo "✅ Old container removed (if any)."
 
-      # ----- Run container with database connection and correct port mapping -----
       - name: 🚀 Run secure container (pre‑DAST)
         shell: bash
         run: |
           set -euo pipefail
-          # Build MySQL connection string from secrets
           CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};"
           docker run -d \
             --name  ${CONTAINER_NAME} \
@@ -225,7 +203,6 @@ jobs:
             ${APP_NAME}:latest
           echo "✅ Container started: ${CONTAINER_NAME} (host:${HOST_PORT} → container:${CONTAINER_PORT})"
 
-      # ----- Wait for app using Swagger JSON endpoint (no DB dependency) -----
       - name: ⏳ Wait for app readiness
         shell: bash
         run: |
@@ -242,7 +219,6 @@ jobs:
           docker logs ${CONTAINER_NAME}
           exit 1
 
-      # ----- Dynamic Application Security Testing (OWASP ZAP) -----
       - name: 🕷️ DAST scan (OWASP ZAP)
         shell: bash
         run: |
@@ -258,7 +234,6 @@ jobs:
               }
           echo "✅ DAST scan passed. Application is safe."
 
-      # ----- Final verification -----
       - name: ✅ Show running container
         shell: bash
         run: |
