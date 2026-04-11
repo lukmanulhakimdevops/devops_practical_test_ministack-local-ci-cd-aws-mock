@@ -368,7 +368,7 @@ jobs:
           fi
           echo "✅ Cleanup done."
 
-      - name: 📝 Create Terraform config (FIXED syntax)
+      - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
           cat > terraform/main.tf <<'TF'
@@ -486,12 +486,69 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # --------------------------------------------------------------------------
-  # DB Init
+  # RDS Init (Create MySQL container via Ministack API)
   # --------------------------------------------------------------------------
-  db-init:
-    name: 🗄️ Initialize Database
+  rds-init:
+    name: 🗄️ RDS Init (Ministack)
     runs-on: [self-hosted, linux, x64]
     needs: infra
+    steps:
+      - name: ☁️ Configure AWS CLI for Ministack
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id     = ${{ env.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
+          EOF
+          cat > ~/.aws/config <<EOF
+          [default]
+          region       = ${{ needs.dr-check.outputs.active_region }}
+          endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
+          output       = json
+          EOF
+
+      - name: 🗄️ Create RDS MySQL instance via Ministack
+        run: |
+          echo "📦 Creating RDS MySQL instance..."
+          aws --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" rds create-db-instance \
+            --db-instance-identifier ministack-mysql \
+            --engine mysql \
+            --db-instance-class db.t3.micro \
+            --allocated-storage 20 \
+            --master-username "${{ env.DB_USER }}" \
+            --master-user-password "${{ env.DB_PASSWORD }}" \
+            --db-name "${{ env.DB_NAME }}" \
+            --no-multi-az \
+            --no-publicly-accessible \
+            --tags Key=Project,Value=DevSecOps-Ministack \
+            || echo "⚠️ RDS instance may already exist"
+
+      - name: ⏳ Wait for MySQL container to appear
+        run: |
+          echo "⏳ Waiting for Ministack to spawn MySQL container..."
+          for i in $(seq 1 30); do
+            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
+              | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
+              | head -1)
+            if [ -n "$MYSQL_CONTAINER" ]; then
+              echo "✅ MySQL container found: $MYSQL_CONTAINER"
+              exit 0
+            fi
+            echo "⏳ MySQL container not yet present... ($i/30)"
+            sleep 10
+          done
+          echo "❌ MySQL container did not appear after 300s"
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
+          exit 1
+
+  # --------------------------------------------------------------------------
+  # DB Init (Create schema)
+  # --------------------------------------------------------------------------
+  db-init:
+    name: 🗂️ Initialize DB Tables
+    runs-on: [self-hosted, linux, x64]
+    needs: rds-init
     outputs:
       mysql_endpoint:  ${{ steps.discover.outputs.endpoint }}
       mysql_port:      ${{ steps.discover.outputs.port }}
