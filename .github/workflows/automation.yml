@@ -20,13 +20,13 @@ on:
 
 env:
   DOTNET_VERSION: '8.0.x'
-  MINISTACK_ENDPOINT: ${{ secrets.MINISTACK_ENDPOINT || 'http://localhost:4566' }}
+  MINISTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 permissions:
-  contents: write
+  contents: write          # untuk commit auto-format
   security-events: write
   actions: read
   checks: write
@@ -42,6 +42,9 @@ jobs:
   lint:
     name: 🔍 Code Linting & Format
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: TodoWebAPI
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,7 +55,6 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Run dotnet format (auto-fix)
-        working-directory: TodoWebAPI
         run: dotnet format --no-restore
       - name: Commit formatting changes (if any)
         run: |
@@ -62,7 +64,7 @@ jobs:
           git diff --quiet && git diff --staged --quiet || (git commit -m "style: apply dotnet format" && git push)
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING
+  # SAST & SECRET SCANNING (CodeQL)
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
@@ -82,9 +84,14 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: csharp
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Build CodeQL database
-        working-directory: TodoWebAPI
-        run: dotnet build TodoWebAPI.csproj
+        run: |
+          cd TodoWebAPI
+          dotnet build TodoWebAPI.csproj
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
@@ -94,6 +101,9 @@ jobs:
   sca:
     name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: TodoWebAPI
     steps:
       - uses: actions/checkout@v4
       - name: Setup .NET
@@ -101,10 +111,8 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Restore
-        working-directory: TodoWebAPI
         run: dotnet restore
       - name: Audit vulnerabilities
-        working-directory: TodoWebAPI
         run: dotnet list package --vulnerable --include-transitive || true
       - name: Generate SBOM (CycloneDX)
         uses: CycloneDX/gh-dotnet-generate-sbom@v1
@@ -127,7 +135,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dependency-report
-          path: reports
+          path: TodoWebAPI/reports
 
   # ------------------------------------------------------------------
   # BUILD & UNIT TESTS
@@ -136,6 +144,9 @@ jobs:
     name: 🔨 Build & Test
     runs-on: ubuntu-latest
     needs: [lint, sast, sca]
+    defaults:
+      run:
+        working-directory: TodoWebAPI
     steps:
       - uses: actions/checkout@v4
       - name: Cache NuGet packages
@@ -148,18 +159,14 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Restore & Build
-        working-directory: TodoWebAPI
         run: |
           dotnet restore
           dotnet build --no-restore -c Release
       - name: Run Unit Tests
-        working-directory: TodoWebAPI
         run: dotnet test --no-build --logger trx --results-directory TestResults
       - name: Publish artifact
-        working-directory: TodoWebAPI
         run: dotnet publish -c Release -o publish_output --no-build
       - name: Zip binaries
-        working-directory: TodoWebAPI
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
@@ -186,7 +193,7 @@ jobs:
         with:
           name: webapp-binaries
           path: deploy/publish
-      - name: Create hardened Dockerfile for .NET app
+      - name: Create hardened Dockerfile
         run: |
           mkdir -p deploy
           cat > deploy/Dockerfile <<'EOF'
@@ -252,7 +259,7 @@ jobs:
   infra:
     name: 🏗️ Mock Infrastructure (MiniStack)
     runs-on: [self-hosted, linux, x64]
-    if: github.event_name != 'pull_request' && hashFiles('terraform/**') != ''
+    if: github.event_name != 'pull_request'
     outputs:
       s3_bucket: ${{ steps.tf.outputs.s3_bucket }}
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
@@ -267,6 +274,99 @@ jobs:
         run: |
           echo "Checking MiniStack at ${{ env.MINISTACK_ENDPOINT }}"
           curl -s ${{ env.MINISTACK_ENDPOINT }}/health || echo "Warning: MiniStack health check failed, proceeding anyway"
+      - name: Create Terraform files dynamically
+        run: |
+          mkdir -p terraform
+          cd terraform
+          cat > main.tf <<'EOF'
+          variable "ministack_endpoint" {
+            description = "MiniStack endpoint URL"
+            type        = string
+            default     = "http://localhost:4566"
+          }
+          variable "environment" {
+            description = "Deployment environment"
+            type        = string
+            default     = "staging"
+          }
+          variable "db_username" {
+            default = "admin"
+          }
+          variable "db_password" {
+            default = "password123"
+            sensitive = true
+          }
+          provider "aws" {
+            region                      = "us-east-1"
+            access_key                  = "test"
+            secret_key                  = "test"
+            skip_credentials_validation = true
+            skip_requesting_account_id  = true
+            skip_metadata_api_check     = true
+            s3_use_path_style           = true
+            endpoints {
+              ec2 = var.ministack_endpoint
+              rds = var.ministack_endpoint
+              s3  = var.ministack_endpoint
+            }
+          }
+          resource "aws_security_group" "web_sg" {
+            name        = "web-sg-${var.environment}"
+            description = "Allow HTTP and SSH"
+            ingress {
+              from_port   = 22
+              to_port     = 22
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 5000
+              to_port     = 5000
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            egress {
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+          }
+          resource "aws_instance" "web" {
+            ami           = "ami-0ff8a91507f77f867"
+            instance_type = "t2.micro"
+            security_groups = [aws_security_group.web_sg.name]
+            tags = {
+              Name = "web-server-${var.environment}"
+            }
+          }
+          resource "aws_s3_bucket" "app_bucket" {
+            bucket = "app-bucket-${var.environment}-${random_id.bucket_suffix.hex}"
+          }
+          resource "random_id" "bucket_suffix" {
+            byte_length = 4
+          }
+          resource "aws_db_instance" "app_db" {
+            allocated_storage    = 20
+            engine               = "mysql"
+            engine_version       = "8.0"
+            instance_class       = "db.t3.micro"
+            db_name              = "MyWebApiDB"
+            username             = var.db_username
+            password             = var.db_password
+            skip_final_snapshot  = true
+            publicly_accessible  = true
+          }
+          output "s3_bucket" {
+            value = aws_s3_bucket.app_bucket.bucket
+          }
+          output "rds_endpoint" {
+            value = aws_db_instance.app_db.address
+          }
+          output "ec2_public_ip" {
+            value = aws_instance.web.public_ip
+          }
+          EOF
       - name: Configure AWS CLI for MiniStack
         run: |
           mkdir -p ~/.aws
@@ -311,35 +411,40 @@ jobs:
         with:
           name: webapp-binaries
           path: deploy
-      - name: Build .NET application Docker image (todo-webapi)
+      - name: Build .NET application Docker image
         run: |
-          mkdir -p deploy
-          cat > deploy/Dockerfile <<'EOF'
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-          WORKDIR /app
-          RUN adduser -D -u 1000 appuser && chown -R appuser /app
-          USER appuser
-          COPY publish/ .
-          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          EOF
           docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
-      - name: Build EC2 Mock container image
-        run: docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
-      - name: Run EC2 Mock instance (privileged for DinD)
+      - name: Create EC2 Mock container image
+        run: |
+          cat > ec2-mock.Dockerfile <<'EOF'
+          FROM alpine:latest
+          RUN apk add --no-cache docker openrc bash curl
+          RUN mkdir -p /etc/docker
+          RUN echo '{"hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"]}' > /etc/docker/daemon.json
+          COPY ec2-mock-entrypoint.sh /entrypoint.sh
+          RUN chmod +x /entrypoint.sh
+          EXPOSE 2375 5000
+          ENTRYPOINT ["/entrypoint.sh"]
+          EOF
+          cat > ec2-mock-entrypoint.sh <<'EOF'
+          #!/bin/sh
+          dockerd &
+          sleep 5
+          tail -f /dev/null
+          EOF
+          chmod +x ec2-mock-entrypoint.sh
+          docker build -t ec2-mock:latest -f ec2-mock.Dockerfile .
+      - name: Run EC2 Mock instance (privileged)
         run: |
           docker rm -f ec2-mock-staging 2>/dev/null || true
           docker run -d --privileged \
             --name ec2-mock-staging \
             -p 8080:5000 \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -e MINISTACK_ENDPOINT=${{ env.MINISTACK_ENDPOINT }} \
-            -e RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}" \
-            -e DB_USER="${{ secrets.DB_USER }}" \
-            -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
             ec2-mock:latest
-      - name: Wait for EC2 Mock to be ready
+      - name: Wait for EC2 Mock
         run: sleep 10
-      - name: Deploy application inside EC2 Mock
+      - name: Deploy app inside EC2 Mock
         run: |
           docker exec ec2-mock-staging docker pull todo-webapi:latest || true
           docker exec ec2-mock-staging docker rm -f todo-webapi-app 2>/dev/null || true
@@ -348,7 +453,7 @@ jobs:
             -p 5000:5000 \
             -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             todo-webapi:latest
-      - name: Health check (akses Swagger via EC2 Mock port)
+      - name: Health check
         run: |
           for i in {1..12}; do
             if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
@@ -365,7 +470,7 @@ jobs:
             zap-baseline.py -t http://localhost:8080 -l FAIL || exit 1
 
   # ------------------------------------------------------------------
-  # DEPLOY TO PRODUCTION (MOCK) - KE DALAM EC2 MOCK CONTAINER
+  # DEPLOY TO PRODUCTION (MOCK)
   # ------------------------------------------------------------------
   deploy-prod:
     name: 🚀 Deploy to Production (EC2 Mock)
@@ -383,10 +488,6 @@ jobs:
             --name ec2-mock-prod \
             -p 8081:5000 \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -e MINISTACK_ENDPOINT=${{ env.MINISTACK_ENDPOINT }} \
-            -e RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}" \
-            -e DB_USER="${{ secrets.DB_USER }}" \
-            -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
             ec2-mock:latest
       - name: Wait and deploy app inside production EC2 mock
         run: |
@@ -414,3 +515,4 @@ jobs:
       - name: Deployment summary
         run: |
           echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
+          echo "EC2 Mock IP: ${{ needs.infra.outputs.ec2_public_ip }}"
