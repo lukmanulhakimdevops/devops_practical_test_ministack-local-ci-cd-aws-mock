@@ -1,246 +1,354 @@
-name: 🛡️ DevSecOps Ministack CI/CD
+name: 🏢 Enterprise DevSecOps Pipeline (Mock AWS)
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - 'TodoWebAPI/**'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging/production)'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
 
 env:
-  AWS_REGION:            ${{ secrets.AWS_REGION || 'us-east-1' }}
-  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+  DOTNET_VERSION: '8.0.x'
+  LOCALSTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  S3_BUCKET:             ${{ secrets.S3_BUCKET }}
-  EC2_HOST:              ${{ secrets.EC2_HOST }}
-  RDS_ENDPOINT:          ${{ secrets.RDS_ENDPOINT }}
-  DB_NAME:               ${{ secrets.DB_NAME }}
-  DB_USER:               ${{ secrets.DB_USER }}
-  DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
 
-  APP_DLL:               TodoWebAPI.dll
-  APP_NAME:              todo-webapi
-  CONTAINER_NAME:        todo-webapi
-  HOST_PORT:             8080
-  CONTAINER_PORT:        5000
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  checks: write
+
+defaults:
+  run:
+    shell: bash
+    working-directory: TodoWebAPI
 
 jobs:
-  # ============================================================
-  # JOB 1 — SAST, SCA & Build (GitHub-hosted runner)
-  # ============================================================
-  security_and_build:
-    name: 🛡️ SAST, SCA & Build
+  # ------------------------------------------------------------------
+  # CODE QUALITY & LINTING
+  # ------------------------------------------------------------------
+  lint:
+    name: 🔍 Code Linting
     runs-on: ubuntu-latest
-
     steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Run dotnet format
+        run: dotnet format --verify-no-changes --no-restore
+
+  # ------------------------------------------------------------------
+  # SAST & SECRET SCANNING
+  # ------------------------------------------------------------------
+  sast:
+    name: 🛡️ SAST & Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: 🔐 Secret Scanning (Gitleaks)
+      - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Security Code Scan
+        uses: dotnet/security-code-scan@main
+        with:
+          project: TodoWebAPI/TodoWebAPI.csproj
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
 
-      - name: 🔧 Setup .NET 8
+  # ------------------------------------------------------------------
+  # SCA & SBOM GENERATION
+  # ------------------------------------------------------------------
+  sca:
+    name: 📦 SCA & SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Restore
+        run: dotnet restore
+      - name: Audit vulnerabilities
+        run: dotnet list package --vulnerable --include-transitive || true
+      - name: Generate SBOM (CycloneDX)
+        uses: CycloneDX/gh-dotnet-generate-sbom@v1
+        with:
+          path: TodoWebAPI
+          output: sbom.xml
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: TodoWebAPI/sbom.xml
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'TodoWebAPI'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+      - name: Upload Dependency Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report
+          path: reports
 
-      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
+  # ------------------------------------------------------------------
+  # BUILD & UNIT TESTS
+  # ------------------------------------------------------------------
+  build:
+    name: 🔨 Build & Test
+    runs-on: ubuntu-latest
+    needs: [lint, sast, sca]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Restore & Build
         run: |
-          for proj in TodoWebAPI/*.csproj; do
-            dotnet add "$proj" package Microsoft.Build --version 17.8.43
-          done
-
-      - name: 📦 SCA — Audit NuGet Dependencies
-        run: |
-          dotnet restore TodoWebAPI/*.csproj
-          dotnet list TodoWebAPI/*.csproj package --vulnerable
-
-      - name: ☁️ Configure AWS CLI (mock)
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/config <<EOF
-          [default]
-          region = ${AWS_REGION}
-          output = json
-          EOF
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id = ${AWS_ACCESS_KEY_ID}
-          aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
-          EOF
-
-      - name: 🔨 Build and Publish .NET App
-        run: |
-          dotnet restore TodoWebAPI/*.csproj
-          dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
-
-      - name: 📦 Package Artifact (manual zip)
+          dotnet restore
+          dotnet build --no-restore -c Release
+      - name: Run Unit Tests
+        run: dotnet test --no-build --logger trx --results-directory TestResults
+      - name: Publish artifact
+        run: dotnet publish -c Release -o publish_output --no-build
+      - name: Zip binaries
         run: |
           cd publish_output
           zip -r ../webapp-binaries.zip .
-          cd ..
-
-      - name: 📤 Upload Artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
           path: webapp-binaries.zip
+          retention-days: 7
 
-  # ============================================================
-  # JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
-  # ============================================================
-  deploy:
-    name: 🐳 Deploy, Scan & DAST
-    needs: security_and_build
-    runs-on: [self-hosted, linux, x64]
-
+  # ------------------------------------------------------------------
+  # CONTAINER IMAGE BUILD & VULNERABILITY SCAN
+  # ------------------------------------------------------------------
+  container:
+    name: 🐳 Container Build & Scan
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
     steps:
-      - name: 🧪 Check Runner Prerequisites
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker --version
-          unzip -v >/dev/null
-
-      - name: ⬇️ Download Workflow Artifact
+      - uses: actions/checkout@v4
+      - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
-          path: ./artifact
-
-      - name: 📂 Extract Artifact
-        shell: bash
+          path: deploy/publish
+      - name: Create hardened Dockerfile
         run: |
-          set -euo pipefail
-          rm -rf deploy_input
-          mkdir -p deploy_input/publish
-          unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
-            echo "ERROR: ${APP_DLL} not found in artifact"
-            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
-            exit 1
-          fi
-          echo "✅ Artifact extracted, ${APP_DLL} present."
-
-      - name: 🐳 Create Secure Dockerfile
-        shell: bash
-        run: |
-          cat > deploy_input/Dockerfile <<'DOCKERFILE'
+          cat > deploy/Dockerfile <<'EOF'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-
           WORKDIR /app
-
-          RUN apk update && apk upgrade --no-cache \
-           && apk add --no-cache openssl
-
-          RUN openssl req -x509 -newkey rsa:4096 \
-                -keyout /app/https-key.pem \
-                -out    /app/https-cert.pem \
-                -days   365 -nodes \
-                -subj   '/CN=localhost' \
-           && openssl pkcs12 -export \
-                -out     /app/aspnetapp.pfx \
-                -inkey   /app/https-key.pem \
-                -in      /app/https-cert.pem \
-                -passout pass:devpassword \
-           && rm /app/https-key.pem /app/https-cert.pem \
-           && apk del openssl
-
-          ENV ASPNETCORE_ENVIRONMENT=Development
+          RUN apk add --no-cache openssl
+          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/key.pem -out /app/cert.pem -days 365 -nodes -subj '/CN=localhost' \
+           && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/key.pem -in /app/cert.pem -passout pass:dev
+          ENV ASPNETCORE_ENVIRONMENT=Production
           ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
-
-          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
-           && chown -R appuser /app
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=dev
+          RUN adduser -D -u 1000 appuser && chown -R appuser /app
           USER appuser
-
-          COPY publish/ /app/
+          COPY publish/ .
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          DOCKERFILE
-          echo "✅ Dockerfile created."
-
-      - name: 🏗️ Build Docker Image
-        shell: bash
-        run: |
-          docker build -t ${APP_NAME}:latest ./deploy_input
-          echo "✅ Docker image built: ${APP_NAME}:latest"
-
-      - name: 🛡️ Container Scan (Trivy)
+          EOF
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: localhost:5000/todo-webapi
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: deploy
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+      - name: Trivy scan (SARIF)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: '${{ env.APP_NAME }}:latest'
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+      - name: Trivy fail on critical/high
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
           format: 'table'
           exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
+      - name: Generate SBOM for container
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          path: ./sbom.spdx.json
+      - name: Upload container SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-sbom
+          path: sbom.spdx.json
 
-      - name: 🧹 Remove Old Container
-        shell: bash
+  # ------------------------------------------------------------------
+  # MOCK INFRASTRUCTURE (LocalStack + Terraform)
+  # ------------------------------------------------------------------
+  infra:
+    name: 🏗️ Mock Infrastructure (LocalStack)
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request'
+    outputs:
+      s3_bucket: ${{ steps.tf.outputs.s3_bucket }}
+      rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      - name: Start LocalStack
         run: |
-          docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-          echo "✅ Old container removed (if any)."
+          docker rm -f localstack 2>/dev/null || true
+          docker run -d --name localstack -p 4566:4566 -e SERVICES=s3,rds localstack/localstack:latest
+          sleep 10
+      - name: Configure mock AWS CLI
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EOF
+      - name: Terraform Apply
+        id: tf
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve -var="environment=${{ github.event.inputs.environment || 'staging' }}"
+          echo "s3_bucket=$(terraform output -raw s3_bucket)" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
 
-      - name: 🚀 Run Secure Container (Pre-DAST)
-        shell: bash
+  # ------------------------------------------------------------------
+  # DEPLOY TO STAGING (MOCK)
+  # ------------------------------------------------------------------
+  deploy-staging:
+    name: 🚀 Deploy to Staging (Mock)
+    runs-on: [self-hosted, linux, x64]
+    needs: [container, infra]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging-mock
+      url: http://localhost:8080
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-binaries
+          path: deploy
+      - name: Build Docker image (or load)
         run: |
-          set -euo pipefail
-          # Build connection string using secrets (password may contain special chars)
-          CONNECTION_STRING="Server=${RDS_ENDPOINT};Port=3306;Database=${DB_NAME};Uid=${DB_USER};Pwd=${DB_PASSWORD};"
+          docker build -t todo-webapi:latest -f deploy/Dockerfile deploy
+      - name: Run container on staging
+        run: |
+          docker rm -f todo-webapi-staging 2>/dev/null || true
           docker run -d \
-            --name  ${CONTAINER_NAME} \
-            -p      ${HOST_PORT}:${CONTAINER_PORT} \
-            -e      ASPNETCORE_ENVIRONMENT=Development \
-            -e      ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
-            -e      ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            -e      ConnectionStrings__DefaultConnection="${CONNECTION_STRING}" \
-            --security-opt="no-new-privileges:true" \
+            --name todo-webapi-staging \
+            -p 8080:5000 \
+            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             --restart unless-stopped \
-            --read-only \
-            --tmpfs /tmp \
-            ${APP_NAME}:latest
-          echo "✅ Container started: ${CONTAINER_NAME} (host:${HOST_PORT} → container:${CONTAINER_PORT})"
-
-      - name: ⏳ Wait for App Readiness
-        shell: bash
+            todo-webapi:latest
+      - name: Health check
         run: |
-          echo "⏳ Waiting for Swagger endpoint..."
-          for i in $(seq 1 12); do
-            if curl -sf http://localhost:${HOST_PORT}/swagger/v1/swagger.json >/dev/null 2>&1; then
-              echo "✅ App is ready after $((i * 5)) seconds."
+          for i in {1..12}; do
+            if curl -sf http://localhost:8080/swagger/v1/swagger.json; then
+              echo "✅ Staging ready"
               exit 0
             fi
-            echo "   attempt $i/12 — retrying in 5 s..."
             sleep 5
           done
-          echo "❌ App did not become ready in 60 s. Showing logs:"
-          docker logs ${CONTAINER_NAME}
+          echo "❌ Health check failed"
           exit 1
-
-      - name: 🕷️ DAST Scan (OWASP ZAP)
-        shell: bash
+      - name: DAST scan (OWASP ZAP)
         run: |
-          echo "💥 Launching DAST scan against the running container..."
-          docker run --rm --network="host" \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py \
-              -t http://localhost:${HOST_PORT} \
-              -l FAIL || {
-                echo "❌ DAST found critical vulnerability — stopping container."
-                docker rm -f ${CONTAINER_NAME}
-                exit 1
-              }
-          echo "✅ DAST scan passed. Application is safe."
+          docker run --rm --network host ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8080 -l FAIL || exit 1
 
-      - name: ✅ Show Running Container
-        shell: bash
+  # ------------------------------------------------------------------
+  # DEPLOY TO PRODUCTION (MOCK) - WITH APPROVAL GATE
+  # ------------------------------------------------------------------
+  deploy-prod:
+    name: 🚀 Deploy to Production (Mock)
+    runs-on: [self-hosted, linux, x64]
+    needs: [deploy-staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment:
+      name: production-mock
+      url: http://localhost:8081
+    steps:
+      - name: Run container on production port
         run: |
-          set -euo pipefail
-          echo "── Container status ────────────────────────────"
-          docker ps --filter "name=${CONTAINER_NAME}"
-          echo "── Last 20 log lines ───────────────────────────"
-          docker logs --tail 20 ${CONTAINER_NAME} || true
+          docker rm -f todo-webapi-prod 2>/dev/null || true
+          docker run -d \
+            --name todo-webapi-prod \
+            -p 8081:5000 \
+            -e ConnectionStrings__DefaultConnection="Server=${{ needs.infra.outputs.rds_endpoint }};Port=3306;Database=MyWebApiDB;Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
+            --restart unless-stopped \
+            todo-webapi:latest
+      - name: Smoke test
+        run: |
+          curl -sf http://localhost:8081/swagger/v1/swagger.json || exit 1
+
+  # ------------------------------------------------------------------
+  # NOTIFICATION (SLACK / WEBHOOK)
+  # ------------------------------------------------------------------
+  notify:
+    name: 📢 Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-prod]
+    if: always()
+    steps:
+      - name: Slack notification (optional)
+        run: |
+          echo "Deployment to ${{ github.event.inputs.environment || 'staging' }} finished: ${{ job.status }}"
+      # Uncomment if you have Slack webhook secret
+      # - uses: slackapi/slack-github-action@v1.25
+      #   with:
+      #     payload: '{"text": "Deployment to ${{ github.event.inputs.environment }} completed: ${{ job.status }}"}'
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
