@@ -147,55 +147,84 @@ jobs:
       #   starts on HTTP:80 for external traffic while the internal HTTPS
       #   listener uses the self-signed cert — no crash, no restart loop.
       # ──────────────────────────────────────────────────────────
+      # ── 🐳 Layer 3: Hardened Dockerfile + iptables entrypoint ──
+      #
+      # APPROACH: iptables REDIRECT 80 → 5000 inside the container.
+      #   • App (appsettings Kestrel) always binds HTTP:5000, HTTPS:5001.
+      #   • ASPNETCORE_URLS is ignored by the app, so we stop fighting it.
+      #   • Instead, the entrypoint (running as root briefly) installs a
+      #     NAT rule that transparently forwards any TCP:80 traffic to :5000.
+      #   • After iptables setup, su-exec drops privileges to appuser.
+      #   • Requires --cap-add NET_ADMIN on docker run (see below).
+      # ──────────────────────────────────────────────────────────
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
+
+          # ── entrypoint.sh ──────────────────────────────────────
+          cat > deploy_input/entrypoint.sh <<'SH'
+#!/bin/sh
+set -e
+
+echo "🔒 [iptables] Redirecting TCP 80 → 5000 (app always binds :5000)"
+# External traffic arriving at container port 80
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 5000
+# Locally originated traffic (e.g. health-check curl from inside)
+iptables -t nat -A OUTPUT     -p tcp --dport 80 -j REDIRECT --to-port 5000
+echo "✅ [iptables] Rules applied."
+
+exec su-exec appuser dotnet /app/TodoWebAPI.dll
+'SH'
+          chmod +x deploy_input/entrypoint.sh
+
+          # ── Dockerfile ─────────────────────────────────────────
           cat > deploy_input/Dockerfile <<'DOCKERFILE'
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
 
-          WORKDIR /app
+WORKDIR /app
 
-          # ── 🔒 OS hardening: patch libcrypto / libssl CVEs ──────
-          RUN apk update && apk upgrade --no-cache
+# ── 🔒 OS hardening + runtime tools ─────────────────────────
+# iptables  : NAT redirect :80 → :5000 at startup
+# su-exec   : privilege drop root → appuser after iptables
+# openssl   : generate self-signed PFX for Kestrel HTTPS endpoint
+RUN apk update && apk upgrade --no-cache \
+ && apk add --no-cache iptables su-exec openssl
 
-          # ── 🔑 Generate self-signed cert so Kestrel HTTPS doesn't crash ──
-          # This is required because appsettings.json configures an HTTPS
-          # endpoint. Without a cert the process exits immediately.
-          RUN apk add --no-cache openssl \
-           && openssl req -x509 -newkey rsa:4096 \
-                -keyout /app/https-key.pem \
-                -out    /app/https-cert.pem \
-                -days   365 -nodes \
-                -subj   '/CN=localhost' \
-           && openssl pkcs12 -export \
-                -out     /app/aspnetapp.pfx \
-                -inkey   /app/https-key.pem \
-                -in      /app/https-cert.pem \
-                -passout pass:devpassword \
-           && rm /app/https-key.pem /app/https-cert.pem \
-           && apk del openssl
+# ── 🔑 Self-signed cert (Kestrel HTTPS endpoint requires a cert) ─
+RUN openssl req -x509 -newkey rsa:4096 \
+      -keyout /app/https-key.pem \
+      -out    /app/https-cert.pem \
+      -days   365 -nodes \
+      -subj   '/CN=localhost' \
+ && openssl pkcs12 -export \
+      -out     /app/aspnetapp.pfx \
+      -inkey   /app/https-key.pem \
+      -in      /app/https-cert.pem \
+      -passout pass:devpassword \
+ && rm /app/https-key.pem /app/https-cert.pem \
+ && apk del openssl
 
-          # ── ⚙️  Runtime environment ─────────────────────────────
-          # External traffic → HTTP on CONTAINER_PORT (mapped from HOST_PORT)
-          # Internal Kestrel HTTPS listener → use the self-signed PFX
-          ENV ASPNETCORE_ENVIRONMENT=Development
-          ENV ASPNETCORE_URLS="http://+:80;https://+:5001"
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+# ── ⚙️  Runtime environment ──────────────────────────────────
+ENV ASPNETCORE_ENVIRONMENT=Development
+ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
 
-          EXPOSE 80
-          EXPOSE 5001
+# ── 👤 Create non-root user (entrypoint starts as root, drops here) ─
+RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+ && chown -R appuser /app
 
-          # ── 👤 Run as non-root ──────────────────────────────────
-          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
-           && chown -R appuser /app
-          USER appuser
+# Expose canonical HTTP port — iptables will redirect to :5000 at runtime
+EXPOSE 80
 
-          COPY publish/ /app/
-          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          DOCKERFILE
-          echo "✅ Dockerfile created."
+COPY publish/       /app/
+COPY entrypoint.sh  /entrypoint.sh
+
+# Container must start as root so iptables rules can be applied.
+# entrypoint.sh will exec su-exec appuser after the NAT rule is set.
+ENTRYPOINT ["/entrypoint.sh"]
+DOCKERFILE
+          echo "✅ Dockerfile + entrypoint.sh created."
 
       - name: 🏗️ Build Docker Image
         shell: bash
@@ -227,19 +256,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # NET_ADMIN capability is required for iptables inside the container.
+          # The entrypoint sets NAT rule 80→5000, then drops to appuser via su-exec.
+          # no-new-privileges is intentionally omitted: su-exec needs it to drop privs.
           docker run -d \
-            --name  ${CONTAINER_NAME} \
-            -p      ${HOST_PORT}:80 \
-            -e      ASPNETCORE_ENVIRONMENT=Development \
-            -e      ASPNETCORE_URLS="http://+:80;https://+:5001" \
-            -e      ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
-            -e      ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            --restart unless-stopped \
-            --security-opt="no-new-privileges:true" \
+            --name     ${CONTAINER_NAME} \
+            -p         ${HOST_PORT}:80 \
+            -e         ASPNETCORE_ENVIRONMENT=Development \
+            -e         ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
+            -e         ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
+            --cap-drop ALL \
+            --cap-add  NET_ADMIN \
+            --cap-add  SETUID \
+            --cap-add  SETGID \
+            --restart  unless-stopped \
             --read-only \
-            --tmpfs /tmp \
+            --tmpfs    /tmp \
             ${APP_NAME}:latest
           echo "✅ Container started: ${CONTAINER_NAME}"
+          echo "   Traffic path: host:${HOST_PORT} → container:80 → iptables NAT → :5000 (app)"
 
       - name: ⏳ Wait for App Readiness
         shell: bash
