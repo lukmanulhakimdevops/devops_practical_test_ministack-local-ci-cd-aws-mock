@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 env:
+  # ── AWS Mock Configuration ────────────────────────────────
   AWS_REGION:            us-east-1
   AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -16,16 +17,17 @@ env:
   DB_USER:               ${{ secrets.DB_USER }}
   DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
 
+  # ── Application & Container Settings ──────────────────────
   APP_DLL:               TodoWebAPI.dll
   APP_NAME:              todo-webapi
   CONTAINER_NAME:        todo-webapi
   HOST_PORT:             8080
   CONTAINER_PORT:        80
 
-# ============================================================
-# JOB 1 — SAST, SCA & Build  (runs on GitHub-hosted runner)
-# ============================================================
 jobs:
+  # ═══════════════════════════════════════════════════════════════
+  #  JOB 1 – SAST, SCA & Build (GitHub‑hosted runner)
+  # ═══════════════════════════════════════════════════════════════
   security_and_build:
     name: 🛡️ SAST, SCA & Build
     runs-on: ubuntu-latest
@@ -34,35 +36,35 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # required by Gitleaks
+          fetch-depth: 0
 
-      # ── 🔐 Layer 1: Secret Scanning ─────────────────────────
+      # ── Layer 1: Secret Scanning ─────────────────────────
       - name: 🔐 Secret Scanning (Gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── ⚙️  Setup .NET ────────────────────────────────────────
+      # ── Setup .NET ───────────────────────────────────────
       - name: 🔧 Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # ── 📦 Layer 2: SCA & Auto-Patch ─────────────────────────
-      - name: 🩹 Auto-Patch Vulnerable NuGet Packages
+      # ── Layer 2: SCA & Auto‑Patch ────────────────────────
+      - name: 🩹 Auto‑Patch Vulnerable NuGet Packages
         run: |
           echo "🩹 Patching Microsoft.Build to a secure version..."
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
 
-      - name: 📦 SCA — Audit NuGet Dependencies
+      - name: 📦 SCA – Audit NuGet Dependencies
         run: |
           echo "🔍 Scanning NuGet packages for known vulnerabilities..."
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable
 
-      # ── ☁️  AWS Mock Config ───────────────────────────────────
+      # ── AWS Mock Config ──────────────────────────────────
       - name: ☁️ Configure AWS CLI (Mock)
         run: |
           mkdir -p ~/.aws
@@ -78,12 +80,11 @@ jobs:
           EOF
           echo "✅ AWS mock config created."
 
-      # ── 🔨 Build & Publish ────────────────────────────────────
+      # ── Build & Publish ──────────────────────────────────
       - name: 🔨 Build and Publish .NET App
         run: |
           echo "📦 Restoring packages..."
           dotnet restore TodoWebAPI/*.csproj
-
           echo "🔨 Publishing release build..."
           dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
 
@@ -98,9 +99,9 @@ jobs:
           name: webapp-binaries
           path: webapp-binaries.zip
 
-# ============================================================
-# JOB 2 — DAST, Container Scan & Deploy  (self-hosted runner)
-# ============================================================
+  # ═══════════════════════════════════════════════════════════════
+  #  JOB 2 – DAST, Container Scan & Deploy (self‑hosted runner)
+  # ═══════════════════════════════════════════════════════════════
   deploy:
     name: 🐳 DAST, Scan & Deploy
     needs: security_and_build
@@ -111,11 +112,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "── Docker version ──────────────────────────────"
           docker --version
-          echo "── unzip version ───────────────────────────────"
           unzip -v >/dev/null
-          echo "✅ All prerequisites OK."
+          echo "✅ Prerequisites OK."
 
       - name: ⬇️ Download Workflow Artifact
         uses: actions/download-artifact@v4
@@ -130,110 +129,72 @@ jobs:
           rm -rf deploy_input
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          echo "✅ Artifact extracted to deploy_input/publish/"
 
-      # ── 🐳 Layer 3: Hardened Dockerfile ──────────────────────
-      #
-      # ROOT CAUSE FIX:
-      #   The app's appsettings.json configures Kestrel with both an HTTP
-      #   (port 5000) and an HTTPS (port 5001) endpoint.  Even when
-      #   ASPNETCORE_URLS overrides the port, Kestrel still tries to
-      #   initialise the HTTPS endpoint and crashes because no certificate
-      #   exists inside the container.
-      #
-      # SOLUTION:
-      #   Generate a self-signed PFX certificate with openssl at image-build
-      #   time and point Kestrel to it via environment variables.  The app
-      #   starts on HTTP:80 for external traffic while the internal HTTPS
-      #   listener uses the self-signed cert — no crash, no restart loop.
-      # ──────────────────────────────────────────────────────────
-      # ── 🐳 Layer 3: Hardened Dockerfile + iptables entrypoint ──
-      #
-      # APPROACH: iptables REDIRECT 80 → 5000 inside the container.
-      #   • App (appsettings Kestrel) always binds HTTP:5000, HTTPS:5001.
-      #   • ASPNETCORE_URLS is ignored by the app, so we stop fighting it.
-      #   • Instead, the entrypoint (running as root briefly) installs a
-      #     NAT rule that transparently forwards any TCP:80 traffic to :5000.
-      #   • After iptables setup, su-exec drops privileges to appuser.
-      #   • Requires --cap-add NET_ADMIN on docker run (see below).
-      # ──────────────────────────────────────────────────────────
+      # ── Layer 3: Hardened Dockerfile ─────────────────────
       - name: 🐳 Create Secure Dockerfile
         shell: bash
         run: |
           set -euo pipefail
 
-          # ── entrypoint.sh ──────────────────────────────────────
+          # entrypoint script (iptables redirect + privilege drop)
           cat > deploy_input/entrypoint.sh <<'SH'
-#!/bin/sh
-set -e
-
-echo "🔒 [iptables] Redirecting TCP 80 → 5000 (app always binds :5000)"
-# External traffic arriving at container port 80
-iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 5000
-# Locally originated traffic (e.g. health-check curl from inside)
-iptables -t nat -A OUTPUT     -p tcp --dport 80 -j REDIRECT --to-port 5000
-echo "✅ [iptables] Rules applied."
-
-exec su-exec appuser dotnet /app/TodoWebAPI.dll
-'SH'
+          #!/bin/sh
+          set -e
+          echo "🔒 [iptables] Redirecting TCP 80 → 5000"
+          iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 5000
+          iptables -t nat -A OUTPUT     -p tcp --dport 80 -j REDIRECT --to-port 5000
+          echo "✅ iptables rules applied."
+          exec su-exec appuser dotnet /app/TodoWebAPI.dll
+          SH
           chmod +x deploy_input/entrypoint.sh
 
-          # ── Dockerfile ─────────────────────────────────────────
+          # Dockerfile
           cat > deploy_input/Dockerfile <<'DOCKERFILE'
-FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
 
-WORKDIR /app
+          WORKDIR /app
 
-# ── 🔒 OS hardening + runtime tools ─────────────────────────
-# iptables  : NAT redirect :80 → :5000 at startup
-# su-exec   : privilege drop root → appuser after iptables
-# openssl   : generate self-signed PFX for Kestrel HTTPS endpoint
-RUN apk update && apk upgrade --no-cache \
- && apk add --no-cache iptables su-exec openssl
+          # Install tools & generate self‑signed cert for Kestrel HTTPS endpoint
+          RUN apk update && apk upgrade --no-cache \
+              && apk add --no-cache iptables su-exec openssl \
+              && openssl req -x509 -newkey rsa:4096 \
+                  -keyout /app/https-key.pem \
+                  -out    /app/https-cert.pem \
+                  -days   365 -nodes \
+                  -subj   '/CN=localhost' \
+              && openssl pkcs12 -export \
+                  -out     /app/aspnetapp.pfx \
+                  -inkey   /app/https-key.pem \
+                  -in      /app/https-cert.pem \
+                  -passout pass:devpassword \
+              && rm /app/https-key.pem /app/https-cert.pem \
+              && apk del openssl
 
-# ── 🔑 Self-signed cert (Kestrel HTTPS endpoint requires a cert) ─
-RUN openssl req -x509 -newkey rsa:4096 \
-      -keyout /app/https-key.pem \
-      -out    /app/https-cert.pem \
-      -days   365 -nodes \
-      -subj   '/CN=localhost' \
- && openssl pkcs12 -export \
-      -out     /app/aspnetapp.pfx \
-      -inkey   /app/https-key.pem \
-      -in      /app/https-cert.pem \
-      -passout pass:devpassword \
- && rm /app/https-key.pem /app/https-cert.pem \
- && apk del openssl
+          # Environment for Kestrel
+          ENV ASPNETCORE_ENVIRONMENT=Development
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
 
-# ── ⚙️  Runtime environment ──────────────────────────────────
-ENV ASPNETCORE_ENVIRONMENT=Development
-ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+          # Non‑root user
+          RUN adduser -u 1000 --disabled-password --gecos "" appuser \
+              && chown -R appuser /app
 
-# ── 👤 Create non-root user (entrypoint starts as root, drops here) ─
-RUN adduser -u 1000 --disabled-password --gecos "" appuser \
- && chown -R appuser /app
+          EXPOSE 80
 
-# Expose canonical HTTP port — iptables will redirect to :5000 at runtime
-EXPOSE 80
+          COPY publish/       /app/
+          COPY entrypoint.sh  /entrypoint.sh
 
-COPY publish/       /app/
-COPY entrypoint.sh  /entrypoint.sh
-
-# Container must start as root so iptables rules can be applied.
-# entrypoint.sh will exec su-exec appuser after the NAT rule is set.
-ENTRYPOINT ["/entrypoint.sh"]
-DOCKERFILE
+          ENTRYPOINT ["/entrypoint.sh"]
+          DOCKERFILE
           echo "✅ Dockerfile + entrypoint.sh created."
 
       - name: 🏗️ Build Docker Image
         shell: bash
         run: |
-          set -euo pipefail
           docker build -t ${APP_NAME}:latest ./deploy_input
-          echo "✅ Docker image built: ${APP_NAME}:latest"
+          echo "✅ Image built: ${APP_NAME}:latest"
 
-      # ── 🛡️ Layer 4: Container Scan (Trivy) ───────────────────
+      # ── Layer 4: Container Scan (Trivy) ──────────────────
       - name: 🛡️ Container Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
@@ -244,21 +205,16 @@ DOCKERFILE
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      # ── 🧹 Remove Old Container ───────────────────────────────
+      # ── Remove Old Container ─────────────────────────────
       - name: 🧹 Remove Old Container
         shell: bash
         run: |
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-          echo "✅ Old container removed (if any)."
 
-      # ── 🚀 Run Container (Pre-DAST) ───────────────────────────
-      - name: 🚀 Run Secure Container (Pre-DAST)
+      # ── Run Container (Pre‑DAST) ─────────────────────────
+      - name: 🚀 Run Secure Container (Pre‑DAST)
         shell: bash
         run: |
-          set -euo pipefail
-          # NET_ADMIN capability is required for iptables inside the container.
-          # The entrypoint sets NAT rule 80→5000, then drops to appuser via su-exec.
-          # no-new-privileges is intentionally omitted: su-exec needs it to drop privs.
           docker run -d \
             --name     ${CONTAINER_NAME} \
             -p         ${HOST_PORT}:80 \
@@ -273,47 +229,40 @@ DOCKERFILE
             --read-only \
             --tmpfs    /tmp \
             ${APP_NAME}:latest
-          echo "✅ Container started: ${CONTAINER_NAME}"
-          echo "   Traffic path: host:${HOST_PORT} → container:80 → iptables NAT → :5000 (app)"
+          echo "✅ Container started (host:${HOST_PORT} → container:80 → app:5000)"
 
       - name: ⏳ Wait for App Readiness
         shell: bash
         run: |
-          echo "⏳ Waiting for the app to become ready..."
-          for i in $(seq 1 12); do
+          echo "⏳ Waiting for app to become ready..."
+          for i in {1..12}; do
             if curl -sf http://localhost:${HOST_PORT}/health >/dev/null 2>&1; then
-              echo "✅ App is ready after $((i * 5)) seconds."
+              echo "✅ App ready."
               exit 0
             fi
-            echo "   attempt $i/12 — retrying in 5 s..."
             sleep 5
           done
-          echo "❌ App did not become ready in 60 s. Showing logs:"
+          echo "❌ App did not become ready in 60s. Logs:"
           docker logs ${CONTAINER_NAME}
           exit 1
 
-      # ── 🕷️ Layer 5: DAST (OWASP ZAP) ─────────────────────────
+      # ── Layer 5: DAST (OWASP ZAP) ────────────────────────
       - name: 🕷️ DAST Scan (OWASP ZAP)
         shell: bash
         run: |
-          echo "💥 Launching DAST scan against the running container..."
+          echo "💥 Launching DAST scan..."
           docker run --rm --network="host" \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py \
-              -t http://localhost:${HOST_PORT} \
-              -l FAIL || {
-                echo "❌ DAST found critical vulnerability — stopping container."
-                docker rm -f ${CONTAINER_NAME}
-                exit 1
-              }
-          echo "✅ DAST scan passed. Application is safe."
+            zap-baseline.py -t http://localhost:${HOST_PORT} -l FAIL || {
+              echo "❌ DAST found critical issues. Stopping container."
+              docker rm -f ${CONTAINER_NAME}
+              exit 1
+            }
+          echo "✅ DAST scan passed."
 
-      # ── ✅ Final Verification ─────────────────────────────────
+      # ── Final Verification ───────────────────────────────
       - name: ✅ Show Running Container
         shell: bash
         run: |
-          set -euo pipefail
-          echo "── Container status ────────────────────────────"
           docker ps --filter "name=${CONTAINER_NAME}"
-          echo "── Last 20 log lines ───────────────────────────"
           docker logs --tail 20 ${CONTAINER_NAME} || true
