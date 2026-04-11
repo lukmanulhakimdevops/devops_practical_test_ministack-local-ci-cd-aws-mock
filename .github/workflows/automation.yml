@@ -39,7 +39,7 @@ env:
   DB_NAME:               ${{ secrets.DB_NAME }}
   DB_USER:               ${{ secrets.DB_USER }}
   DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
-  DB_PORT:               ${{ secrets.DB_PORT }}
+  DB_PORT:               ${{ secrets.DB_PORT || '3306' }}
 
 permissions:
   contents: read
@@ -284,15 +284,16 @@ jobs:
           TRIVY_DISABLE_VEX_NOTICE: true
 
   # --------------------------------------------------------------------------
-  # Mock Infrastructure (Ministack / Terraform)
+  # Mock Infrastructure (Ministack / Terraform) + MySQL container
   # --------------------------------------------------------------------------
   infra:
-    name: 🏗️ Mock Infrastructure (Ministack)
+    name: 🏗️ Mock Infrastructure + MySQL
     runs-on: [self-hosted, linux, x64]
     needs: dr-check
     outputs:
       s3_bucket:     ${{ steps.tf.outputs.s3_bucket }}
       ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
+      mysql_port:    ${{ steps.mysql.outputs.port }}
     steps:
       - uses: actions/checkout@v4
 
@@ -301,13 +302,41 @@ jobs:
         with:
           terraform_version: 1.5.0
 
+      - name: 🐳 Start MySQL container (mock RDS)
+        id: mysql
+        run: |
+          echo "🚀 Starting MySQL container as mock RDS..."
+          docker rm -f mock-rds-mysql 2>/dev/null || true
+          docker run -d \
+            --name mock-rds-mysql \
+            -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD="${{ env.DB_PASSWORD }}" \
+            -e MYSQL_DATABASE="${{ env.DB_NAME }}" \
+            -e MYSQL_USER="${{ env.DB_USER }}" \
+            -e MYSQL_PASSWORD="${{ env.DB_PASSWORD }}" \
+            mysql:8.0
+          echo "✅ MySQL container started on port 3306"
+          echo "port=3306" >> $GITHUB_OUTPUT
+
+      - name: ⏳ Wait for MySQL to be ready
+        run: |
+          echo "⏳ Waiting for MySQL to accept connections..."
+          for i in $(seq 1 30); do
+            if docker exec mock-rds-mysql mysqladmin ping -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ MySQL ready"
+              break
+            fi
+            echo "⏳ Waiting... ($i/30)"
+            sleep 3
+          done
+
       - name: 🐳 Ensure Ministack is running
         run: |
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "🚀 Starting Ministack container..."
             docker run -d --name ministack \
               -p 4566:4566 \
-              -e SERVICES=rds,ec2,s3,sts,iam \
+              -e SERVICES=ec2,s3,sts,iam \
               nahuelnucera/ministack:latest
             echo "⏳ Waiting 30s for Ministack to initialize..."
             sleep 30
@@ -356,16 +385,18 @@ jobs:
               --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
               --group-id "$SG_ID" || true
           fi
-          # S3
-          BUCKET=$(aws s3api list-buckets \
+          # S3 - delete all objects first, then bucket
+          BUCKETS=$(aws s3api list-buckets \
             --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
             --query "Buckets[?contains(Name,'app-bucket-${ENV_NAME}')].Name" \
             --output text 2>/dev/null || echo "")
-          if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
-            echo "🗑️ Deleting S3: $BUCKET"
-            aws s3 rb "s3://$BUCKET" \
-              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --force || true
-          fi
+          for BUCKET in $BUCKETS; do
+            if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
+              echo "🗑️ Emptying and deleting S3 bucket: $BUCKET"
+              aws s3 rm "s3://$BUCKET" --recursive --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" || true
+              aws s3 rb "s3://$BUCKET" --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --force || true
+            fi
+          done
           echo "✅ Cleanup done."
 
       - name: 📝 Create Terraform config
@@ -400,7 +431,6 @@ jobs:
             endpoints {
               ec2 = var.ministack_endpoint
               s3  = var.ministack_endpoint
-              rds = var.ministack_endpoint
               sts = var.ministack_endpoint
               iam = var.ministack_endpoint
             }
@@ -486,141 +516,30 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # --------------------------------------------------------------------------
-  # RDS Init (Create MySQL container via Ministack API)
-  # --------------------------------------------------------------------------
-  rds-init:
-    name: 🗄️ RDS Init (Ministack)
-    runs-on: [self-hosted, linux, x64]
-    needs: infra
-    steps:
-      - name: ☁️ Configure AWS CLI for Ministack
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id     = ${{ env.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
-          EOF
-          cat > ~/.aws/config <<EOF
-          [default]
-          region       = ${{ needs.dr-check.outputs.active_region }}
-          endpoint_url = ${{ env.MINISTACK_ENDPOINT }}
-          output       = json
-          EOF
-
-      - name: 🗄️ Create RDS MySQL instance via Ministack
-        run: |
-          echo "📦 Creating RDS MySQL instance..."
-          aws --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" rds create-db-instance \
-            --db-instance-identifier ministack-mysql \
-            --engine mysql \
-            --db-instance-class db.t3.micro \
-            --allocated-storage 20 \
-            --master-username "${{ env.DB_USER }}" \
-            --master-user-password "${{ env.DB_PASSWORD }}" \
-            --db-name "${{ env.DB_NAME }}" \
-            --no-multi-az \
-            --no-publicly-accessible \
-            --tags Key=Project,Value=DevSecOps-Ministack \
-            || echo "⚠️ RDS instance may already exist"
-
-      - name: ⏳ Wait for MySQL container to appear
-        run: |
-          echo "⏳ Waiting for Ministack to spawn MySQL container..."
-          for i in $(seq 1 30); do
-            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
-              | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
-              | head -1)
-            if [ -n "$MYSQL_CONTAINER" ]; then
-              echo "✅ MySQL container found: $MYSQL_CONTAINER"
-              exit 0
-            fi
-            echo "⏳ MySQL container not yet present... ($i/30)"
-            sleep 10
-          done
-          echo "❌ MySQL container did not appear after 300s"
-          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
-          exit 1
-
-  # --------------------------------------------------------------------------
-  # DB Init (Create schema)
+  # DB Init (Create schema in MySQL container)
   # --------------------------------------------------------------------------
   db-init:
     name: 🗂️ Initialize DB Tables
     runs-on: [self-hosted, linux, x64]
-    needs: rds-init
-    outputs:
-      mysql_endpoint:  ${{ steps.discover.outputs.endpoint }}
-      mysql_port:      ${{ steps.discover.outputs.port }}
-      mysql_container: ${{ steps.discover.outputs.container }}
+    needs: infra
     steps:
-      - name: 🔎 Discover MySQL container
-        id: discover
+      - name: ⏳ Wait for MySQL to be fully ready
         run: |
-          echo "🔎 Discovering MySQL container by image name..."
-          MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
-            | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' \
-            | head -1)
-
-          if [ -z "$MYSQL_CONTAINER" ]; then
-            echo "❌ No running container with a mysql image found!"
-            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
-            exit 1
-          fi
-
-          echo "✅ Found MySQL container: $MYSQL_CONTAINER"
-
-          EXPOSED_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp 2>/dev/null \
-            | grep -oE '[0-9]+$' | head -1)
-
-          if [ -n "$EXPOSED_PORT" ]; then
-            ENDPOINT="localhost:$EXPOSED_PORT"
-            echo "✅ Endpoint (exposed port): $ENDPOINT"
-          else
-            ENDPOINT="${MYSQL_CONTAINER}:3306"
-            EXPOSED_PORT="3306"
-            echo "✅ Endpoint (container network): $ENDPOINT"
-          fi
-
-          echo "endpoint=$ENDPOINT"         >> $GITHUB_OUTPUT
-          echo "port=$EXPOSED_PORT"         >> $GITHUB_OUTPUT
-          echo "container=$MYSQL_CONTAINER" >> $GITHUB_OUTPUT
-
-          echo "📋 All running containers:"
-          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
-
-      - name: ⏳ Wait for MySQL to accept connections
-        run: |
-          CONTAINER="${{ steps.discover.outputs.container }}"
-          echo "⏳ Waiting for MySQL in: $CONTAINER"
-          for i in $(seq 1 60); do
-            if docker exec "$CONTAINER" mysqladmin ping \
-                -u"${{ env.DB_USER }}" \
-                -p"${{ env.DB_PASSWORD }}" \
-                --silent 2>/dev/null; then
-              echo "✅ MySQL ready after $((i * 3))s"
+          echo "⏳ Final check for MySQL..."
+          for i in $(seq 1 10); do
+            if docker exec mock-rds-mysql mysqladmin ping -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ MySQL is ready"
               exit 0
             fi
-            [ $((i % 10)) -eq 0 ] && docker logs "$CONTAINER" --tail 10 2>/dev/null || true
             sleep 3
           done
-          echo "❌ MySQL not ready after 180s"
-          docker logs "$CONTAINER" --tail 30 2>/dev/null || true
+          echo "❌ MySQL not ready"
           exit 1
 
-      - name: 🗂️ Create database and tables
+      - name: 🗂️ Create tables
         run: |
-          CONTAINER="${{ steps.discover.outputs.container }}"
-
-          echo "📦 Creating database ${{ env.DB_NAME }}..."
-          docker exec "$CONTAINER" mysql \
-            -u"${{ env.DB_USER }}" \
-            -p"${{ env.DB_PASSWORD }}" \
-            -e "CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\`
-                CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-
           echo "📋 Creating tables..."
-          docker exec -i "$CONTAINER" mysql \
+          docker exec -i mock-rds-mysql mysql \
             -u"${{ env.DB_USER }}" \
             -p"${{ env.DB_PASSWORD }}" \
             "${{ env.DB_NAME }}" <<'SQL'
@@ -636,8 +555,8 @@ jobs:
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
 
-          echo "✅ DB initialized. Verifying..."
-          docker exec "$CONTAINER" mysql \
+          echo "✅ Tables created. Verifying..."
+          docker exec mock-rds-mysql mysql \
             -u"${{ env.DB_USER }}" \
             -p"${{ env.DB_PASSWORD }}" \
             "${{ env.DB_NAME }}" \
@@ -709,14 +628,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          DB_PORT="${{ env.DB_PORT }}"
-          if [ -z "$DB_PORT" ]; then
-            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' \
-              | awk -F'\t' '$2 ~ /^mysql/ { print $1 }' | head -1)
-            DB_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp 2>/dev/null \
-              | grep -oE '[0-9]+$' | head -1)
-            echo "🔎 Auto-detected DB_PORT: $DB_PORT"
-          fi
+          DB_PORT="3306"   # MySQL container exposed on 3306
 
           docker run -d \
             --name    ${CONTAINER_NAME} \
