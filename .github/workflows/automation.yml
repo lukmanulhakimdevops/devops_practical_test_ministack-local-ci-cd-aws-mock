@@ -280,6 +280,38 @@ jobs:
             if curl -s ${{ env.MINISTACK_ENDPOINT }}/health | grep -q "available"; then break; fi
             sleep 3
           done
+      - name: Clean up leftover resources (force cleanup)
+        env:
+          AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
+          AWS_REGION: ${{ needs.dr-check.outputs.active_region }}
+          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          ENV_NAME=${{ github.event.inputs.environment || 'staging' }}
+          echo "Cleaning up leftover resources for environment: $ENV_NAME"
+
+          # 1. Hapus EC2 instance jika ada
+          INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "Terminating existing EC2 instance: $INSTANCE_ID"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+            sleep 10
+          fi
+
+          # 2. Hapus Security Group jika ada
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=web-sg-${ENV_NAME}" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            echo "Deleting existing security group: $SG_ID"
+            aws ec2 delete-security-group --group-id $SG_ID || true
+          fi
+
+          # 3. Hapus S3 bucket jika ada
+          BUCKET_NAME=$(aws s3 ls | grep "app-bucket-${ENV_NAME}" | awk '{print $3}' || true)
+          if [ -n "$BUCKET_NAME" ]; then
+            echo "Deleting existing S3 bucket: $BUCKET_NAME"
+            aws s3 rb s3://$BUCKET_NAME --force || true
+          fi
+
       - name: Create Terraform files
         run: |
           mkdir -p terraform
