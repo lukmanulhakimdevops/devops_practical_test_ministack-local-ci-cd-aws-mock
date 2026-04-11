@@ -1,6 +1,6 @@
 # 🏢 Enterprise DevSecOps Pipeline (Ministack + EC2 Mock)
 
-[![CI/CD Pipeline](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions/workflows/dotnet.yml/badge.svg)](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions)
+[![CI/CD Pipeline](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions/workflows/automation.yml/badge.svg)](https://github.com/lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock/actions)
 [![Security: DevSecOps](https://img.shields.io/badge/Security-DevSecOps-red)](#)
 [![Deployment: Docker](https://img.shields.io/badge/Deployment-Docker-blue)](#)
 [![Mock AWS: Ministack](https://img.shields.io/badge/Mock_AWS-Ministack-orange)](#)
