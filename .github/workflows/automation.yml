@@ -26,7 +26,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 permissions:
-  contents: read
+  contents: write          # Diperlukan untuk commit otomatis hasil format
   security-events: write
   actions: read
   checks: write
@@ -38,26 +38,38 @@ defaults:
 
 jobs:
   # ------------------------------------------------------------------
-  # CODE QUALITY & LINTING
+  # CODE QUALITY & LINTING (Dengan auto-fix dan commit)
   # ------------------------------------------------------------------
   lint:
-    name: 🔍 Code Linting
+    name: 🔍 Code Linting & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}   # Untuk push ke branch yang sama
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-      - name: Run dotnet format
-        run: dotnet format --verify-no-changes --no-restore
+      - name: Run dotnet format (auto-fix)
+        run: dotnet format --no-restore
+      - name: Commit formatting changes (if any)
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git diff --quiet && git diff --staged --quiet || (git commit -m "style: apply dotnet format" && git push)
 
   # ------------------------------------------------------------------
-  # SAST & SECRET SCANNING
+  # SAST & SECRET SCANNING (Menggunakan CodeQL sebagai pengganti)
   # ------------------------------------------------------------------
   sast:
     name: 🛡️ SAST & Secrets
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,14 +78,15 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Security Code Scan
-        uses: dotnet/security-code-scan@main
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
         with:
-          project: TodoWebAPI/TodoWebAPI.csproj
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results.sarif
+          languages: csharp
+      - name: Build CodeQL database
+        run: |
+          dotnet build TodoWebAPI/TodoWebAPI.csproj
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
 
   # ------------------------------------------------------------------
   # SCA & SBOM GENERATION
