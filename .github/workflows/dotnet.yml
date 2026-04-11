@@ -91,35 +91,35 @@ jobs:
 # JOB 2 — DAST, Container Scan & Deploy (self-hosted runner)
 # ============================================================
   deploy:
-    name: 🐳 DAST, Scan & Deploy
-    needs: security_and_build
+    name: 🐳 Deploy to Laptop Docker
+    needs: build
     runs-on: [self-hosted, linux, x64]
 
     steps:
-      - name: 🧪 Check Runner Prerequisites
+      - name: 🧪 Check runner prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          echo "── Docker version ──────────────────────────────"
           docker --version
-          echo "── unzip version ───────────────────────────────"
           unzip -v >/dev/null
-          echo "✅ All prerequisites OK."
-
-      - name: ⬇️ Download Workflow Artifact
+      - name: ⬇️ Download workflow artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: ./artifact
 
-      - name: 📂 Extract Artifact
+      - name: 📂 Extract artifact
         shell: bash
         run: |
           set -euo pipefail
           rm -rf deploy_input
           mkdir -p deploy_input/publish
           unzip -q ./artifact/webapp-binaries.zip -d deploy_input/publish
-          echo "✅ Artifact extracted to deploy_input/publish/"
+          if [[ ! -f "deploy_input/publish/${APP_DLL}" ]]; then
+            echo "ERROR: ${APP_DLL} not found in artifact"
+            find deploy_input/publish -maxdepth 3 -type f | sed 's/^/ - /'
+            exit 1
+          fi
 
       # ----- Hardened Dockerfile with self-signed cert -----
       - name: 🐳 Create Secure Dockerfile
