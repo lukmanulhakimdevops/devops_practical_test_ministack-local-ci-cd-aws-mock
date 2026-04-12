@@ -1,17 +1,214 @@
+name: 🛡️ Enterprise DevSecOps CI/CD (DR & Audit-Proof)
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'TodoWebAPI/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+      manual_dr_trigger:
+        description: 'Force DR failover to us-east-2 (laptop)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  APP_DLL: TodoWebAPI.dll
+  APP_NAME: todo-webapi
+  CONTAINER_NAME: todo-webapi
+  HOST_PORT: 8080
+  CONTAINER_PORT: 5000
+  MINISTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
+  AWS_REGION_PRIMARY: us-east-1
+  AWS_REGION_DR: us-east-2
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DB_NAME: ${{ secrets.DB_NAME }}
+  DB_USER: ${{ secrets.DB_USER }}
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET || '' }}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  checks: write
+
+jobs:
+
+# ==========================================
+# DR DECISION
+# ==========================================
+  dr-check:
+    runs-on: ubuntu-latest
+    outputs:
+      active_region: ${{ steps.set.outputs.region }}
+      runner_label: ${{ steps.set.outputs.runner }}
+      ministack_port: ${{ steps.set.outputs.port }}
+      failover: ${{ steps.set.outputs.failover }}
+      state_key_prefix: ${{ steps.set.outputs.state_prefix }}
+      use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
+    steps:
+      - id: set
+        run: |
+          FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+          USE_S3="false"
+
+          if [ "$FAIL" = "true" ]; then
+            REGION="${{ env.AWS_REGION_DR }}"
+            RUNNER="self-hosted"
+            PORT="4567"
+            PREFIX="ministack/us-east-2"
+          else
+            REGION="${{ env.AWS_REGION_PRIMARY }}"
+            RUNNER="ubuntu-latest"
+            PORT="4566"
+            PREFIX="ministack/us-east-1"
+          fi
+
+          if [ -n "${{ env.TF_STATE_BUCKET }}" ] && [ "$RUNNER" != "self-hosted" ]; then
+            USE_S3="true"
+          fi
+
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "runner=$RUNNER" >> $GITHUB_OUTPUT
+          echo "port=$PORT" >> $GITHUB_OUTPUT
+          echo "failover=$FAIL" >> $GITHUB_OUTPUT
+          echo "state_prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
+
+# ==========================================
+# BUILD
+# ==========================================
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet publish TodoWebAPI/*.csproj -c Release -o publish_output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webapp-binaries
+          path: publish_output/
+
+# ==========================================
+# CONTAINER
+# ==========================================
+  container:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: webapp-binaries
+          path: deploy/publish
+
+      - run: |
+          cat > deploy/Dockerfile <<'EOF'
+          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+          WORKDIR /app
+          COPY publish/ /app/
+          EXPOSE 5000
+          ENTRYPOINT ["dotnet","TodoWebAPI.dll"]
+          EOF
+
+      - run: docker build -t ${{ env.APP_NAME }}:latest ./deploy
+      - run: docker save ${{ env.APP_NAME }}:latest | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+
+# ==========================================
+# DEPLOY
+# ==========================================
+  deploy:
+    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    needs: [dr-check, container]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - run: docker load < image.tar.gz
+      - run: docker rm -f ${{ env.CONTAINER_NAME }} || true
+
+      - run: |
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            -p ${{ env.HOST_PORT }}:${{ env.CONTAINER_PORT }} \
+            ${{ env.APP_NAME }}:latest
+
+      - run: |
+          for i in $(seq 1 10); do
+            curl -f http://localhost:${{ env.HOST_PORT }} && exit 0
+            sleep 3
+          done
+          exit 1
+
+# ==========================================
+# DAST
+# ==========================================
+  dast:
+    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    needs: deploy
+    steps:
+      - run: |
+          docker run --rm --network host zaproxy/zap-stable \
+          zap-baseline.py -t http://localhost:${{ env.HOST_PORT }}
+
+# ==========================================
+# TRAFFIC
+# ==========================================
+  traffic:
+    runs-on: ubuntu-latest
+    needs: [dr-check, deploy, dast]
+    steps:
+      - run: |
+          echo "Region: ${{ needs.dr-check.outputs.active_region }}"
+          echo "Failover: ${{ needs.dr-check.outputs.failover }}"
+
+# ==========================================
+# CLEANUP
+# ==========================================
+  cleanup:
+    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    needs: [traffic, dast]
+    if: "always() && github.ref_name != 'develop'"
+    steps:
+      - run: docker rm -f ${{ env.CONTAINER_NAME }} || true
+
+# ==========================================
+# NOTIFY (FIXED)
+# ==========================================
   notify:
-    name: 📢 Pipeline Summary
     runs-on: ubuntu-latest
     needs: [dr-check, traffic, dast, cleanup]
     if: always()
     steps:
-      - name: 🧮 Compute Flags
-        id: flags
+      - id: flags
         run: |
           if [ "${{ github.ref_name }}" = "develop" ]; then
-            echo "is_dev=YES" >> $GITHUB_OUTPUT
             echo "dev_label=✅ YES (Persistent)" >> $GITHUB_OUTPUT
           else
-            echo "is_dev=NO" >> $GITHUB_OUTPUT
             echo "dev_label=❌ NO" >> $GITHUB_OUTPUT
           fi
 
@@ -21,24 +218,10 @@
             echo "status=❌ FAILED" >> $GITHUB_OUTPUT
           fi
 
-      - name: 📊 Print Summary
-        run: |
-          REGION="${{ needs.dr-check.outputs.active_region }}"
-          FAILOVER="${{ needs.dr-check.outputs.failover }}"
-
-          echo "================================"
-          echo "  🛡️ DevSecOps Pipeline Summary"
-          echo "================================"
-          echo "  Branch: ${{ github.ref_name }}"
-          echo "  Persistent Dev: ${{ steps.flags.outputs.dev_label }}"
-          echo "  Region: $REGION"
-          echo "  DR Failover: $FAILOVER"
-          echo "  RDS Health: ✅ PASSED"
-          echo "  App Health: ✅ PASSED"
-          echo "  DAST: ${{ needs.dast.result }}"
-          echo "  Status: ${{ steps.flags.outputs.status }}"
-          echo "================================"
-          if [ "${{ steps.flags.outputs.is_dev }}" = "YES" ]; then
-            echo "💡 Environment persistent for dev iterations."
-            echo "🌐 Access: http://localhost:${{ env.HOST_PORT }}"
-          fi
+      - run: |
+          echo "=============================="
+          echo "Dev: ${{ steps.flags.outputs.dev_label }}"
+          echo "Region: ${{ needs.dr-check.outputs.active_region }}"
+          echo "DAST: ${{ needs.dast.result }}"
+          echo "Status: ${{ steps.flags.outputs.status }}"
+          echo "=============================="
