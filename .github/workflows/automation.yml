@@ -234,7 +234,7 @@ jobs:
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
           format: 'table'
-          exit-code: '0'            # Do not fail on vulnerabilities (we've patched known ones)
+          exit-code: '0'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
       - name: 💾 Save Docker Image
@@ -244,7 +244,7 @@ jobs:
         with:
           name: docker-image
           path: ${{ env.APP_NAME }}-image.tar.gz
-          retention-days: 1
+          retention-days: 7
 
   # ==========================================
   # INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
@@ -442,69 +442,32 @@ jobs:
           echo "RDS_PORT=$port" >> $GITHUB_ENV
           echo "Parsed: $host:$port"
 
-      - name: ⏳ Wait for MySQL container (Ministack RDS)
-        if: needs.dr-check.outputs.is_dr == 'false'
+      - name: 🏥 Wait for MySQL to be fully ready
         run: |
-          echo "Looking for MySQL container spawned by Ministack..."
-          # Ministack creates a container with name like 'ministack_mysql_*' or 'localstack_rds_*'
-          # Wait for it to appear and be healthy
-          for i in $(seq 1 30); do
-            MYSQL_CONTAINER=$(docker ps --filter "name=mysql" --filter "name=ministack" --format '{{.Names}}' | head -1)
-            if [ -n "$MYSQL_CONTAINER" ]; then
-              echo "Found MySQL container: $MYSQL_CONTAINER"
-              break
-            fi
-            echo "Waiting for MySQL container... attempt $i"
-            sleep 3
-          done
-          if [ -z "$MYSQL_CONTAINER" ]; then
-            echo "❌ MySQL container not found. Falling back to proxy endpoint healthcheck."
-            MYSQL_CONTAINER=""
-          fi
-          echo "MYSQL_CONTAINER=$MYSQL_CONTAINER" >> $GITHUB_ENV
-
-      - name: 🏥 Health Check MySQL (direct container)
-        if: needs.dr-check.outputs.is_dr == 'false' && env.MYSQL_CONTAINER != ''
-        run: |
-          echo "Checking MySQL directly via container $MYSQL_CONTAINER"
-          for i in $(seq 1 60); do
-            if docker exec "$MYSQL_CONTAINER" mysqladmin ping -u root --password="${{ env.DB_PASSWORD }}" --silent; then
-              echo "✅ MySQL is READY (attempt $i)"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "❌ MySQL never became ready via direct container"
-          exit 1
-
-      - name: 🏥 Health Check MySQL (TCP fallback for DR/Laptop)
-        if: needs.dr-check.outputs.is_dr == 'true' || env.MYSQL_CONTAINER == ''
-        run: |
-          echo "Checking MySQL TCP readiness at $RDS_HOST:$RDS_PORT"
-          SUCCESS=0
+          echo "Waiting for MySQL at $RDS_HOST:$RDS_PORT to accept queries..."
           for i in $(seq 1 60); do
             echo "Attempt $i..."
-            MYSQL_PWD="${{ env.DB_PASSWORD }}" docker run --rm --network host mysql:8.0 \
-              mysqladmin ping \
-              --protocol=TCP \
-              -h"$RDS_HOST" \
-              -P"$RDS_PORT" \
-              -u"${{ env.DB_USER }}" \
-              --connect-timeout=5 \
-              --silent && { SUCCESS=1; break; }
-            sleep 5
+            if docker run --rm --network host mysql:8.0 \
+                mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+                -e "SELECT 1" --protocol=TCP --connect-timeout=5 2>/dev/null; then
+              echo "✅ MySQL is READY"
+              exit 0
+            fi
+            sleep 10
           done
-          if [ "$SUCCESS" != "1" ]; then
-            echo "❌ MySQL never became ready"
-            exit 1
-          fi
-          echo "✅ MySQL is READY"
+          echo "❌ MySQL never became ready"
+          exit 1
 
       - name: 🗂️ Initialize Database Schema
         run: |
-          if [ -n "$MYSQL_CONTAINER" ]; then
-            echo "Using direct container for schema init: $MYSQL_CONTAINER"
-            docker exec -i "$MYSQL_CONTAINER" mysql -u root --password="${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
+          docker run -i --rm --network host mysql:8.0 \
+            mysql \
+            --protocol=TCP \
+            -h"$RDS_HOST" \
+            -P"$RDS_PORT" \
+            -u"${{ env.DB_USER }}" \
+            -p"${{ env.DB_PASSWORD }}" \
+            "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id         INT PRIMARY KEY AUTO_INCREMENT,
             Name       VARCHAR(255) NULL,
@@ -513,24 +476,6 @@ jobs:
             UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
-          else
-            docker run -i --rm --network host mysql:8.0 \
-              mysql \
-              --protocol=TCP \
-              -h"$RDS_HOST" \
-              -P"$RDS_PORT" \
-              -u"${{ env.DB_USER }}" \
-              -p"${{ env.DB_PASSWORD }}" \
-              "${{ env.DB_NAME }}" << 'SQL'
-          CREATE TABLE IF NOT EXISTS TodoItems (
-            Id         INT PRIMARY KEY AUTO_INCREMENT,
-            Name       VARCHAR(255) NULL,
-            IsComplete TINYINT(1)   NOT NULL DEFAULT 0,
-            CreatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          SQL
-          fi
           echo "✅ Schema ready in ${{ needs.dr-check.outputs.active_region }}"
 
   # ==========================================
@@ -546,11 +491,32 @@ jobs:
        (needs.sast.result == 'success' && needs.sca.result == 'success' && needs.container.result == 'success'))
     environment: ${{ github.event.inputs.environment || 'staging' }}
     steps:
-      - name: ⬇️ Download Golden Image
+      - name: 🔍 Determine artifact source
+        id: artifact
+        run: |
+          if [ "${{ needs.dr-check.outputs.is_dr }}" == "true" ]; then
+            echo "source=download" >> $GITHUB_OUTPUT
+          else
+            echo "source=local" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ⬇️ Download Golden Image (from current run)
+        if: steps.artifact.outputs.source == 'local'
         uses: actions/download-artifact@v4
         with:
           name: docker-image
           path: .
+
+      - name: ⬇️ Download Golden Image (from latest primary run)
+        if: steps.artifact.outputs.source == 'download'
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: ${{ github.workflow }}
+          branch: main
+          name: docker-image
+          path: .
+          search_artifacts: true
+          if_no_artifact_found: fail
 
       - name: 📦 Load Image
         run: docker load < ${{ env.APP_NAME }}-image.tar.gz
@@ -608,7 +574,7 @@ jobs:
     name: 🕷️ DAST Scan
     runs-on: ubuntu-latest
     if: needs.dr-check.outputs.is_dr == 'false'
-    needs: [dr-check, infra]   # Runs parallel with build
+    needs: [dr-check, infra]
     steps:
       - name: ⬇️ Download Golden Image
         uses: actions/download-artifact@v4
@@ -642,44 +608,23 @@ jobs:
             sleep 5
           done
 
-          # Find MySQL container directly for reliability
-          for i in $(seq 1 30); do
-            MYSQL_CONTAINER=$(docker ps --filter "name=mysql" --filter "name=ministack" --format '{{.Names}}' | head -1)
-            [ -n "$MYSQL_CONTAINER" ] && break
-            sleep 3
-          done
-
-          if [ -n "$MYSQL_CONTAINER" ]; then
-            echo "Using direct MySQL container: $MYSQL_CONTAINER"
-            for i in $(seq 1 30); do
-              docker exec "$MYSQL_CONTAINER" mysqladmin ping -u root --password="${{ env.DB_PASSWORD }}" --silent && break
-              sleep 3
-            done
-            docker exec -i "$MYSQL_CONTAINER" mysql -u root --password="${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
-            CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
-            SQL
-            # For app connection, use proxy endpoint
-            ep="${{ needs.infra.outputs.rds_endpoint }}"
-            if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
-          else
-            # Fallback to TCP
-            ep=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
-              rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-              --query "DBInstances[0].Endpoint.Address" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
-            if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
-            sleep 15
-            for i in $(seq 1 30); do
-              MYSQL_PWD="${{ env.DB_PASSWORD }}" docker run --rm --network host mysql:8.0 \
-                mysqladmin ping --protocol=TCP -h"$host" -P"$port" -u"${{ env.DB_USER }}" --silent && break
-              sleep 3
-            done
-            docker run -i --rm --network host mysql:8.0 \
-              mysql --protocol=TCP -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
-            CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
-            SQL
-          fi
+          ep=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+            rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+            --query "DBInstances[0].Endpoint.Address" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
+          if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
           echo "RDS_HOST=$host" >> $GITHUB_ENV
           echo "RDS_PORT=$port" >> $GITHUB_ENV
+
+          # Wait for MySQL
+          for i in $(seq 1 30); do
+            docker run --rm --network host mysql:8.0 mysql -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" -e "SELECT 1" --protocol=TCP 2>/dev/null && break
+            sleep 10
+          done
+
+          docker run -i --rm --network host mysql:8.0 \
+            mysql --protocol=TCP -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
+          CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
+          SQL
 
       - name: 🚀 Run App for DAST
         run: |
