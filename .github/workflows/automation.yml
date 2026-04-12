@@ -396,7 +396,9 @@ jobs:
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
           
           echo "🗂️ Mengeksekusi Injeksi Skema Database..."
-          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" -e "
+          
+          # Buat file SQL menggunakan heredoc (aman dari YAML parsing)
+          cat > /tmp/init.sql <<'EOF'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -404,7 +406,14 @@ jobs:
             CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          "
+          EOF
+          
+          # Jalankan file SQL melalui Docker volume mount
+          docker run -i --rm --network host \
+            -v /tmp/init.sql:/init.sql:ro \
+            mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" \
+            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" < /init.sql
+          
           echo "✅ FASE 2 SELESAI: Tabel berhasil dibuat."
 
   # ==========================================
