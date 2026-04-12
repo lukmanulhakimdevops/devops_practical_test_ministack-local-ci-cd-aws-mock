@@ -270,8 +270,11 @@ jobs:
 
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack -p ${PORT}:4566 -v /var/run/docker.sock:/var/run/docker.sock \
-            -e SERVICES=ec2,s3,sts,iam,rds -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
+          # Gunakan --network host agar port mapping berfungsi dengan baik
+          docker run -d --name ministack --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
             nahuelnucera/ministack:latest
 
           echo "⏳ Waiting for Ministack..."
@@ -294,7 +297,7 @@ jobs:
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "❌ Ministack container not running. Start with:"
-            echo "   docker run -d --name ministack -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest"
+            echo "   docker run -d --name ministack --network host -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest"
             exit 1
           fi
           echo "✅ Ministack is running"
@@ -423,6 +426,24 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     steps:
+      - name: Ensure Ministack is running
+        run: |
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
+            echo "Starting Ministack..."
+            docker run -d --name ministack --network host \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e SERVICES=ec2,s3,sts,iam,rds \
+              -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
+              nahuelnucera/ministack:latest
+            sleep 10
+          fi
+          # Wait for Ministack to be ready
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${PORT}/_localstack/health" && break
+            sleep 2
+          done
+
       - name: Parse RDS Endpoint
         id: parse
         run: |
@@ -439,12 +460,11 @@ jobs:
           echo "RDS_PORT=$port" >> $GITHUB_ENV
           echo "Parsed: $host:$port"
 
-      - name: 🏥 Health Check RDS (via Ministack network)
+      - name: 🏥 Health Check RDS
         run: |
           echo "Checking MySQL at $RDS_HOST:$RDS_PORT"
-          # Gunakan network container ministack agar bisa akses RDS internal
           for i in $(seq 1 60); do
-            if docker run --rm --network container:ministack mysql:8.0 \
+            if docker run --rm --network host mysql:8.0 \
                 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent; then
               echo "✅ RDS healthy (attempt $i)"
               break
@@ -454,7 +474,7 @@ jobs:
 
       - name: 🗂️ Initialize Database Schema
         run: |
-          docker run -i --rm --network container:ministack mysql:8.0 \
+          docker run -i --rm --network host mysql:8.0 \
             mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id         INT          PRIMARY KEY AUTO_INCREMENT,
@@ -488,6 +508,23 @@ jobs:
       - name: 📦 Load Image
         run: docker load < ${{ env.APP_NAME }}-image.tar.gz
 
+      - name: Ensure Ministack is running
+        run: |
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
+            echo "Starting Ministack..."
+            docker run -d --name ministack --network host \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e SERVICES=ec2,s3,sts,iam,rds \
+              -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
+              nahuelnucera/ministack:latest
+            sleep 10
+          fi
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${PORT}/_localstack/health" && break
+            sleep 2
+          done
+
       - name: Parse RDS Endpoint
         run: |
           ep="${{ needs.infra.outputs.rds_endpoint }}"
@@ -504,7 +541,7 @@ jobs:
 
       - name: 🗂️ Ensure Schema (Idempotent)
         run: |
-          docker run -i --rm --network container:ministack mysql:8.0 \
+          docker run -i --rm --network host mysql:8.0 \
             mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id         INT          PRIMARY KEY AUTO_INCREMENT,
@@ -563,25 +600,28 @@ jobs:
         run: |
           PORT=4566
           docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack -p ${PORT}:4566 -v /var/run/docker.sock:/var/run/docker.sock \
-            -e SERVICES=ec2,s3,sts,iam,rds -e DEFAULT_REGION=us-east-1 nahuelnucera/ministack:latest
+          docker run -d --name ministack --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            -e DEFAULT_REGION=us-east-1 \
+            nahuelnucera/ministack:latest
 
           for i in $(seq 1 30); do curl -sf "http://localhost:${PORT}/_localstack/health" && break; sleep 2; done
 
-          docker run --rm --network container:ministack -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+          docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
             rds create-db-instance --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
             --db-instance-class db.t3.micro --engine mysql --engine-version "8.0" --master-username "${{ env.DB_USER }}" \
             --master-user-password "${{ env.DB_PASSWORD }}" --db-name "${{ env.DB_NAME }}" --allocated-storage 20 \
             --no-multi-az --publicly-accessible --no-deletion-protection --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
-          ep=$(docker run --rm --network container:ministack -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+          ep=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
             rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
             --query "DBInstances[0].Endpoint.Address" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
           if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
           echo "RDS_HOST=$host" >> $GITHUB_ENV
           echo "RDS_PORT=$port" >> $GITHUB_ENV
 
-          docker run -i --rm --network container:ministack mysql:8.0 \
+          docker run -i --rm --network host mysql:8.0 \
             mysql -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
           SQL
