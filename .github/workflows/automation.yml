@@ -106,6 +106,7 @@ jobs:
   sast:
     name: 🔐 SAST & Secrets
     runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
     permissions:
       security-events: write
       contents: read
@@ -136,6 +137,7 @@ jobs:
   sca:
     name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Setup .NET
@@ -164,6 +166,7 @@ jobs:
   build:
     name: 🔨 Build Application
     runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Setup .NET
@@ -194,6 +197,7 @@ jobs:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
     needs: build
+    if: needs.dr-check.outputs.is_dr == 'false'
     steps:
       - uses: actions/checkout@v4
       - name: ⬇️ Download artifact
@@ -462,15 +466,29 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     steps:
+      # ---------- Helper function to parse RDS endpoint ----------
+      - name: Parse RDS Endpoint
+        id: parse
+        run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          # Pisahkan host dan port. Jika tidak ada ":", gunakan port default 3306.
+          if [[ "$RDS_ENDPOINT" == *":"* ]]; then
+            RDS_HOST="${RDS_ENDPOINT%:*}"
+            RDS_PORT="${RDS_ENDPOINT##*:}"
+          else
+            RDS_HOST="$RDS_ENDPOINT"
+            RDS_PORT="3306"
+          fi
+          # localhost -> 127.0.0.1 untuk koneksi Docker host
+          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
+          echo "RDS_HOST=$RDS_HOST, RDS_PORT=$RDS_PORT"
+
       # ---------- GitHub-hosted: restart Ministack if needed ----------
       - name: '🏥 [GitHub] Ensure Ministack & RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "⚠️ Ministack tidak ditemukan, restart..."
@@ -507,6 +525,7 @@ jobs:
                 --no-deletion-protection \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
+            # Update RDS_HOST dan RDS_PORT setelah provisioning ulang
             RDS_ENDPOINT=$(docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
               -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -516,8 +535,16 @@ jobs:
                 --query "DBInstances[0].Endpoint.Address" \
                 --output text \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
-            RDS_HOST="$RDS_ENDPOINT"
+            if [[ "$RDS_ENDPOINT" == *":"* ]]; then
+              RDS_HOST="${RDS_ENDPOINT%:*}"
+              RDS_PORT="${RDS_ENDPOINT##*:}"
+            else
+              RDS_HOST="$RDS_ENDPOINT"
+              RDS_PORT="3306"
+            fi
             [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+            echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+            echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
           fi
 
           echo "🏥 Healthcheck TCP $RDS_HOST:$RDS_PORT..."
@@ -538,11 +565,6 @@ jobs:
       - name: '🏥 [Laptop] RDS Health Check'
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-
           echo "🏥 Checking RDS at $RDS_HOST:$RDS_PORT ..."
           for i in $(seq 1 30); do
             if docker run --rm --network host mysql:8.0 \
@@ -557,11 +579,6 @@ jobs:
       # ---------- Common: Schema init ----------
       - name: '🗂️ Database Schema Initialization'
         run: |
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-
           docker run -i --rm --network host mysql:8.0 \
             mysql -h"$RDS_HOST" -P"$RDS_PORT" \
             -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
@@ -582,6 +599,10 @@ jobs:
     name: 🚀 Deploy & Health Check
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, sast, sca, container, db-init, infra]
+    if: |
+      always() &&
+      (needs.dr-check.outputs.is_dr == 'true' || 
+       (needs.sast.result == 'success' && needs.sca.result == 'success' && needs.container.result == 'success'))
     environment: ${{ github.event.inputs.environment || 'staging' }}
     steps:
       - name: ⬇️ Download Docker Image Artifact
@@ -595,13 +616,27 @@ jobs:
           docker load < ${{ env.APP_NAME }}-image.tar.gz
           echo "✅ Golden Image Loaded."
 
+      # ---------- Parse RDS endpoint again (ensure env vars) ----------
+      - name: Parse RDS Endpoint
+        id: parse
+        run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          if [[ "$RDS_ENDPOINT" == *":"* ]]; then
+            RDS_HOST="${RDS_ENDPOINT%:*}"
+            RDS_PORT="${RDS_ENDPOINT##*:}"
+          else
+            RDS_HOST="$RDS_ENDPOINT"
+            RDS_PORT="3306"
+          fi
+          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
+
       # ---------- GitHub-hosted: Ensure Ministack + RDS ----------
       - name: '🐳 [GitHub] Ensure Ministack + RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "⚠️ Ministack tidak ada, restart idempotent..."
             docker rm -f ministack 2>/dev/null || true
@@ -646,24 +681,17 @@ jobs:
                 --query "DBInstances[0].Endpoint.Address" \
                 --output text \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
+            if [[ "$RDS_ENDPOINT" == *":"* ]]; then
+              RDS_HOST="${RDS_ENDPOINT%:*}"
+              RDS_PORT="${RDS_ENDPOINT##*:}"
+            else
+              RDS_HOST="$RDS_ENDPOINT"
+              RDS_PORT="3306"
+            fi
+            [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+            echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+            echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
           fi
-
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
-          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
-
-      # ---------- Self-hosted: just set RDS env ----------
-      - name: '💻 [Laptop] Set RDS Connection'
-        if: needs.dr-check.outputs.is_dr == 'true'
-        run: |
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
-          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
 
       - name: 🗂️ Ensure DB Schema (Idempotent)
         run: |
@@ -716,7 +744,7 @@ jobs:
   dast:
     name: 🕷️ DAST Scan
     runs-on: ubuntu-latest
-    if: needs.dr-check.outputs.is_dr == 'false'   # Hanya di primary
+    if: needs.dr-check.outputs.is_dr == 'false'
     needs: [dr-check, deploy]
     steps:
       - name: ⬇️ Download Docker Image Artifact
@@ -768,12 +796,16 @@ jobs:
               --query "DBInstances[0].Endpoint.Address" \
               --output text \
               --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
-
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          if [[ "$RDS_ENDPOINT" == *":"* ]]; then
+            RDS_HOST="${RDS_ENDPOINT%:*}"
+            RDS_PORT="${RDS_ENDPOINT##*:}"
+          else
+            RDS_HOST="$RDS_ENDPOINT"
+            RDS_PORT="3306"
+          fi
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
-          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
+          echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
 
           docker run -i --rm --network host mysql:8.0 \
             mysql -h"$RDS_HOST" -P"$RDS_PORT" \
@@ -828,7 +860,6 @@ jobs:
           path: /tmp/zap-out/
           retention-days: 7
 
-      # Cleanup after DAST (only ephemeral containers)
       - name: 🧹 Cleanup DAST containers
         if: always()
         run: |
@@ -927,7 +958,9 @@ jobs:
           FAILOVER="${{ needs.dr-check.outputs.failover }}"
           IS_DEV="${{ github.ref_name == 'develop' && '✅ YES (Persistent)' || '❌ NO' }}"
           STATUS="✅ SUCCESS"
-          [ "${{ needs.dast.result }}" != "success" ] && [ "$FAILOVER" == "false" ] && STATUS="❌ FAILED"
+          if [ "$FAILOVER" == "false" ]; then
+            [ "${{ needs.dast.result }}" != "success" ] && STATUS="❌ FAILED"
+          fi
           echo "================================"
           echo "  🛡️ DevSecOps Pipeline Summary"
           echo "================================"
