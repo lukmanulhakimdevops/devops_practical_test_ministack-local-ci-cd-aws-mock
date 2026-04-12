@@ -26,7 +26,7 @@ env:
   DOTNET_VERSION: '8.0.x'
   APP_NAME: todo-webapi
   CONTAINER_NAME: todo-webapi
-  HOST_PORT: 8080
+  HOST_PORT: 5000
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -224,7 +224,7 @@ jobs:
            && mkdir -p /app/logs \
            && chown -R appuser:appuser /app
           USER appuser
-          EXPOSE 8080
+          EXPOSE 5000
           COPY --chown=appuser:appuser publish/ /app/
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
@@ -625,11 +625,19 @@ jobs:
       - name: 🔍 Health Check App
         run: |
           url="http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json"
+          echo "⏳ Polling $url in ${REGION}..."
           for i in $(seq 1 20); do
             code=$(curl -so /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
-            [ "$code" = "200" ] && { echo "✅ App healthy"; break; }
+            if [ "$code" = "200" ]; then
+              echo "✅ HEALTH CHECK PASSED (HTTP $code) in ${REGION}"
+              exit 0
+            fi
+            echo "  attempt $i/20 — HTTP $code"
             sleep 5
           done
+          echo "❌ HEALTH CHECK FAILED"
+          docker logs --tail 60 ${{ env.CONTAINER_NAME }}
+          exit 1
 
       - name: 🕷️ Fullstack DAST Scan (OWASP ZAP)
         if: needs.dr-check.outputs.is_dr == 'false'
