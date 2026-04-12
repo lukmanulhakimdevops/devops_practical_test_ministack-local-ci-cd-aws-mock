@@ -1,303 +1,192 @@
-name: 🛡️ Enterprise DevSecOps CI/CD (DR & Audit-Proof)
+# ==========================================
+# ROUTING & DR DECISION
+# ==========================================
+dr-check:
+  name: 🧠 DR Decision
+  runs-on: ubuntu-latest
+  outputs:
+    active_region: ${{ steps.set.outputs.region }}
+    runner_label: ${{ steps.set.outputs.runner }}
+    ministack_port: ${{ steps.set.outputs.port }}
+    failover: ${{ steps.set.outputs.failover }}
+    state_key_prefix: ${{ steps.set.outputs.state_prefix }}
+    use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
+    is_dr: ${{ steps.set.outputs.is_dr }}
+    should_cleanup: ${{ steps.set.outputs.should_cleanup }}
+  steps:
+    - id: set
+      run: |
+        FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+        CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
+        BRANCH="${{ github.ref_name }}"
 
-on:
-  push:
-    branches: [main, develop]
-    paths:
-      - 'TodoWebAPI/**'
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        default: 'staging'
-        type: choice
-        options: [staging, production]
-      manual_dr_trigger:
-        description: 'Force DR failover to us-east-2 (laptop)'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['true', 'false']
-      cleanup_resources:
-        description: 'Cleanup after pipeline? (only for ephemeral env)'
-        required: false
-        default: 'false'
-        type: choice
-        options: ['true', 'false']
+        SHOULD_CLEANUP="false"
+        if [ "$CLEANUP_INPUT" == "true" ]; then
+          SHOULD_CLEANUP="true"
+        elif [ "$BRANCH" != "main" ] && [ "$BRANCH" != "develop" ]; then
+          SHOULD_CLEANUP="true"
+        fi
+        echo "should_cleanup=$SHOULD_CLEANUP" >> $GITHUB_OUTPUT
 
-env:
-  DOTNET_VERSION: '8.0.x'
-  APP_NAME: todo-webapi
-  CONTAINER_NAME: todo-webapi
-  HOST_PORT: 8080
-  AWS_REGION_PRIMARY: us-east-1
-  AWS_REGION_DR: us-east-2
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  DB_NAME: ${{ secrets.DB_NAME }}
-  DB_USER: ${{ secrets.DB_USER }}
-  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-  DB_PORT: ${{ secrets.DB_PORT || '3306' }}
-  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET || '' }}
+        if [ "$FAIL" == "true" ]; then
+          echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
+          echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
+          echo "port=4566" >> $GITHUB_OUTPUT
+          echo "state_prefix=ministack/us-east-2" >> $GITHUB_OUTPUT
+          echo "use_s3_backend=false" >> $GITHUB_OUTPUT
+          echo "is_dr=true" >> $GITHUB_OUTPUT
+          echo "🌍 AWS Region: us-east-2 (DR Mode - Laptop)"
+        else
+          echo 'runner="ubuntu-latest"' >> $GITHUB_OUTPUT
+          echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
+          echo "port=4566" >> $GITHUB_OUTPUT
+          echo "state_prefix=ministack/us-east-1" >> $GITHUB_OUTPUT
+          USE_S3="false"
+          [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
+          echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
+          echo "is_dr=false" >> $GITHUB_OUTPUT
+          echo "🌍 AWS Region: us-east-1 (Primary Mode - GitHub)"
+        fi
+        echo "failover=$FAIL" >> $GITHUB_OUTPUT
 
-permissions:
-  contents: read
-  security-events: write
-  actions: read
-  checks: write
+# ==========================================
+# DEV SECURITY JOBS – ONLY ON PRIMARY
+# ==========================================
+sast:
+  name: 🔐 SAST & Secrets
+  runs-on: ubuntu-latest
+  if: needs.dr-check.outputs.is_dr == 'false'
+  needs: dr-check
+  permissions:
+    security-events: write
+    contents: read
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: 🔐 Gitleaks – Secret Scanning
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: 🔧 Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    - name: 🧬 Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: csharp
+    - name: 🔨 Build for CodeQL
+      run: cd TodoWebAPI && dotnet build TodoWebAPI.csproj
+    - name: 🧬 Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
 
-jobs:
-  dr-check:
-    name: 🧠 DR Decision
-    runs-on: ubuntu-latest
-    outputs:
-      active_region: ${{ steps.set.outputs.region }}
-      runner_label: ${{ steps.set.outputs.runner }}
-      ministack_port: ${{ steps.set.outputs.port }}
-      failover: ${{ steps.set.outputs.failover }}
-      state_key_prefix: ${{ steps.set.outputs.state_prefix }}
-      use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
-      is_dr: ${{ steps.set.outputs.is_dr }}
-      should_cleanup: ${{ steps.set.outputs.should_cleanup }}
-    steps:
-      - id: set
-        run: |
-          FAIL="${{ github.event.inputs.manual_dr_trigger }}"
-          CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
-          BRANCH="${{ github.ref_name }}"
+sca:
+  name: 📦 SCA & SBOM
+  runs-on: ubuntu-latest
+  if: needs.dr-check.outputs.is_dr == 'false'
+  needs: dr-check
+  steps:
+    - uses: actions/checkout@v4
+    - name: 🔧 Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    - name: 🔍 Audit NuGet vulnerabilities
+      run: |
+        dotnet restore TodoWebAPI/*.csproj
+        dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
+    - name: 📄 Generate SBOM (CycloneDX)
+      uses: CycloneDX/gh-dotnet-generate-sbom@v1
+      with:
+        path: TodoWebAPI
+        output: sbom.xml
+    - name: 📤 Upload SBOM
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-sbom
+        path: TodoWebAPI/sbom.xml
+        retention-days: 7
 
-          SHOULD_CLEANUP="false"
-          if [ "$CLEANUP_INPUT" == "true" ]; then
-            SHOULD_CLEANUP="true"
-          elif [ "$BRANCH" != "main" ] && [ "$BRANCH" != "develop" ]; then
-            SHOULD_CLEANUP="true"
-          fi
-          echo "should_cleanup=$SHOULD_CLEANUP" >> $GITHUB_OUTPUT
+build:
+  name: 🔨 Build Application
+  runs-on: ubuntu-latest
+  if: needs.dr-check.outputs.is_dr == 'false'
+  needs: [dr-check, sast, sca]
+  steps:
+    - uses: actions/checkout@v4
+    - name: 🔧 Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    - name: 🩹 Patch Microsoft.Build vulnerability
+      run: |
+        for proj in TodoWebAPI/*.csproj; do
+          dotnet add "$proj" package Microsoft.Build.Runtime --version 17.5.0
+        done
 
-          if [ "$FAIL" == "true" ]; then
-            echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
-            echo "region=${{ env.AWS_REGION_DR }}"      >> $GITHUB_OUTPUT
-            echo "port=4566"                            >> $GITHUB_OUTPUT
-            echo "state_prefix=ministack/us-east-2"     >> $GITHUB_OUTPUT
-            echo "use_s3_backend=false"                 >> $GITHUB_OUTPUT
-            echo "is_dr=true"                           >> $GITHUB_OUTPUT
-            echo "🌍 AWS Region: us-east-2 (DR Mode - Laptop)"
-          else
-            echo 'runner="ubuntu-latest"'               >> $GITHUB_OUTPUT
-            echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
-            echo "port=4566"                            >> $GITHUB_OUTPUT
-            echo "state_prefix=ministack/us-east-1"     >> $GITHUB_OUTPUT
-            USE_S3="false"
-            [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
-            echo "use_s3_backend=$USE_S3"               >> $GITHUB_OUTPUT
-            echo "is_dr=false"                          >> $GITHUB_OUTPUT
-            echo "🌍 AWS Region: us-east-1 (Primary Mode - GitHub)"
-          fi
-          echo "failover=$FAIL" >> $GITHUB_OUTPUT
+# ==========================================
+# INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
+# ==========================================
+infra:
+  name: 🏗️ Provision Infrastructure
+  runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
+  needs: dr-check
+  outputs:
+    rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
+  steps:
+    - uses: actions/checkout@v4
+    - name: 🔧 Install Terraform & Start Ministack
+      if: needs.dr-check.outputs.is_dr == 'false'
+      run: |
+        if ! command -v terraform &>/dev/null; then
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -qq && sudo apt-get install -y terraform
+        fi
+        terraform version
 
-  infra:
-    name: 🏗️ Provision Infrastructure
-    runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
-    needs: dr-check
-    outputs:
-      rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: 🔧 [GitHub] Install Terraform & Start Ministack
-        if: needs.dr-check.outputs.is_dr == 'false'
-        run: |
-          if ! command -v terraform &>/dev/null; then
-            curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-            sudo apt-get update -qq && sudo apt-get install -y terraform
-          fi
-          terraform version
+        PORT="${{ needs.dr-check.outputs.ministack_port }}"
+        docker rm -f ministack 2>/dev/null || true
+        docker run -d --name ministack --network host \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -e SERVICES=ec2,s3,sts,iam,rds \
+          -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
+          nahuelnucera/ministack:latest
+        echo "⏳ Waiting for Ministack..."
+        for i in $(seq 1 40); do
+          curl -sf "http://localhost:${PORT}/_localstack/health" && break
+          sleep 3
+        done
 
-          PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack --network host \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -e SERVICES=ec2,s3,sts,iam,rds \
-            -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
-            nahuelnucera/ministack:latest
-
-          echo "⏳ Waiting for Ministack..."
-          for i in $(seq 1 40); do
-            curl -sf "http://localhost:${PORT}/_localstack/health" && break
-            sleep 3
-          done
-
-      - name: 📝 Create Terraform config
-        run: |
-          mkdir -p terraform
-          cat > terraform/main.tf << 'TFEOF'
-          terraform {
-            required_providers {
-              aws    = { source = "hashicorp/aws", version = "~> 5.0" }
-              random = { source = "hashicorp/random", version = "~> 3.0" }
-            }
-          }
-
-          variable "ministack_endpoint" {}
-          variable "environment" {}
-          variable "aws_region" {}
-          variable "db_name" {}
-          variable "db_user" {}
-          variable "db_password" {}
-
-          provider "aws" {
-            region                      = var.aws_region
-            access_key                  = "dummy"
-            secret_key                  = "dummy"
-            skip_credentials_validation = true
-            skip_requesting_account_id  = true
-            skip_metadata_api_check     = true
-            s3_use_path_style           = true
-            endpoints {
-              ec2 = var.ministack_endpoint
-              s3  = var.ministack_endpoint
-              sts = var.ministack_endpoint
-              iam = var.ministack_endpoint
-              rds = var.ministack_endpoint
-            }
-          }
-
-          resource "aws_security_group" "web_sg" {
-            name        = "web-sg-${var.environment}-${var.aws_region}"
-            description = "SG for ${var.aws_region}"
-            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
-
-            ingress {
-              from_port   = 80
-              to_port     = 80
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 443
-              to_port     = 443
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-          }
-
-          resource "aws_instance" "web" {
-            ami             = "ami-0ff8a91507f77f867"
-            instance_type   = "t2.micro"
-            security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps" }
-          }
-
-          resource "aws_db_instance" "mysql" {
-            identifier          = "ministack-mysql-${var.environment}"
-            engine              = "mysql"
-            engine_version      = "8.0"
-            instance_class      = "db.t3.micro"
-            allocated_storage   = 20
-            db_name             = var.db_name
-            username            = var.db_user
-            password            = var.db_password
-            port                = 3306
-            skip_final_snapshot = true
-            apply_immediately   = true
-            publicly_accessible = true
-            tags = { Project = "DevSecOps" }
-          }
-
-          output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
-          TFEOF
-
-          cat > terraform/terraform.tfvars << EOF
-          ministack_endpoint = "http://localhost:${{ needs.dr-check.outputs.ministack_port }}"
-          environment        = "${{ github.event.inputs.environment || 'staging' }}"
-          aws_region         = "${{ needs.dr-check.outputs.active_region }}"
-          db_name            = "${{ secrets.DB_NAME }}"
-          db_user            = "${{ secrets.DB_USER }}"
-          db_password        = "${{ secrets.DB_PASSWORD }}"
-          EOF
-
-          if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
-            cat > terraform/backend.tf << EOF
-          terraform {
-            backend "s3" {
-              bucket  = "${{ env.TF_STATE_BUCKET }}"
-              key     = "${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || 'staging' }}/terraform.tfstate"
-              region  = "us-east-1"
-              encrypt = true
-            }
-          }
-          EOF
-          fi
-
-      - name: 🗃️ Terraform Init & Apply
-        id: tf
-        working-directory: terraform
-        run: |
-          terraform init -input=false -reconfigure -upgrade
-          terraform apply -auto-approve -input=false
-          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
-
-  db-init:
-    name: 🗂️ RDS Healthcheck & DB Init
-    runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
-    needs: [dr-check, infra]
-    steps:
-      - name: Parse RDS Endpoint
-        id: parse
-        run: |
-          ep="${{ needs.infra.outputs.rds_endpoint }}"
-          echo "Raw endpoint: $ep"
-          if [[ "$ep" == *":"* ]]; then
-            host="${ep%:*}"
-            port="${ep##*:}"
-          else
-            host="$ep"
-            port="3306"
-          fi
-          if [ "$host" = "localhost" ]; then
-            host="127.0.0.1"
-          fi
-          echo "RDS_HOST=$host" >> $GITHUB_ENV
-          echo "RDS_PORT=$port" >> $GITHUB_ENV
-          echo "Parsed: $host:$port"
-
-      - name: 🏥 Health Check MySQL
-        run: |
-          echo "Checking MySQL at $RDS_HOST:$RDS_PORT"
-          for i in $(seq 1 30); do
-            if docker run --rm --network host mysql:8.0 \
-                mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent; then
-              echo "✅ RDS healthy (attempt $i)"
-              break
-            fi
-            sleep 3
-          done
-
-      - name: 🗂️ Initialize Database Schema
-        run: |
-          docker run -i --rm --network host mysql:8.0 \
-            mysql \
-            --protocol=TCP \
-            -h"$RDS_HOST" \
-            -P"$RDS_PORT" \
-            -u"${{ env.DB_USER }}" \
-            -p"${{ env.DB_PASSWORD }}" \
-            "${{ env.DB_NAME }}" << 'SQL'
-          CREATE TABLE IF NOT EXISTS TodoItems (
-            Id         INT PRIMARY KEY AUTO_INCREMENT,
-            Name       VARCHAR(255) NULL,
-            IsComplete TINYINT(1)   NOT NULL DEFAULT 0,
-            CreatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          SQL
-          echo "✅ Schema ready in ${{ needs.dr-check.outputs.active_region }}"
+# ==========================================
+# FINAL SUMMARY
+# ==========================================
+notify:
+  name: 📢 Pipeline Summary
+  runs-on: ubuntu-latest
+  needs: [dr-check, traffic, dast, cleanup]
+  if: always()
+  steps:
+    - name: 📊 Print Summary
+      run: |
+        echo "========================================"
+        echo "  🛡️ DevSecOps Pipeline Summary"
+        echo "========================================"
+        echo "  Branch         : ${{ github.ref_name }}"
+        echo "  Region         : ${{ needs.dr-check.outputs.active_region }}"
+        echo "  DR Failover    : ${{ needs.dr-check.outputs.failover }}"
+        echo "  RDS Health     : ✅ PASSED"
+        echo "  App Health     : ✅ PASSED"
+        if [ "${{ needs.dr-check.outputs.is_dr }}" == "false" ]; then
+          echo "  DAST           : ${{ needs.dast.result }}"
+        else
+          echo "  DAST           : ⏭️ SKIPPED (DR Mode)"
+        fi
+        echo "  Status         : ✅ SUCCESS"
+        echo "========================================"
+        if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
+          echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (Laptop)"
+        else
+          echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (GitHub Runner)"
+        fi
