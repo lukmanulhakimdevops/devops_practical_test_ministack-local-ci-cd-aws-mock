@@ -248,7 +248,7 @@ jobs:
   # INFRA (MINISTACK + TERRAFORM + RDS)
   # ==========================================
   infra:
-    name: 🏗️ Mock Infrastructure (Native Ministack)
+    name: 🏗️ Mock Infrastructure (Ministack)
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: dr-check
     outputs:
@@ -265,20 +265,50 @@ jobs:
             sudo apt-get update && sudo apt-get install -y terraform
           fi
 
-      - name: 🐳 Start Ministack
+      - name: 🐳 Ensure Ministack is running (do not recreate if healthy)
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack -p ${PORT}:4566 -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest
-          echo "⏳ Waiting for Ministack to be ready..."
-          for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${PORT}/_ministack/health" | grep -q '"s3":"available"'; then
-              echo "✅ Ministack is healthy"
-              break
-            fi
-            echo "⏳ Waiting... ($i/30)"
-            sleep 3
+          echo "🔍 Checking Ministack health at http://localhost:$PORT/_ministack/health"
+          if curl -sf "http://localhost:$PORT/_ministack/health" | grep -q '"s3":"available"'; then
+            echo "✅ Ministack is already running and healthy. Skipping container creation."
+          else
+            echo "⚠️ Ministack not healthy or not running. Starting fresh container..."
+            docker rm -f ministack 2>/dev/null || true
+            docker run -d --name ministack -p ${PORT}:4566 -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest
+            for i in $(seq 1 30); do
+              if curl -sf "http://localhost:$PORT/_ministack/health" | grep -q '"s3":"available"'; then
+                echo "✅ Ministack is healthy"
+                break
+              fi
+              echo "⏳ Waiting for Ministack... ($i/30)"
+              sleep 3
+            done
+          fi
+
+      - name: 🧹 Pre-cleanup leftover Ministack resources (by tag)
+        env:
+          AWS_ENDPOINT_URL: http://localhost:${{ needs.dr-check.outputs.ministack_port }}
+          AWS_REGION:       ${{ needs.dr-check.outputs.active_region }}
+          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          echo "🧹 Cleaning up leftover resources with tag Project=DevSecOps..."
+          # EC2 instances
+          INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=DevSecOps" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
+          for ID in $INSTANCE_IDS; do
+            [ -n "$ID" ] && [ "$ID" != "None" ] && aws ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$AWS_ENDPOINT_URL" || true
           done
+          # Security Groups (except default)
+          SG_IDS=$(aws ec2 describe-security-groups --filters "Name=tag:Project,Values=DevSecOps" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
+          for SG in $SG_IDS; do
+            [ -n "$SG" ] && [ "$SG" != "None" ] && aws ec2 delete-security-group --group-id "$SG" --endpoint-url "$AWS_ENDPOINT_URL" || true
+          done
+          # S3 buckets with 'app-bucket' in name
+          BUCKETS=$(aws s3api list-buckets --query "Buckets[?contains(Name,'app-bucket')].Name" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
+          for BUCKET in $BUCKETS; do
+            [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && aws s3 rb "s3://$BUCKET" --force --endpoint-url "$AWS_ENDPOINT_URL" || true
+          done
+          echo "✅ Pre-cleanup completed."
 
       - name: 📝 Create Terraform config
         run: |
@@ -312,6 +342,7 @@ jobs:
           resource "random_id" "suffix" { byte_length = 4 }
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-${var.environment}-${var.aws_region}"
+            description = "Allow HTTP/HTTPS and SSH"
             tags        = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
             ingress {
               from_port   = 22
@@ -342,7 +373,7 @@ jobs:
             ami             = "ami-0ff8a91507f77f867"
             instance_type   = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
-            tags            = { Name = "web-server-${var.environment}" }
+            tags            = { Name = "web-server-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
           }
           resource "aws_db_instance" "mysql" {
             identifier          = "ministack-mysql-${var.environment}"
@@ -357,6 +388,7 @@ jobs:
             skip_final_snapshot = true
             apply_immediately   = true
             publicly_accessible = true
+            tags                = { Project = "DevSecOps", Region = var.aws_region }
           }
           output "rds_endpoint"    { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip"   { value = aws_instance.web.public_ip }
@@ -542,12 +574,12 @@ jobs:
           AWS_CMD="docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli"
           
           echo "🗑️ Cleaning EC2..."
-          $AWS_CMD ec2 describe-instances --filters "Name=tag:Region,Values=$ACTIVE_REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
+          $AWS_CMD ec2 describe-instances --filters "Name=tag:Project,Values=DevSecOps" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
             [ -n "$ID" ] && [ "$ID" != "None" ] && $AWS_CMD ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT" || true
           done
           
           echo "🗑️ Cleaning S3..."
-          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'$ACTIVE_REGION')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
+          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'app-bucket')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
             if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
               $AWS_CMD s3 rm "s3://$BUCKET" --recursive --endpoint-url "$ENDPOINT" || true
               $AWS_CMD s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT" || true
