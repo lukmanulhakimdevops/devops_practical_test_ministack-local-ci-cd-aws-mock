@@ -226,17 +226,16 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # [PARALLEL TRACK 5] MOCK INFRASTRUCTURE (REAL RDS)
+  # [PARALLEL TRACK 5] MOCK INFRASTRUCTURE (MINISTACK NATIVE RDS)
   # ==========================================
   infra:
-    name: 🏗️ Mock Infrastructure (Ministack Real RDS)
+    name: 🏗️ Mock Infrastructure (Native Ministack)
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: dr-check
     outputs:
       s3_bucket:     ${{ steps.tf.outputs.s3_bucket }}
       ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
-      rds_address:   ${{ steps.tf.outputs.rds_address }}
-      rds_port:      ${{ steps.tf.outputs.rds_port }}
+      rds_endpoint:  ${{ steps.tf.outputs.rds_endpoint }}
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Ensure Terraform
@@ -317,7 +316,7 @@ jobs:
             tags = { Name = "web-server-\${var.environment}" }
           }
           
-          # MENGGUNAKAN NATIVE MINISTACK RDS (Akan men-trigger Docker daemon via socket)
+          # NATIVE MINISTACK RDS
           resource "aws_db_instance" "mysql" {
             identifier          = "ministack-mysql-\${var.environment}"
             engine              = "mysql"
@@ -333,8 +332,8 @@ jobs:
             publicly_accessible = true
           }
           
-          output "rds_address" { value = aws_db_instance.mysql.address }
-          output "rds_port"    { value = aws_db_instance.mysql.port }
+          # Output format endpoint sesuai standar AWS RDS (hostname:port)
+          output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           EOF
           
@@ -350,12 +349,11 @@ jobs:
           terraform apply -auto-approve -input=false \
             -var="environment=${{ github.event.inputs.environment || 'staging' }}" \
             -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
-          echo "rds_address=$(terraform output -raw rds_address)" >> $GITHUB_OUTPUT
-          echo "rds_port=$(terraform output -raw rds_port)" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [SUB-TRACK 5.1] DB INITIALIZATION (Targeting Ministack RDS)
+  # [SUB-TRACK 5.1] DB INITIALIZATION
   # ==========================================
   db-init:
     name: 🗂️ Initialize DB Tables
@@ -364,19 +362,40 @@ jobs:
     steps:
       - name: ⏳ Wait for Ministack RDS Connection
         run: |
-          echo "⏳ Menunggu MySQL dari Ministack RDS di endpoint ${{ needs.infra.outputs.rds_address }}:${{ needs.infra.outputs.rds_port }}..."
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          
+          # [CRITICAL PATCH] Memaksa penggunaan TCP/IP dengan mengubah localhost menjadi 127.0.0.1
+          if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
+          
+          echo "⏳ Menunggu MySQL dari Ministack RDS di endpoint TCP $RDS_HOST:$RDS_PORT..."
+          SUCCESS="false"
           for i in $(seq 1 30); do
-            # Menggunakan container sementara sebagai client agar tidak perlu install mysql-client di host
-            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"${{ needs.infra.outputs.rds_address }}" -P"${{ needs.infra.outputs.rds_port }}" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
-              echo "✅ Ministack RDS MySQL siap menerima koneksi."
+            # Menggunakan container sementara sebagai client
+            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ Ministack RDS MySQL siap menerima koneksi TCP."
+              SUCCESS="true"
               break
             fi
             sleep 3
           done
+          
+          if [ "$SUCCESS" = "false" ]; then
+             echo "❌ CRITICAL: Timeout menunggu database Ministack RDS."
+             exit 1
+          fi
 
       - name: 🗂️ Create tables
         run: |
-          docker run -i --rm --network host mysql:8.0 mysql -h"${{ needs.infra.outputs.rds_address }}" -P"${{ needs.infra.outputs.rds_port }}" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          
+          # [CRITICAL PATCH] Memaksa penggunaan TCP/IP
+          if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
+          
+          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -409,11 +428,18 @@ jobs:
         run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
       - name: 🚀 Run container
         run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          
+          if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
+          
           docker run -d --name ${CONTAINER_NAME} --network host \
             -e ASPNETCORE_URLS=http://+:${HOST_PORT} \
-            -e "ConnectionStrings__DefaultConnection=Server=${{ needs.infra.outputs.rds_address }};Port=${{ needs.infra.outputs.rds_port }};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
             ${APP_NAME}:latest
+            
       - name: 🔍 WAJIB Health Check (Region-Aware)
         run: |
           echo "⏳ Polling health endpoint in ${{ needs.dr-check.outputs.active_region }}..."
