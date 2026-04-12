@@ -247,7 +247,103 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
+  # DAST SCAN – ONLY PRIMARY (ephemeral env)
+  # RUNS AS SOON AS GOLDEN IMAGE IS READY
+  # ==========================================
+  dast:
+    name: 🕷️ DAST Scan (Parallel with Infra)
+    runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
+    needs: [dr-check, container]   # Hanya menunggu image, tidak menunggu infra
+    steps:
+      - name: ⬇️ Download Golden Image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: .
+
+      - name: 🐳 Setup Ephemeral Ministack & RDS for DAST
+        run: |
+          PORT=4566
+          docker rm -f ministack 2>/dev/null || true
+          docker run -d --name ministack --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            -e DEFAULT_REGION=us-east-1 \
+            nahuelnucera/ministack:latest
+
+          for i in $(seq 1 30); do curl -sf "http://localhost:${PORT}/_localstack/health" && break; sleep 2; done
+
+          docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+            rds create-db-instance --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+            --db-instance-class db.t3.micro --engine mysql --engine-version "8.0" --master-username "${{ env.DB_USER }}" \
+            --master-user-password "${{ env.DB_PASSWORD }}" --db-name "${{ env.DB_NAME }}" --allocated-storage 20 \
+            --no-multi-az --publicly-accessible --no-deletion-protection --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
+
+          for i in $(seq 1 60); do
+            STATUS=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+              rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+              --query "DBInstances[0].DBInstanceStatus" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "creating")
+            [ "$STATUS" = "available" ] && break
+            sleep 5
+          done
+
+          ep=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
+            rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+            --query "DBInstances[0].Endpoint.Address" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
+          if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
+          echo "RDS_HOST=$host" >> $GITHUB_ENV
+          echo "RDS_PORT=$port" >> $GITHUB_ENV
+
+          # Wait for MySQL
+          for i in $(seq 1 30); do
+            docker run --rm --network host mysql:8.0 mysql -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" -e "SELECT 1" --protocol=TCP 2>/dev/null && break
+            sleep 10
+          done
+
+          docker run -i --rm --network host mysql:8.0 \
+            mysql --protocol=TCP -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
+          CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
+          SQL
+
+      - name: 🚀 Run App for DAST
+        run: |
+          docker load < ${{ env.APP_NAME }}-image.tar.gz
+          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
+            -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
+            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
+            --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --tmpfs /app/logs:rw,noexec,nosuid,size=32m \
+            ${{ env.APP_NAME }}:latest
+          for i in $(seq 1 20); do
+            code=$(curl -so /dev/null -w "%{http_code}" "http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json" 2>/dev/null || echo "000")
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+
+      - name: 🕷️ ZAP Baseline Scan
+        run: |
+          mkdir -p /tmp/zap-out
+          docker run --rm --network host -v /tmp/zap-out:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "http://localhost:${{ env.HOST_PORT }}" -r zap-report.html -J zap-report.json -l FAIL || { echo "❌ DAST failed"; exit 1; }
+
+      - name: 📤 Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: /tmp/zap-out/
+          retention-days: 7
+
+      - name: 🧹 Cleanup DAST containers
+        if: always()
+        run: |
+          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker rm -f ministack 2>/dev/null || true
+
+  # ==========================================
+  # INFRASTRUCTURE PROVISIONING – BOTH ENVS
+  # (RUNS IN PARALLEL WITH DAST)
   # ==========================================
   infra:
     name: 🏗️ Provision Infrastructure
@@ -566,100 +662,6 @@ jobs:
           echo "❌ App health check failed"
           docker logs --tail 50 ${{ env.CONTAINER_NAME }}
           exit 1
-
-  # ==========================================
-  # DAST SCAN – ONLY PRIMARY (ephemeral env)
-  # ==========================================
-  dast:
-    name: 🕷️ DAST Scan
-    runs-on: ubuntu-latest
-    if: needs.dr-check.outputs.is_dr == 'false'
-    needs: [dr-check, infra]
-    steps:
-      - name: ⬇️ Download Golden Image
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: .
-
-      - name: 🐳 Setup Ministack & RDS for DAST
-        run: |
-          PORT=4566
-          docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack --network host \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -e SERVICES=ec2,s3,sts,iam,rds \
-            -e DEFAULT_REGION=us-east-1 \
-            nahuelnucera/ministack:latest
-
-          for i in $(seq 1 30); do curl -sf "http://localhost:${PORT}/_localstack/health" && break; sleep 2; done
-
-          docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
-            rds create-db-instance --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-            --db-instance-class db.t3.micro --engine mysql --engine-version "8.0" --master-username "${{ env.DB_USER }}" \
-            --master-user-password "${{ env.DB_PASSWORD }}" --db-name "${{ env.DB_NAME }}" --allocated-storage 20 \
-            --no-multi-az --publicly-accessible --no-deletion-protection --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
-
-          for i in $(seq 1 60); do
-            STATUS=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
-              rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-              --query "DBInstances[0].DBInstanceStatus" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "creating")
-            [ "$STATUS" = "available" ] && break
-            sleep 5
-          done
-
-          ep=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
-            rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-            --query "DBInstances[0].Endpoint.Address" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
-          if [[ "$ep" == *":"* ]]; then host="${ep%:*}"; port="${ep##*:}"; else host="$ep"; port="3306"; fi
-          echo "RDS_HOST=$host" >> $GITHUB_ENV
-          echo "RDS_PORT=$port" >> $GITHUB_ENV
-
-          # Wait for MySQL
-          for i in $(seq 1 30); do
-            docker run --rm --network host mysql:8.0 mysql -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" -e "SELECT 1" --protocol=TCP 2>/dev/null && break
-            sleep 10
-          done
-
-          docker run -i --rm --network host mysql:8.0 \
-            mysql --protocol=TCP -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
-          CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255), IsComplete TINYINT(1) DEFAULT 0);
-          SQL
-
-      - name: 🚀 Run App for DAST
-        run: |
-          docker load < ${{ env.APP_NAME }}-image.tar.gz
-          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
-            -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
-            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
-            --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --tmpfs /app/logs:rw,noexec,nosuid,size=32m \
-            ${{ env.APP_NAME }}:latest
-          for i in $(seq 1 20); do
-            code=$(curl -so /dev/null -w "%{http_code}" "http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json" 2>/dev/null || echo "000")
-            [ "$code" = "200" ] && break
-            sleep 5
-          done
-
-      - name: 🕷️ ZAP Baseline Scan
-        run: |
-          mkdir -p /tmp/zap-out
-          docker run --rm --network host -v /tmp/zap-out:/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-            -t "http://localhost:${{ env.HOST_PORT }}" -r zap-report.html -J zap-report.json -l FAIL || { echo "❌ DAST failed"; exit 1; }
-
-      - name: 📤 Upload ZAP Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap-report
-          path: /tmp/zap-out/
-          retention-days: 7
-
-      - name: 🧹 Cleanup DAST containers
-        if: always()
-        run: |
-          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          docker rm -f ministack 2>/dev/null || true
 
   # ==========================================
   # TRAFFIC STATUS
