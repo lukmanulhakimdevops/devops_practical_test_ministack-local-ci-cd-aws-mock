@@ -39,7 +39,6 @@ env:
   DB_NAME:               ${{ secrets.DB_NAME }}
   DB_USER:               ${{ secrets.DB_USER }}
   DB_PASSWORD:           ${{ secrets.DB_PASSWORD }}
-  DB_PORT:               ${{ secrets.DB_PORT || '3306' }}
   TF_STATE_BUCKET:       ${{ secrets.TF_STATE_BUCKET || '' }}
 
 permissions:
@@ -49,9 +48,9 @@ permissions:
   checks: write
 
 jobs:
-  # --------------------------------------------------------------------------
-  # DR Decision
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 1] ROUTING & DR LOGIC
+  # ==========================================
   dr-check:
     name: 🧠 DR Decision
     runs-on: ubuntu-latest
@@ -69,7 +68,7 @@ jobs:
           USE_S3="false"
           if [ "$FAIL" == "true" ]; then
             REGION="${{ env.AWS_REGION_DR }}"
-            RUNNER="[self-hosted, linux, x64]"
+            RUNNER="self-hosted"
             PORT="4567"
             PREFIX="ministack/us-east-2"
           else
@@ -78,7 +77,7 @@ jobs:
             PORT="4566"
             PREFIX="ministack/us-east-1"
           fi
-          if [ -n "${{ env.TF_STATE_BUCKET }}" ] && [ "$RUNNER" != "[self-hosted, linux, x64]" ]; then
+          if [ -n "${{ env.TF_STATE_BUCKET }}" ] && [ "$RUNNER" != "self-hosted" ]; then
             USE_S3="true"
           fi
           echo "region=$REGION"           >> $GITHUB_OUTPUT
@@ -88,9 +87,9 @@ jobs:
           echo "state_prefix=$PREFIX"     >> $GITHUB_OUTPUT
           echo "use_s3_backend=$USE_S3"   >> $GITHUB_OUTPUT
 
-  # --------------------------------------------------------------------------
-  # SAST & Secrets
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 2] SECURITY SAST
+  # ==========================================
   sast:
     name: 🔐 SAST & Secrets
     runs-on: ubuntu-latest
@@ -101,53 +100,44 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: 🔐 Gitleaks – Secret Scanning
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
       - name: 🧬 Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: csharp
-
       - name: 🔨 Build for CodeQL
         run: cd TodoWebAPI && dotnet build TodoWebAPI.csproj
-
       - name: 🧬 Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  # --------------------------------------------------------------------------
-  # SCA & SBOM
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 3] SECURITY SCA
+  # ==========================================
   sca:
     name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
       - name: 🔍 Audit NuGet vulnerabilities
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
-
       - name: 📄 Generate SBOM (CycloneDX)
         uses: CycloneDX/gh-dotnet-generate-sbom@v1
         with:
           path: TodoWebAPI
           output: sbom.xml
-
       - name: 📤 Upload SBOM
         uses: actions/upload-artifact@v4
         with:
@@ -155,32 +145,28 @@ jobs:
           path: TodoWebAPI/sbom.xml
           retention-days: 7
 
-  # --------------------------------------------------------------------------
-  # Build Application
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 4] BUILD APPLICATION
+  # ==========================================
   build:
     name: 🔨 Build Application
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
       - name: 🩹 Patch Microsoft.Build vulnerability
         run: |
           for proj in TodoWebAPI/*.csproj; do
             dotnet add "$proj" package Microsoft.Build --version 17.8.43
           done
-
       - name: 🔨 Restore, Build & Publish
         run: |
           dotnet restore TodoWebAPI/*.csproj
-          dotnet build   TodoWebAPI/*.csproj -c Release --no-restore
+          dotnet build TodoWebAPI/*.csproj -c Release --no-restore
           dotnet publish TodoWebAPI/*.csproj -c Release --no-build -o publish_output
-
       - name: 📤 Upload App Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -188,22 +174,20 @@ jobs:
           path: publish_output/
           retention-days: 1
 
-  # --------------------------------------------------------------------------
-  # Container Build & Scan
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [SUB-TRACK 4.1] CONTAINER BUILD
+  # ==========================================
   container:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
     needs: build
     steps:
       - uses: actions/checkout@v4
-
       - name: ⬇️ Download artifact
         uses: actions/download-artifact@v4
         with:
           name: webapp-binaries
           path: deploy/publish
-
       - name: 🐳 Create hardened Dockerfile
         run: |
           cat > deploy/Dockerfile <<'DOCKERFILE'
@@ -222,11 +206,9 @@ jobs:
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
-
       - name: 🏗️ Build Docker Image
         run: docker build -t ${APP_NAME}:latest ./deploy
-
-      - name: 🛡️ Trivy Image Scan (Fail on CRITICAL/HIGH)
+      - name: 🛡️ Trivy Image Scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
@@ -234,10 +216,8 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
-
-      - name: 💾 Save Docker Image (Artifact)
+      - name: 💾 Save Docker Image
         run: docker save ${APP_NAME}:latest | gzip > ${APP_NAME}-image.tar.gz
-
       - name: 📤 Upload Docker Image Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -245,19 +225,20 @@ jobs:
           path: ${APP_NAME}-image.tar.gz
           retention-days: 1
 
-  # --------------------------------------------------------------------------
-  # Mock Infrastructure + MySQL
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 5] MOCK INFRASTRUCTURE (REAL RDS)
+  # ==========================================
   infra:
-    name: 🏗️ Mock Infrastructure + MySQL
+    name: 🏗️ Mock Infrastructure (Ministack Real RDS)
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: dr-check
     outputs:
       s3_bucket:     ${{ steps.tf.outputs.s3_bucket }}
       ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
+      rds_address:   ${{ steps.tf.outputs.rds_address }}
+      rds_port:      ${{ steps.tf.outputs.rds_port }}
     steps:
       - uses: actions/checkout@v4
-
       - name: 🔧 Ensure Terraform
         run: |
           if ! command -v terraform &> /dev/null; then
@@ -265,104 +246,26 @@ jobs:
             echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
             sudo apt-get update && sudo apt-get install -y terraform
           fi
-
-      - name: 🐳 Start MySQL (mock RDS)
-        run: |
-          docker rm -f mock-rds-mysql 2>/dev/null || true
-          docker run -d --name mock-rds-mysql -p 3306:3306 \
-            -e MYSQL_ROOT_PASSWORD="${{ env.DB_PASSWORD }}" \
-            -e MYSQL_DATABASE="${{ env.DB_NAME }}" \
-            -e MYSQL_USER="${{ env.DB_USER }}" \
-            -e MYSQL_PASSWORD="${{ env.DB_PASSWORD }}" \
-            mysql:8.0
-          for i in $(seq 1 30); do
-            docker exec mock-rds-mysql mysqladmin ping -uroot -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null && break
-            sleep 2
-          done
-
-      - name: 🐳 Ensure Ministack (Region-Aware Port)
+          
+      - name: 🐳 Start Ministack (With Docker Socket for Real RDS)
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           docker rm -f ministack 2>/dev/null || true
-          docker run -d --name ministack -p ${PORT}:4566 -e SERVICES=ec2,s3,sts,iam nahuelnucera/ministack:latest
+          
+          # [CRITICAL] Me-mount docker.sock agar Ministack bisa menjalankan container MySQL sungguhan
+          docker run -d --name ministack -p ${PORT}:4566 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            nahuelnucera/ministack:latest
+            
           for i in $(seq 1 30); do
             curl -sf "http://localhost:${PORT}/_localstack/health" | grep -q '"s3":"available"' && break
             sleep 3
           done
-
-      - name: 📝 Create Terraform config (VALID HCL)
+          
+      - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
-          cat > terraform/main.tf <<'EOF'
-          terraform {
-            BACKEND_BLOCK_PLACEHOLDER
-            required_providers {
-              aws = { source = "hashicorp/aws", version = "~> 5.0" }
-              random = { source = "hashicorp/random", version = "~> 3.0" }
-            }
-          }
-          variable "ministack_endpoint" {}
-          variable "environment" {}
-          variable "aws_region" {}
-          provider "aws" {
-            region     = var.aws_region
-            access_key = "test"
-            secret_key = "test"
-            skip_credentials_validation = true
-            skip_requesting_account_id  = true
-            skip_metadata_api_check     = true
-            s3_use_path_style           = true
-            endpoints {
-              ec2 = var.ministack_endpoint
-              s3  = var.ministack_endpoint
-              sts = var.ministack_endpoint
-              iam = var.ministack_endpoint
-            }
-          }
-          resource "random_id" "suffix" { byte_length = 4 }
-          resource "aws_security_group" "web_sg" {
-            name        = "web-sg-${var.environment}-${var.aws_region}"
-            description = "SG for ${var.aws_region}"
-            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
-            ingress {
-              from_port   = 22
-              to_port     = 22
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 80
-              to_port     = 80
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 443
-              to_port     = 443
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-          }
-          resource "aws_instance" "web" {
-            ami             = "ami-0ff8a91507f77f867"
-            instance_type   = "t2.micro"
-            security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
-          }
-          resource "aws_s3_bucket" "app_bucket" {
-            bucket = "app-bucket-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
-            tags   = { Project = "DevSecOps", Region = var.aws_region }
-          }
-          output "s3_bucket"     { value = aws_s3_bucket.app_bucket.bucket }
-          output "ec2_public_ip" { value = aws_instance.web.public_ip }
-          EOF
-          # Siapkan backend block
           BACKEND_BLOCK=""
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
             BACKEND_BLOCK="
@@ -373,23 +276,68 @@ jobs:
               encrypt = true
             }"
           fi
-          sed -i "s|BACKEND_BLOCK_PLACEHOLDER|${BACKEND_BLOCK}|g" terraform/main.tf
-
-      - name: ☁️ Configure AWS CLI for Ministack
-        run: |
-          mkdir -p ~/.aws
-          cat > ~/.aws/credentials <<EOF
-          [default]
-          aws_access_key_id     = ${{ env.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key = ${{ env.AWS_SECRET_ACCESS_KEY }}
+          cat > terraform/main.tf <<EOF
+          terraform {
+            ${BACKEND_BLOCK}
+            required_providers {
+              aws = { source = "hashicorp/aws", version = "~> 5.0" }
+              random = { source = "hashicorp/random", version = "~> 3.0" }
+            }
+          }
+          variable "ministack_endpoint" { default = "http://localhost:${{ needs.dr-check.outputs.ministack_port }}" }
+          variable "environment"        { default = "staging" }
+          variable "aws_region"         { default = "${{ needs.dr-check.outputs.active_region }}" }
+          
+          provider "aws" {
+            region     = var.aws_region
+            access_key = "test"
+            secret_key = "test"
+            skip_credentials_validation = true
+            skip_requesting_account_id  = true
+            skip_metadata_api_check     = true
+            s3_use_path_style           = true
+            endpoints { 
+              ec2 = var.ministack_endpoint
+              s3  = var.ministack_endpoint
+              sts = var.ministack_endpoint
+              iam = var.ministack_endpoint
+              rds = var.ministack_endpoint
+            }
+          }
+          
+          resource "aws_security_group" "web_sg" {
+            name        = "web-sg-\${var.environment}-\${var.aws_region}"
+            tags = { Name = "web-sg-\${var.environment}", Project = "DevSecOps", Region = var.aws_region }
+          }
+          
+          resource "aws_instance" "web" {
+            ami             = "ami-0ff8a91507f77f867"
+            instance_type   = "t2.micro"
+            security_groups = [aws_security_group.web_sg.name]
+            tags = { Name = "web-server-\${var.environment}" }
+          }
+          
+          # MENGGUNAKAN NATIVE MINISTACK RDS (Akan men-trigger Docker daemon via socket)
+          resource "aws_db_instance" "mysql" {
+            identifier          = "ministack-mysql-\${var.environment}"
+            engine              = "mysql"
+            engine_version      = "8.0"
+            instance_class      = "db.t3.micro"
+            allocated_storage   = 20
+            db_name             = "${{ env.DB_NAME }}"
+            username            = "${{ env.DB_USER }}"
+            password            = "${{ env.DB_PASSWORD }}"
+            port                = 3306
+            skip_final_snapshot = true
+            apply_immediately   = true
+            publicly_accessible = true
+          }
+          
+          output "rds_address" { value = aws_db_instance.mysql.address }
+          output "rds_port"    { value = aws_db_instance.mysql.port }
+          output "ec2_public_ip" { value = aws_instance.web.public_ip }
           EOF
-          cat > ~/.aws/config <<EOF
-          [default]
-          region       = ${{ needs.dr-check.outputs.active_region }}
-          endpoint_url = http://localhost:${{ needs.dr-check.outputs.ministack_port }}
-          output       = json
-          EOF
-
+          
       - name: 🗃️ Init & Apply Terraform
         id: tf
         working-directory: terraform
@@ -400,59 +348,35 @@ jobs:
         run: |
           terraform init -input=false -reconfigure -upgrade
           terraform apply -auto-approve -input=false \
-            -var="ministack_endpoint=http://localhost:${{ needs.dr-check.outputs.ministack_port }}" \
             -var="environment=${{ github.event.inputs.environment || 'staging' }}" \
             -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
-          echo "s3_bucket=$(terraform output -raw s3_bucket)"         >> $GITHUB_OUTPUT
+          echo "rds_address=$(terraform output -raw rds_address)" >> $GITHUB_OUTPUT
+          echo "rds_port=$(terraform output -raw rds_port)" >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
-  # --------------------------------------------------------------------------
-  # DB Initialization (Robust) + Disable Root
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [SUB-TRACK 5.1] DB INITIALIZATION (Targeting Ministack RDS)
+  # ==========================================
   db-init:
-    name: 🗂️ Initialize DB Tables & Secure
+    name: 🗂️ Initialize DB Tables
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, infra]
     steps:
-      - name: 🔍 Pastikan container MySQL ada dan siap
+      - name: ⏳ Wait for Ministack RDS Connection
         run: |
-          echo "🔍 Memeriksa container MySQL mock-rds-mysql..."
-          if ! docker ps --format '{{.Names}}' | grep -q '^mock-rds-mysql$'; then
-            echo "⚠️ Container MySQL tidak ditemukan. Membuat ulang..."
-            docker rm -f mock-rds-mysql 2>/dev/null || true
-            docker run -d --name mock-rds-mysql -p 3306:3306 \
-              -e MYSQL_ROOT_PASSWORD="${{ env.DB_PASSWORD }}" \
-              -e MYSQL_DATABASE="${{ env.DB_NAME }}" \
-              -e MYSQL_USER="${{ env.DB_USER }}" \
-              -e MYSQL_PASSWORD="${{ env.DB_PASSWORD }}" \
-              mysql:8.0
-          else
-            echo "✅ Container MySQL mock-rds-mysql sudah ada."
-          fi
-          echo "⏳ Menunggu MySQL siap (root)..."
+          echo "⏳ Menunggu MySQL dari Ministack RDS di endpoint ${{ needs.infra.outputs.rds_address }}:${{ needs.infra.outputs.rds_port }}..."
           for i in $(seq 1 30); do
-            if docker exec mock-rds-mysql mysqladmin ping -uroot -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
-              echo "✅ MySQL root siap."
+            # Menggunakan container sementara sebagai client agar tidak perlu install mysql-client di host
+            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"${{ needs.infra.outputs.rds_address }}" -P"${{ needs.infra.outputs.rds_port }}" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ Ministack RDS MySQL siap menerima koneksi."
               break
             fi
-            sleep 2
+            sleep 3
           done
 
-      - name: 🗂️ Setup user & database (menggunakan root)
+      - name: 🗂️ Create tables
         run: |
-          docker exec mock-rds-mysql mysql -uroot -p"${{ env.DB_PASSWORD }}" <<EOF
-          CREATE DATABASE IF NOT EXISTS \`${{ env.DB_NAME }}\`;
-          CREATE USER IF NOT EXISTS '${{ env.DB_USER }}'@'%' IDENTIFIED BY '${{ env.DB_PASSWORD }}';
-          CREATE USER IF NOT EXISTS '${{ env.DB_USER }}'@'localhost' IDENTIFIED BY '${{ env.DB_PASSWORD }}';
-          GRANT ALL PRIVILEGES ON \`${{ env.DB_NAME }}\`.* TO '${{ env.DB_USER }}'@'%';
-          GRANT ALL PRIVILEGES ON \`${{ env.DB_NAME }}\`.* TO '${{ env.DB_USER }}'@'localhost';
-          FLUSH PRIVILEGES;
-          EOF
-          echo "✅ User ${{ env.DB_USER }} dibuat/diperbarui."
-
-      - name: 🗂️ Create tables (menggunakan user aplikasi)
-        run: |
-          docker exec -i mock-rds-mysql mysql -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
+          docker run -i --rm --network host mysql:8.0 mysql -h"${{ needs.infra.outputs.rds_address }}" -P"${{ needs.infra.outputs.rds_port }}" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -461,25 +385,15 @@ jobs:
             UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
-          echo "✅ Tabel dibuat di ${{ needs.dr-check.outputs.active_region }}"
+          echo "✅ Tabel berhasil dibuat di dalam RDS instance milik Ministack."
 
-      - name: 🔒 Secure MySQL - Disable root remote access
-        run: |
-          echo "🔒 Mengunci akses root MySQL..."
-          docker exec mock-rds-mysql mysql -uroot -p"${{ env.DB_PASSWORD }}" <<EOF
-          DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
-          ALTER USER 'root'@'localhost' IDENTIFIED BY '$(openssl rand -base64 32)';
-          FLUSH PRIVILEGES;
-          EOF
-          echo "✅ Root remote access disabled dan password root diacak."
-
-  # --------------------------------------------------------------------------
-  # Deployment & Health Check
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [CONVERGENCE GATE] DEPLOYMENT
+  # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: [dr-check, sast, sca, container, db-init]
+    needs: [dr-check, sast, sca, container, db-init, infra]
     environment: ${{ github.ref_name == 'develop' && '' || github.event.inputs.environment }}
     steps:
       - name: ⬇️ Download Docker Image Artifact
@@ -487,23 +401,19 @@ jobs:
         with:
           name: docker-image
           path: .
-
       - name: 📦 Load Golden Image
         run: |
           docker load < ${APP_NAME}-image.tar.gz
           echo "✅ Golden Image Loaded."
-
       - name: 🧹 Remove old container
         run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-
       - name: 🚀 Run container
         run: |
           docker run -d --name ${CONTAINER_NAME} --network host \
             -e ASPNETCORE_URLS=http://+:${HOST_PORT} \
-            -e "ConnectionStrings__DefaultConnection=Server=127.0.0.1;Port=3306;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+            -e "ConnectionStrings__DefaultConnection=Server=${{ needs.infra.outputs.rds_address }};Port=${{ needs.infra.outputs.rds_port }};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
             ${APP_NAME}:latest
-
       - name: 🔍 WAJIB Health Check (Region-Aware)
         run: |
           echo "⏳ Polling health endpoint in ${{ needs.dr-check.outputs.active_region }}..."
@@ -519,9 +429,9 @@ jobs:
           docker logs ${CONTAINER_NAME}
           exit 1
 
-  # --------------------------------------------------------------------------
-  # DAST Scan
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [POST-DEPLOY] DAST SCAN
+  # ==========================================
   dast:
     name: 🕷️ DAST Scan
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
@@ -536,9 +446,9 @@ jobs:
             }
           echo "✅ DAST passed in ${{ needs.dr-check.outputs.active_region }}"
 
-  # --------------------------------------------------------------------------
-  # Traffic Switch Simulation
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [POST-DEPLOY] ROUTING NOTIFICATION
+  # ==========================================
   traffic:
     name: 🌐 Traffic Status
     runs-on: ubuntu-latest
@@ -558,9 +468,9 @@ jobs:
             echo "📍 Traffic routed to : GitHub CI Host (us-east-1) via http://localhost:${{ env.HOST_PORT }}"
           fi
 
-  # --------------------------------------------------------------------------
-  # Conditional Cleanup
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [CLEANUP] DESTROY MOCK INFRASTRUCTURE
+  # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
@@ -575,24 +485,36 @@ jobs:
           MINISTACK_PORT: ${{ needs.dr-check.outputs.ministack_port }}
         run: |
           echo "🧹 Cleaning up ${{ needs.dr-check.outputs.active_region }} resources..."
-          docker rm -f ${CONTAINER_NAME} mock-rds-mysql 2>/dev/null || true
+          docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
           REGION="${{ needs.dr-check.outputs.active_region }}"
+          
+          # Hapus EC2
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
             amazon/aws-cli ec2 describe-instances --filters "Name=tag:Region,Values=$REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read ID; do
             [ -n "$ID" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli ec2 terminate-instances --instance-ids "$ID" --endpoint-url http://localhost:${MINISTACK_PORT} || true
           done
+          
+          # Hapus S3
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
             amazon/aws-cli s3api list-buckets --query "Buckets[?contains(Name,'$REGION')].Name" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read BUCKET; do
             [ -n "$BUCKET" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli s3 rm "s3://$BUCKET" --recursive --endpoint-url http://localhost:${MINISTACK_PORT} || true
             [ -n "$BUCKET" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli s3 rb "s3://$BUCKET" --force --endpoint-url http://localhost:${MINISTACK_PORT} || true
           done
+          
+          # Hapus RDS (Menggunakan API Ministack yang akan otomatis membunuh container fisiknya)
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            amazon/aws-cli rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read DBID; do
+            [ -n "$DBID" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url http://localhost:${MINISTACK_PORT} || true
+          done
+          
           echo "✅ Cleanup complete."
 
-  # --------------------------------------------------------------------------
-  # Pipeline Summary
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [FINAL] SUMMARY REPORT
+  # ==========================================
   notify:
     name: 📢 Pipeline Summary
     runs-on: ubuntu-latest
