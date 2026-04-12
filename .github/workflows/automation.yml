@@ -267,7 +267,7 @@ jobs:
             curl -sf "http://localhost:${PORT}/_localstack/health" | grep -q '"s3":"available"' && break
             sleep 3
           done
-      - name: 📝 Create Terraform config (VALID HCL, NO SEMICOLONS)
+      - name: 📝 Create Terraform config (VALID HCL)
         run: |
           mkdir -p terraform
           cat > terraform/main.tf <<'EOF'
@@ -382,13 +382,36 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [SUB-TRACK 5.1] DB INITIALIZATION
+  # [SUB-TRACK 5.1] DB INITIALIZATION (Dengan Pengecekan Ulang Container)
   # ==========================================
   db-init:
     name: 🗂️ Initialize DB Tables
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, infra]
     steps:
+      - name: 🔍 Pastikan container MySQL ada dan siap
+        run: |
+          echo "🔍 Memeriksa container MySQL mock-rds-mysql..."
+          if ! docker ps --format '{{.Names}}' | grep -q '^mock-rds-mysql$'; then
+            echo "⚠️ Container MySQL tidak ditemukan. Membuat ulang..."
+            docker rm -f mock-rds-mysql 2>/dev/null || true
+            docker run -d --name mock-rds-mysql -p 3306:3306 \
+              -e MYSQL_ROOT_PASSWORD="${{ env.DB_PASSWORD }}" \
+              -e MYSQL_DATABASE="${{ env.DB_NAME }}" \
+              -e MYSQL_USER="${{ env.DB_USER }}" \
+              -e MYSQL_PASSWORD="${{ env.DB_PASSWORD }}" \
+              mysql:8.0
+          else
+            echo "✅ Container MySQL mock-rds-mysql sudah ada."
+          fi
+          echo "⏳ Menunggu MySQL siap menerima koneksi..."
+          for i in $(seq 1 30); do
+            if docker exec mock-rds-mysql mysqladmin ping -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ MySQL siap."
+              break
+            fi
+            sleep 2
+          done
       - name: 🗂️ Create tables
         run: |
           docker exec -i mock-rds-mysql mysql -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
