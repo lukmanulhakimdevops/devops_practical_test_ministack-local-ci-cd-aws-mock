@@ -258,6 +258,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- GitHub Primary ----------
       - name: 🔧 [GitHub] Install Terraform & Start Ministack
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -276,12 +277,13 @@ jobs:
             -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
             nahuelnucera/ministack:latest
 
-          echo "⏳ Waiting for Ministack API..."
+          echo "⏳ Waiting for Ministack..."
           for i in $(seq 1 40); do
             curl -sf "http://localhost:${PORT}/_localstack/health" && break
             sleep 3
           done
 
+      # ---------- Laptop DR ----------
       - name: 💻 [Laptop] Verify Ministack & Terraform
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
@@ -294,7 +296,13 @@ jobs:
             exit 1
           fi
           echo "✅ Ministack is running"
+          # Ensure LocalStack health endpoint is responding
+          for i in $(seq 1 10); do
+            curl -sf "http://localhost:${PORT}/_localstack/health" && break
+            sleep 2
+          done
 
+      # ---------- Common: Terraform Config ----------
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -419,7 +427,9 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     steps:
-      - name: Ensure Ministack is running and RDS instance is available
+      # ---------- GitHub Primary: ensure Ministack ----------
+      - name: 🐳 [GitHub] Ensure Ministack & RDS ready
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
@@ -437,19 +447,32 @@ jobs:
             sleep 2
           done
 
-          echo "⏳ Waiting for RDS instance 'ministack-mysql-${{ github.event.inputs.environment || 'staging' }}' to be available..."
+          echo "⏳ Waiting for RDS instance..."
           for i in $(seq 1 60); do
             STATUS=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} amazon/aws-cli \
               rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
               --query "DBInstances[0].DBInstanceStatus" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "creating")
-            if [ "$STATUS" = "available" ]; then
-              echo "✅ RDS instance is available"
-              break
-            fi
+            if [ "$STATUS" = "available" ]; then echo "✅ RDS available"; break; fi
             echo "  attempt $i/60 – status: $STATUS"
             sleep 5
           done
 
+      # ---------- Laptop DR: only wait for RDS ----------
+      - name: 💻 [Laptop] Wait for RDS availability
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          echo "⏳ Waiting for RDS instance 'ministack-mysql-${{ github.event.inputs.environment || 'staging' }}'..."
+          for i in $(seq 1 60); do
+            STATUS=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} amazon/aws-cli \
+              rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+              --query "DBInstances[0].DBInstanceStatus" --output text --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "creating")
+            if [ "$STATUS" = "available" ]; then echo "✅ RDS available"; break; fi
+            echo "  attempt $i/60 – status: $STATUS"
+            sleep 5
+          done
+
+      # ---------- Common: parse endpoint & healthcheck ----------
       - name: Parse RDS Endpoint
         id: parse
         run: |
@@ -466,7 +489,7 @@ jobs:
           echo "RDS_PORT=$port" >> $GITHUB_ENV
           echo "Parsed: $host:$port"
 
-      - name: Probe MySQL Port
+      - name: 🏥 Probe MySQL Port
         run: |
           echo "🔍 Checking port $RDS_PORT on $RDS_HOST..."
           for i in $(seq 1 30); do
@@ -525,7 +548,9 @@ jobs:
       - name: 📦 Load Image
         run: docker load < ${{ env.APP_NAME }}-image.tar.gz
 
-      - name: Ensure Ministack is running
+      # ---------- GitHub Primary: ensure Ministack ----------
+      - name: 🐳 [GitHub] Ensure Ministack
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
@@ -541,6 +566,14 @@ jobs:
             curl -sf "http://localhost:${PORT}/_localstack/health" && break
             sleep 2
           done
+
+      # ---------- Laptop DR: no need to start Ministack ----------
+      - name: 💻 [Laptop] Verify Ministack is reachable
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          curl -sf "http://localhost:${PORT}/_localstack/health" || { echo "❌ Ministack not responding"; exit 1; }
+          echo "✅ Ministack is reachable"
 
       - name: Parse RDS Endpoint
         run: |
@@ -599,7 +632,7 @@ jobs:
           exit 1
 
   # ==========================================
-  # DAST SCAN – ONLY PRIMARY
+  # DAST SCAN – ONLY PRIMARY (ephemeral env)
   # ==========================================
   dast:
     name: 🕷️ DAST Scan
@@ -631,7 +664,6 @@ jobs:
             --master-user-password "${{ env.DB_PASSWORD }}" --db-name "${{ env.DB_NAME }}" --allocated-storage 20 \
             --no-multi-az --publicly-accessible --no-deletion-protection --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
-          # Tunggu RDS available
           for i in $(seq 1 60); do
             STATUS=$(docker run --rm --network host -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli \
               rds describe-db-instances --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
