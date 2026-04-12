@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # DR DECISION
+  # [PARALLEL TRACK 1] ROUTING & DR LOGIC
   # ==========================================
   dr-check:
     name: 🧠 DR Decision
@@ -86,7 +86,7 @@ jobs:
           echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # SAST
+  # [PARALLEL TRACK 2] SECURITY SAST
   # ==========================================
   sast:
     name: 🔐 SAST & Secrets
@@ -116,7 +116,7 @@ jobs:
         uses: github/codeql-action/analyze@v3
 
   # ==========================================
-  # SCA
+  # [PARALLEL TRACK 3] SECURITY SCA
   # ==========================================
   sca:
     name: 📦 SCA & SBOM
@@ -144,7 +144,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # BUILD
+  # [PARALLEL TRACK 4] BUILD APPLICATION
   # ==========================================
   build:
     name: 🔨 Build Application
@@ -173,7 +173,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # CONTAINER
+  # [SUB-TRACK 4.1] CONTAINER BUILD
   # ==========================================
   container:
     name: 🐳 Container Build & Scan
@@ -192,9 +192,7 @@ jobs:
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
           RUN apk update && apk upgrade --no-cache && apk add --no-cache openssl
-          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/https-key.pem -out /app/https-cert.pem -days 365 -nodes -subj '/CN=localhost' && \
-              openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/https-key.pem -in /app/https-cert.pem -passout pass:devpassword && \
-              rm /app/https-key.pem /app/https-cert.pem && apk del openssl
+          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/https-key.pem -out /app/https-cert.pem -days 365 -nodes -subj '/CN=localhost' && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/https-key.pem -in /app/https-cert.pem -passout pass:devpassword && rm /app/https-key.pem /app/https-cert.pem && apk del openssl
           ENV ASPNETCORE_ENVIRONMENT=Production
           ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
           ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
@@ -205,8 +203,8 @@ jobs:
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
       - name: 🏗️ Build Docker Image
-        run: docker build -t ${APP_NAME}:latest ./deploy
-      - name: 🛡️ Trivy Image Scan (Fail on CRITICAL/HIGH)
+        run: docker build -t ${{ env.APP_NAME }}:latest ./deploy
+      - name: 🛡️ Trivy Image Scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:latest'
@@ -214,20 +212,20 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
-      - name: 💾 Save Docker Image (Artifact)
-        run: docker save ${APP_NAME}:latest | gzip > ${APP_NAME}-image.tar.gz
+      - name: 💾 Save Docker Image
+        run: docker save ${{ env.APP_NAME }}:latest | gzip > ${{ env.APP_NAME }}-image.tar.gz
       - name: 📤 Upload Docker Image Artifact
         uses: actions/upload-artifact@v4
         with:
           name: docker-image
-          path: ${APP_NAME}-image.tar.gz
+          path: ${{ env.APP_NAME }}-image.tar.gz
           retention-days: 1
 
   # ==========================================
-  # INFRA (MINISTACK + TERRAFORM + RDS)
+  # [PARALLEL TRACK 5] PROVISION INFRASTRUCTURE (TERRAFORM -> MINISTACK)
   # ==========================================
   infra:
-    name: 🏗️ Mock Infrastructure (Ministack)
+    name: 🏗️ Provision Infrastructure
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: dr-check
     outputs:
@@ -242,46 +240,7 @@ jobs:
             echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
             sudo apt-get update && sudo apt-get install -y terraform
           fi
-      - name: 🐳 Ensure Ministack is running (do not recreate if healthy)
-        run: |
-          PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          echo "🔍 Checking Ministack health at http://localhost:$PORT/_ministack/health"
-          if curl -sf "http://localhost:$PORT/_ministack/health" | grep -q '"s3":"available"'; then
-            echo "✅ Ministack is already running and healthy. Skipping container creation."
-          else
-            echo "⚠️ Ministack not healthy or not running. Starting fresh container..."
-            docker rm -f ministack 2>/dev/null || true
-            docker run -d --name ministack -p ${PORT}:4566 -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest
-            for i in $(seq 1 30); do
-              if curl -sf "http://localhost:$PORT/_ministack/health" | grep -q '"s3":"available"'; then
-                echo "✅ Ministack is healthy"
-                break
-              fi
-              echo "⏳ Waiting for Ministack... ($i/30)"
-              sleep 3
-            done
-          fi
-      - name: 🧹 Pre-cleanup leftover Ministack resources (by tag)
-        env:
-          AWS_ENDPOINT_URL: http://localhost:${{ needs.dr-check.outputs.ministack_port }}
-          AWS_REGION: ${{ needs.dr-check.outputs.active_region }}
-          AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          echo "🧹 Cleaning up leftover resources with tag Project=DevSecOps..."
-          INSTANCE_IDS=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=DevSecOps" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
-          for ID in $INSTANCE_IDS; do
-            [ -n "$ID" ] && [ "$ID" != "None" ] && aws ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$AWS_ENDPOINT_URL" || true
-          done
-          SG_IDS=$(aws ec2 describe-security-groups --filters "Name=tag:Project,Values=DevSecOps" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
-          for SG in $SG_IDS; do
-            [ -n "$SG" ] && [ "$SG" != "None" ] && aws ec2 delete-security-group --group-id "$SG" --endpoint-url "$AWS_ENDPOINT_URL" || true
-          done
-          BUCKETS=$(aws s3api list-buckets --query "Buckets[?contains(Name,'app-bucket')].Name" --output text --endpoint-url "$AWS_ENDPOINT_URL" 2>/dev/null)
-          for BUCKET in $BUCKETS; do
-            [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && aws s3 rb "s3://$BUCKET" --force --endpoint-url "$AWS_ENDPOINT_URL" || true
-          done
-          echo "✅ Pre-cleanup completed."
+          
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -295,10 +254,11 @@ jobs:
           variable "ministack_endpoint" { default = "http://localhost:PORT_PLACEHOLDER" }
           variable "environment" { default = "staging" }
           variable "aws_region" { default = "REGION_PLACEHOLDER" }
+          
           provider "aws" {
             region = var.aws_region
-            access_key = "test"
-            secret_key = "test"
+            access_key = "ACCESS_KEY_PLACEHOLDER"
+            secret_key = "SECRET_KEY_PLACEHOLDER"
             skip_credentials_validation = true
             skip_requesting_account_id = true
             skip_metadata_api_check = true
@@ -314,39 +274,16 @@ jobs:
           resource "random_id" "suffix" { byte_length = 4 }
           resource "aws_security_group" "web_sg" {
             name = "web-sg-${var.environment}-${var.aws_region}"
-            description = "Allow HTTP/HTTPS and SSH"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
-            ingress {
-              from_port = 22
-              to_port = 22
-              protocol = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port = 80
-              to_port = 80
-              protocol = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port = 443
-              to_port = 443
-              protocol = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port = 0
-              to_port = 0
-              protocol = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
           }
           resource "aws_instance" "web" {
             ami = "ami-0ff8a91507f77f867"
             instance_type = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
+            tags = { Name = "web-server-${var.environment}" }
           }
+          
+          # TERRAFORM MEMBUAT RDS DI MINISTACK
           resource "aws_db_instance" "mysql" {
             identifier = "ministack-mysql-${var.environment}"
             engine = "mysql"
@@ -360,34 +297,55 @@ jobs:
             skip_final_snapshot = true
             apply_immediately = true
             publicly_accessible = true
-            tags = { Project = "DevSecOps", Region = var.aws_region }
           }
+          
+          # MENGAMBIL ENDPOINT YANG DIHASILKAN OLEH MINISTACK
           output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           TFEOF
+          
           sed -i "s/PORT_PLACEHOLDER/${{ needs.dr-check.outputs.ministack_port }}/g" terraform/main.tf
           sed -i "s/REGION_PLACEHOLDER/${{ needs.dr-check.outputs.active_region }}/g" terraform/main.tf
-          sed -i "s/DBNAME_PLACEHOLDER/${{ env.DB_NAME }}/g" terraform/main.tf
-          sed -i "s/DBUSER_PLACEHOLDER/${{ env.DB_USER }}/g" terraform/main.tf
-          sed -i "s/DBPASS_PLACEHOLDER/${{ env.DB_PASSWORD }}/g" terraform/main.tf
+          sed -i "s/ACCESS_KEY_PLACEHOLDER/${{ secrets.AWS_ACCESS_KEY_ID }}/g" terraform/main.tf
+          sed -i "s/SECRET_KEY_PLACEHOLDER/${{ secrets.AWS_SECRET_ACCESS_KEY }}/g" terraform/main.tf
+          sed -i "s/DBNAME_PLACEHOLDER/${{ secrets.DB_NAME }}/g" terraform/main.tf
+          sed -i "s/DBUSER_PLACEHOLDER/${{ secrets.DB_USER }}/g" terraform/main.tf
+          sed -i "s/DBPASS_PLACEHOLDER/${{ secrets.DB_PASSWORD }}/g" terraform/main.tf
+          
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
-            sed -i '/required_providers/i\    backend "s3" {\n      bucket = "${{ env.TF_STATE_BUCKET }}"\n      key = "${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || '\''staging'\'' }}/terraform.tfstate"\n      region = "us-east-1"\n      encrypt = true\n    }' terraform/main.tf
+            cat << 'EOF' > terraform/backend.tf
+            terraform {
+              backend "s3" {}
+            }
+          EOF
           fi
+
       - name: 🗃️ Init & Apply Terraform
         id: tf
         working-directory: terraform
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_STATE_ACCESS_KEY || env.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_STATE_SECRET_KEY || env.AWS_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_STATE_ACCESS_KEY || secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_STATE_SECRET_KEY || secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          terraform init -input=false -reconfigure -upgrade
+          if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
+            terraform init -input=false -reconfigure -upgrade \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || 'staging' }}/terraform.tfstate" \
+              -backend-config="region=us-east-1" \
+              -backend-config="encrypt=true"
+          else
+            terraform init -input=false -reconfigure -upgrade
+          fi
+          
           terraform apply -auto-approve -input=false -var="environment=${{ github.event.inputs.environment || 'staging' }}" -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
+          
+          # EKSPOR ENDPOINT UNTUK JOB BERIKUTNYA
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # DB INIT (RDS HEALTHCHECK + SCHEMA)
+  # [SUB-TRACK 5.1] RDS HEALTHCHECK & DB INIT
   # ==========================================
   db-init:
     name: 🗂️ RDS Healthcheck & DB Init
@@ -400,24 +358,27 @@ jobs:
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+          
           echo "🏥 Healthcheck Ping ke TCP $RDS_HOST:$RDS_PORT..."
           for i in $(seq 1 60); do
-            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
-              echo "✅ HEALTHCHECK PASS: MySQL Engine UP."
+            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ HEALTHCHECK PASS: RDS Ministack UP."
               exit 0
             fi
-            echo "⏱️ Waiting... ($i/60)"
+            echo "⏱️ Menunggu RDS Ministack... ($i/60)"
             sleep 5
           done
           echo "❌ CRITICAL: RDS Healthcheck FAILED"
           exit 1
+          
       - name: 🗂️ PHASE 2: Database Schema Initialization
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQLEOF'
+          
+          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ secrets.DB_NAME }}" <<'SQLEOF'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -429,13 +390,13 @@ jobs:
           echo "✅ Database schema initialized."
 
   # ==========================================
-  # DEPLOY
+  # [CONVERGENCE GATE] DEPLOYMENT
   # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, sast, sca, container, db-init, infra]
-    environment: ${{ github.ref_name == 'develop' && '' || github.event.inputs.environment }}
+    environment: ${{ github.event.inputs.environment || 'staging' }}
     steps:
       - name: ⬇️ Download Docker Image Artifact
         uses: actions/download-artifact@v4
@@ -443,26 +404,26 @@ jobs:
           name: docker-image
           path: .
       - name: 📦 Load Golden Image
-        run: |
-          docker load < ${APP_NAME}-image.tar.gz
-          echo "✅ Golden Image Loaded."
+        run: docker load < ${{ env.APP_NAME }}-image.tar.gz && echo "✅ Golden Image Loaded."
       - name: 🧹 Remove old container
-        run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+        run: docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
       - name: 🚀 Run container
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          docker run -d --name ${CONTAINER_NAME} --network host \
-            -e ASPNETCORE_URLS=http://+:${HOST_PORT} \
-            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+          
+          docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
+            -e ASPNETCORE_URLS=http://+:${{ env.HOST_PORT }} \
+            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ secrets.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
-            ${APP_NAME}:latest
+            ${{ env.APP_NAME }}:latest
+            
       - name: 🔍 WAJIB Health Check Aplikasi
         run: |
           echo "⏳ Polling Application Health Endpoint..."
-          HEALTH_URL="http://localhost:${CONTAINER_PORT}/swagger/v1/swagger.json"
+          HEALTH_URL="http://localhost:${{ env.CONTAINER_PORT }}/swagger/v1/swagger.json"
           for i in $(seq 1 20); do
             if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
               echo "✅ HEALTH CHECK PASSED"
@@ -471,11 +432,11 @@ jobs:
             sleep 5
           done
           echo "❌ HEALTH CHECK FAILED"
-          docker logs ${CONTAINER_NAME}
+          docker logs ${{ env.CONTAINER_NAME }}
           exit 1
 
   # ==========================================
-  # DAST
+  # [POST-DEPLOY] DAST SCAN
   # ==========================================
   dast:
     name: 🕷️ DAST Scan
@@ -484,15 +445,11 @@ jobs:
     steps:
       - name: 🕷️ Run ZAP baseline scan
         run: |
-          docker run --rm --network host ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t "http://localhost:${HOST_PORT}" -l FAIL || {
-              echo "❌ DAST failed"
-              exit 1
-            }
+          docker run --rm --network host ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "http://localhost:${{ env.HOST_PORT }}" -l FAIL || { echo "❌ DAST failed"; exit 1; }
           echo "✅ DAST passed"
 
   # ==========================================
-  # TRAFFIC
+  # [POST-DEPLOY] ROUTING NOTIFICATION
   # ==========================================
   traffic:
     name: 🌐 Traffic Status
@@ -514,15 +471,18 @@ jobs:
           fi
 
   # ==========================================
-  # CLEANUP (YAML-SAFE)
+  # [CLEANUP] TEARDOWN RESOURCES
   # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, traffic, dast]
-    if: ${{ always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production') }}
+    if: |
+      always() && 
+      github.ref_name != 'develop' && 
+      (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
     steps:
-      - name: 🗑️ Cleanup Resources
+      - name: 🗑️ Cleanup Resources in Ministack
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -532,29 +492,34 @@ jobs:
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         run: |
           set -euo pipefail
-          echo "🧹 Cleaning up $ACTIVE_REGION resources..."
+          echo "🧹 Cleaning up Application Container..."
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          
           ENDPOINT="http://localhost:$MINISTACK_PORT"
           AWS_CMD="docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli"
-          echo "🗑️ Cleaning EC2..."
-          $AWS_CMD ec2 describe-instances --filters "Name=tag:Project,Values=DevSecOps" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
+          
+          echo "🗑️ Cleaning EC2 in Ministack..."
+          $AWS_CMD ec2 describe-instances --filters "Name=tag:Region,Values=$ACTIVE_REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
             [ -n "$ID" ] && [ "$ID" != "None" ] && $AWS_CMD ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT" || true
           done
-          echo "🗑️ Cleaning S3..."
-          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'app-bucket')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
+          
+          echo "🗑️ Cleaning S3 in Ministack..."
+          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'$ACTIVE_REGION')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
             if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
               $AWS_CMD s3 rm "s3://$BUCKET" --recursive --endpoint-url "$ENDPOINT" || true
               $AWS_CMD s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT" || true
             fi
           done
-          echo "🗑️ Cleaning RDS..."
+          
+          echo "🗑️ Cleaning RDS in Ministack..."
           $AWS_CMD rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r DBID; do
             [ -n "$DBID" ] && [ "$DBID" != "None" ] && $AWS_CMD rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url "$ENDPOINT" || true
           done
-          echo "✅ Cleanup complete."
+          
+          echo "✅ Resource Cleanup complete."
 
   # ==========================================
-  # SUMMARY
+  # [FINAL] SUMMARY REPORT
   # ==========================================
   notify:
     name: 📢 Pipeline Summary
