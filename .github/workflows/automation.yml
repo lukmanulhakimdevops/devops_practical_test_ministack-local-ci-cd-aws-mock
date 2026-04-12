@@ -1,192 +1,234 @@
-# ==========================================
-# ROUTING & DR DECISION
-# ==========================================
-dr-check:
-  name: 🧠 DR Decision
-  runs-on: ubuntu-latest
-  outputs:
-    active_region: ${{ steps.set.outputs.region }}
-    runner_label: ${{ steps.set.outputs.runner }}
-    ministack_port: ${{ steps.set.outputs.port }}
-    failover: ${{ steps.set.outputs.failover }}
-    state_key_prefix: ${{ steps.set.outputs.state_prefix }}
-    use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
-    is_dr: ${{ steps.set.outputs.is_dr }}
-    should_cleanup: ${{ steps.set.outputs.should_cleanup }}
-  steps:
-    - id: set
-      run: |
-        FAIL="${{ github.event.inputs.manual_dr_trigger }}"
-        CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
-        BRANCH="${{ github.ref_name }}"
+name: 🛡️ Enterprise DevSecOps CI/CD (DR & Audit-Proof)
 
-        SHOULD_CLEANUP="false"
-        if [ "$CLEANUP_INPUT" == "true" ]; then
-          SHOULD_CLEANUP="true"
-        elif [ "$BRANCH" != "main" ] && [ "$BRANCH" != "develop" ]; then
-          SHOULD_CLEANUP="true"
-        fi
-        echo "should_cleanup=$SHOULD_CLEANUP" >> $GITHUB_OUTPUT
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'TodoWebAPI/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+      manual_dr_trigger:
+        description: 'Force DR failover to us-east-2 (laptop)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      cleanup_resources:
+        description: 'Cleanup after pipeline? (only for ephemeral env)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
 
-        if [ "$FAIL" == "true" ]; then
-          echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
-          echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
-          echo "port=4566" >> $GITHUB_OUTPUT
-          echo "state_prefix=ministack/us-east-2" >> $GITHUB_OUTPUT
-          echo "use_s3_backend=false" >> $GITHUB_OUTPUT
-          echo "is_dr=true" >> $GITHUB_OUTPUT
-          echo "🌍 AWS Region: us-east-2 (DR Mode - Laptop)"
-        else
-          echo 'runner="ubuntu-latest"' >> $GITHUB_OUTPUT
-          echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
-          echo "port=4566" >> $GITHUB_OUTPUT
-          echo "state_prefix=ministack/us-east-1" >> $GITHUB_OUTPUT
-          USE_S3="false"
-          [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
-          echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
-          echo "is_dr=false" >> $GITHUB_OUTPUT
-          echo "🌍 AWS Region: us-east-1 (Primary Mode - GitHub)"
-        fi
-        echo "failover=$FAIL" >> $GITHUB_OUTPUT
+jobs:
+  # ==========================================
+  # DR DECISION
+  # ==========================================
+  dr-check:
+    name: 🧠 DR Decision
+    runs-on: ubuntu-latest
+    outputs:
+      active_region: ${{ steps.set.outputs.region }}
+      runner_label: ${{ steps.set.outputs.runner }}
+      ministack_port: ${{ steps.set.outputs.port }}
+      failover: ${{ steps.set.outputs.failover }}
+      state_key_prefix: ${{ steps.set.outputs.state_prefix }}
+      use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
+      is_dr: ${{ steps.set.outputs.is_dr }}
+      should_cleanup: ${{ steps.set.outputs.should_cleanup }}
+    steps:
+      - id: set
+        run: |
+          FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+          CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
+          BRANCH="${{ github.ref_name }}"
 
-# ==========================================
-# DEV SECURITY JOBS – ONLY ON PRIMARY
-# ==========================================
-sast:
-  name: 🔐 SAST & Secrets
-  runs-on: ubuntu-latest
-  if: needs.dr-check.outputs.is_dr == 'false'
-  needs: dr-check
-  permissions:
-    security-events: write
-    contents: read
-  steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    - name: 🔐 Gitleaks – Secret Scanning
-      uses: gitleaks/gitleaks-action@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    - name: 🔧 Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
-    - name: 🧬 Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: csharp
-    - name: 🔨 Build for CodeQL
-      run: cd TodoWebAPI && dotnet build TodoWebAPI.csproj
-    - name: 🧬 Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+          SHOULD_CLEANUP="false"
+          if [ "$CLEANUP_INPUT" == "true" ]; then
+            SHOULD_CLEANUP="true"
+          elif [ "$BRANCH" != "main" ] && [ "$BRANCH" != "develop" ]; then
+            SHOULD_CLEANUP="true"
+          fi
+          echo "should_cleanup=$SHOULD_CLEANUP" >> $GITHUB_OUTPUT
 
-sca:
-  name: 📦 SCA & SBOM
-  runs-on: ubuntu-latest
-  if: needs.dr-check.outputs.is_dr == 'false'
-  needs: dr-check
-  steps:
-    - uses: actions/checkout@v4
-    - name: 🔧 Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
-    - name: 🔍 Audit NuGet vulnerabilities
-      run: |
-        dotnet restore TodoWebAPI/*.csproj
-        dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
-    - name: 📄 Generate SBOM (CycloneDX)
-      uses: CycloneDX/gh-dotnet-generate-sbom@v1
-      with:
-        path: TodoWebAPI
-        output: sbom.xml
-    - name: 📤 Upload SBOM
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-sbom
-        path: TodoWebAPI/sbom.xml
-        retention-days: 7
+          if [ "$FAIL" == "true" ]; then
+            echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
+            echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
+            echo "port=4566" >> $GITHUB_OUTPUT
+            echo "state_prefix=ministack/us-east-2" >> $GITHUB_OUTPUT
+            echo "use_s3_backend=false" >> $GITHUB_OUTPUT
+            echo "is_dr=true" >> $GITHUB_OUTPUT
+            echo "🌍 AWS Region: us-east-2 (DR Mode - Laptop)"
+          else
+            echo 'runner="ubuntu-latest"' >> $GITHUB_OUTPUT
+            echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
+            echo "port=4566" >> $GITHUB_OUTPUT
+            echo "state_prefix=ministack/us-east-1" >> $GITHUB_OUTPUT
+            USE_S3="false"
+            [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
+            echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
+            echo "is_dr=false" >> $GITHUB_OUTPUT
+            echo "🌍 AWS Region: us-east-1 (Primary Mode - GitHub)"
+          fi
+          echo "failover=$FAIL" >> $GITHUB_OUTPUT
 
-build:
-  name: 🔨 Build Application
-  runs-on: ubuntu-latest
-  if: needs.dr-check.outputs.is_dr == 'false'
-  needs: [dr-check, sast, sca]
-  steps:
-    - uses: actions/checkout@v4
-    - name: 🔧 Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: ${{ env.DOTNET_VERSION }}
-    - name: 🩹 Patch Microsoft.Build vulnerability
-      run: |
-        for proj in TodoWebAPI/*.csproj; do
-          dotnet add "$proj" package Microsoft.Build.Runtime --version 17.5.0
-        done
+  # ==========================================
+  # DEV SECURITY JOBS – ONLY ON PRIMARY (us-east-1)
+  # ==========================================
+  sast:
+    name: 🔐 SAST & Secrets
+    runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
+    needs: dr-check
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 🔐 Gitleaks – Secret Scanning
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: 🧬 Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+      - name: 🔨 Build for CodeQL
+        run: cd TodoWebAPI && dotnet build TodoWebAPI.csproj
+      - name: 🧬 Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
 
-# ==========================================
-# INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
-# ==========================================
-infra:
-  name: 🏗️ Provision Infrastructure
-  runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
-  needs: dr-check
-  outputs:
-    rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
-  steps:
-    - uses: actions/checkout@v4
-    - name: 🔧 Install Terraform & Start Ministack
-      if: needs.dr-check.outputs.is_dr == 'false'
-      run: |
-        if ! command -v terraform &>/dev/null; then
-          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-          sudo apt-get update -qq && sudo apt-get install -y terraform
-        fi
-        terraform version
+  sca:
+    name: 📦 SCA & SBOM
+    runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
+    needs: dr-check
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: 🔍 Audit NuGet vulnerabilities
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
+      - name: 📄 Generate SBOM (CycloneDX)
+        uses: CycloneDX/gh-dotnet-generate-sbom@v1
+        with:
+          path: TodoWebAPI
+          output: sbom.xml
+      - name: 📤 Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-sbom
+          path: TodoWebAPI/sbom.xml
+          retention-days: 7
 
-        PORT="${{ needs.dr-check.outputs.ministack_port }}"
-        docker rm -f ministack 2>/dev/null || true
-        docker run -d --name ministack --network host \
-          -v /var/run/docker.sock:/var/run/docker.sock \
-          -e SERVICES=ec2,s3,sts,iam,rds \
-          -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
-          nahuelnucera/ministack:latest
-        echo "⏳ Waiting for Ministack..."
-        for i in $(seq 1 40); do
-          curl -sf "http://localhost:${PORT}/_localstack/health" && break
-          sleep 3
-        done
+  build:
+    name: 🔨 Build Application
+    runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'
+    needs: [dr-check, sast, sca]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: 🩹 Patch Microsoft.Build vulnerability
+        run: |
+          for proj in TodoWebAPI/*.csproj; do
+            dotnet add "$proj" package Microsoft.Build.Runtime --version 17.5.0
+          done
+      - name: 🔨 Restore, Build & Publish
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
+          dotnet build TodoWebAPI/*.csproj -c Release --no-restore
+          dotnet publish TodoWebAPI/*.csproj -c Release --no-build -o publish_output
+      - name: 📤 Upload App Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-binaries
+          path: publish_output/
+          retention-days: 1
 
-# ==========================================
-# FINAL SUMMARY
-# ==========================================
-notify:
-  name: 📢 Pipeline Summary
-  runs-on: ubuntu-latest
-  needs: [dr-check, traffic, dast, cleanup]
-  if: always()
-  steps:
-    - name: 📊 Print Summary
-      run: |
-        echo "========================================"
-        echo "  🛡️ DevSecOps Pipeline Summary"
-        echo "========================================"
-        echo "  Branch         : ${{ github.ref_name }}"
-        echo "  Region         : ${{ needs.dr-check.outputs.active_region }}"
-        echo "  DR Failover    : ${{ needs.dr-check.outputs.failover }}"
-        echo "  RDS Health     : ✅ PASSED"
-        echo "  App Health     : ✅ PASSED"
-        if [ "${{ needs.dr-check.outputs.is_dr }}" == "false" ]; then
-          echo "  DAST           : ${{ needs.dast.result }}"
-        else
-          echo "  DAST           : ⏭️ SKIPPED (DR Mode)"
-        fi
-        echo "  Status         : ✅ SUCCESS"
-        echo "========================================"
-        if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
-          echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (Laptop)"
-        else
-          echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (GitHub Runner)"
-        fi
+  # ==========================================
+  # INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
+  # ==========================================
+  infra:
+    name: 🏗️ Provision Infrastructure
+    runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
+    needs: dr-check
+    outputs:
+      rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🔧 Install Terraform & Start Ministack
+        if: needs.dr-check.outputs.is_dr == 'false'
+        run: |
+          if ! command -v terraform &>/dev/null; then
+            curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt-get update -qq && sudo apt-get install -y terraform
+          fi
+          terraform version
+
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          docker rm -f ministack 2>/dev/null || true
+          docker run -d --name ministack --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
+            nahuelnucera/ministack:latest
+          echo "⏳ Waiting for Ministack..."
+          for i in $(seq 1 40); do
+            curl -sf "http://localhost:${PORT}/_localstack/health" && break
+            sleep 3
+          done
+
+  # ==========================================
+  # FINAL SUMMARY
+  # ==========================================
+  notify:
+    name: 📢 Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [dr-check, traffic, dast, cleanup]
+    if: always()
+    steps:
+      - name: 📊 Print Summary
+        run: |
+          echo "========================================"
+          echo "  🛡️ DevSecOps Pipeline Summary"
+          echo "========================================"
+          echo "  Branch         : ${{ github.ref_name }}"
+          echo "  Region         : ${{ needs.dr-check.outputs.active_region }}"
+          echo "  DR Failover    : ${{ needs.dr-check.outputs.failover }}"
+          echo "  RDS Health     : ✅ PASSED"
+          echo "  App Health     : ✅ PASSED"
+          if [ "${{ needs.dr-check.outputs.is_dr }}" == "false" ]; then
+            echo "  DAST           : ${{ needs.dast.result }}"
+          else
+            echo "  DAST           : ⏭️ SKIPPED (DR Mode)"
+          fi
+          echo "  Status         : ✅ SUCCESS"
+          echo "========================================"
+          if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
+            echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (Laptop)"
+          else
+            echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (GitHub Runner)"
+          fi
