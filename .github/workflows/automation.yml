@@ -187,7 +187,7 @@ jobs:
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
     env:
       MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-      REGION: ${{ needs.dr-check.outputs.region }}
+      REGION:  ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - uses: actions/checkout@v4
@@ -213,7 +213,7 @@ jobs:
           echo "⏳ Waiting for Ministack services..."
           for i in $(seq 1 40); do
             STATUS=$(curl -sf "http://localhost:${MS_PORT}/_localstack/health" 2>/dev/null || echo '{}')
-            S3=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))" 2>/dev/null)
+            S3=$(echo  "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))"  2>/dev/null)
             EC2=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('ec2',''))" 2>/dev/null)
             RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
             if [ "$S3" = "available" ] && [ "$EC2" = "available" ] && [ "$RDS" = "available" ]; then
@@ -223,12 +223,13 @@ jobs:
             sleep 3
           done
 
-      - name: 💻 Verify Local Environment & Download State (DR)
+      - name: 💻 Verify Local Environment (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
           terraform version || { echo "❌ Terraform not found."; exit 1; }
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "❌ Ministack not running."
+            echo "❌ Ministack not running. Start with:"
+            echo "   docker run -d --name ministack --network host -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest"
             exit 1
           fi
           for i in $(seq 1 10); do
@@ -237,12 +238,18 @@ jobs:
           done
           echo "✅ Ministack ready"
 
-      - name: ⬇️ Download Terraform State (DR only)
+      - name: ⬇️ Download Terraform State from Primary (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
-        uses: actions/download-artifact@v4
+        id: download-state
+        uses: dawidd6/action-download-artifact@v6
         with:
+          workflow: ${{ github.workflow }}
+          branch: main
           name: terraform-state-us-east-1
           path: terraform-state
+          search_artifacts: true
+          if_no_artifact_found: warn
+        continue-on-error: true
 
       - name: 📝 Create Terraform config
         run: |
@@ -343,11 +350,14 @@ jobs:
           aws_region         = "${REGION}"
           EOF
 
-      - name: 🔄 Restore State and Destroy (DR)
+      - name: 🔄 Restore State & Destroy (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
         working-directory: terraform
         run: |
-          cp ../terraform-state/terraform.tfstate . || true
+          if [ -f "../terraform-state/terraform.tfstate" ]; then
+            echo "📦 Restoring Terraform state from primary..."
+            cp ../terraform-state/terraform.tfstate .
+          fi
           terraform init -input=false -reconfigure -upgrade
           terraform destroy -auto-approve -input=false || true
 
@@ -356,12 +366,12 @@ jobs:
         id: tf-primary
         working-directory: terraform
         env:
-          AWS_ACCESS_KEY_ID: test
+          AWS_ACCESS_KEY_ID:     test
           AWS_SECRET_ACCESS_KEY: test
-          AWS_DEFAULT_REGION: us-east-1
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          AWS_DEFAULT_REGION:    us-east-1
+          TF_VAR_db_name:        ${{ secrets.DB_NAME }}
+          TF_VAR_db_user:        ${{ secrets.DB_USER }}
+          TF_VAR_db_password:    ${{ secrets.DB_PASSWORD }}
         run: |
           terraform init -input=false -reconfigure -upgrade
           terraform apply -auto-approve -input=false
@@ -383,14 +393,13 @@ jobs:
         id: tf-dr
         working-directory: terraform
         env:
-          AWS_ACCESS_KEY_ID: test
+          AWS_ACCESS_KEY_ID:     test
           AWS_SECRET_ACCESS_KEY: test
-          AWS_DEFAULT_REGION: us-east-1
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+          AWS_DEFAULT_REGION:    us-east-1
+          TF_VAR_db_name:        ${{ secrets.DB_NAME }}
+          TF_VAR_db_user:        ${{ secrets.DB_USER }}
+          TF_VAR_db_password:    ${{ secrets.DB_PASSWORD }}
         run: |
-          terraform init -input=false -reconfigure -upgrade
           terraform apply -auto-approve -input=false
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
           echo "✅ Terraform applied in ${REGION}"
@@ -403,8 +412,8 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     env:
-      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-      REGION: ${{ needs.dr-check.outputs.region }}
+      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
+      REGION:   ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - name: 🐳 Ensure Ministack & RDS
@@ -463,6 +472,7 @@ jobs:
             sleep 5
           done
 
+          # IP Hunting
           MYSQL_CONTAINER="$DB_ID"
           echo "🔍 Hunting IP for container $MYSQL_CONTAINER"
           for i in $(seq 1 30); do
@@ -502,11 +512,11 @@ jobs:
             mysql --protocol=TCP -h"${RDS_HOST}" -P"${RDS_PORT}" \
             -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
-            Id INT PRIMARY KEY AUTO_INCREMENT,
-            Name VARCHAR(255) NULL,
-            IsComplete TINYINT(1) NOT NULL DEFAULT 0,
-            CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            Id         INT          PRIMARY KEY AUTO_INCREMENT,
+            Name       VARCHAR(255) NULL,
+            IsComplete TINYINT(1)   NOT NULL DEFAULT 0,
+            CreatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
           echo "✅ Schema ready in ${REGION}"
@@ -519,8 +529,8 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, build, db-init]
     env:
-      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-      REGION: ${{ needs.dr-check.outputs.region }}
+      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
+      REGION:   ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - name: ⬇️ Download Golden Image
@@ -589,7 +599,8 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-api-scan.py \
             -t http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json \
-            -f openapi -r dast_report.html || echo "⚠️ Security findings detected."
+            -f openapi -r dast_report.html \
+          || echo "⚠️ Security findings detected."
           echo "✅ DAST completed"
 
       - name: 📤 Upload ZAP Report
@@ -609,8 +620,8 @@ jobs:
     needs: [dr-check, deploy]
     if: always() && github.event.inputs.cleanup_resources == 'true' && needs.dr-check.outputs.is_dr == 'false'
     env:
-      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-      REGION: ${{ needs.dr-check.outputs.region }}
+      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
+      REGION:   ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - name: 🗑️ Cleanup Ministack Resources
@@ -626,11 +637,9 @@ jobs:
           docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
           if docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             $AWS_RUN rds delete-db-instance --db-instance-identifier "$DB_ID" --skip-final-snapshot --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
-            
             $AWS_RUN ec2 describe-instances --filters "Name=tag:Project,Values=DevSecOps" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT_URL" 2>/dev/null | tr '\t' '\n' | grep -v '^$' | while read -r ID; do
               [ -n "$ID" ] && [ "$ID" != "None" ] && $AWS_RUN ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
             done
-            
             $AWS_RUN s3api list-buckets --query "Buckets[?starts_with(Name,'artifacts-${ENV_NAME}')].Name" --output text --endpoint-url "$ENDPOINT_URL" 2>/dev/null | tr '\t' '\n' | grep -v '^$' | while read -r BUCKET; do
               [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && $AWS_RUN s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
             done
@@ -648,11 +657,11 @@ jobs:
     if: always()
     steps:
       - run: |
-          echo "=========================================="
-          echo "🛡️ FULL-SPECTRUM DEVSECOPS SUMMARY"
-          echo "=========================================="
+          echo "========================================"
+          echo "🛡️  FULL-SPECTRUM DEVSECOPS SUMMARY"
+          echo "========================================"
           echo "Target Region  : ${{ needs.dr-check.outputs.region }}"
           echo "Runner State   : ${{ needs.dr-check.outputs.is_dr == 'true' && '💻 BARE-METAL' || '☁️ GITHUB CLOUD' }}"
           echo "Deployment     : ${{ needs.deploy.result }}"
-          echo "=========================================="
+          echo "========================================"
           echo "URL: http://localhost:${{ env.HOST_PORT }}"
