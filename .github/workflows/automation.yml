@@ -536,11 +536,15 @@ jobs:
       REGION:   ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      - name: ⬇️ Download Golden Image
-        uses: actions/download-artifact@v4
+      - name: ⬇️ Download Golden Image (Primary: current run, DR: latest main)
+        uses: dawidd6/action-download-artifact@v6
         with:
+          workflow: ${{ github.workflow }}
+          branch: main
           name: golden-image
           path: .
+          search_artifacts: true
+          if_no_artifact_found: fail
 
       - name: 📦 Load Image
         run: docker load < image.tar.gz
