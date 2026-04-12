@@ -440,19 +440,23 @@ jobs:
           else
             echo "📍 Traffic: GitHub CI Host (us-east-1) via http://localhost:${{ env.HOST_PORT }}"
           fi
-# ==========================================
-  # [CLEANUP] YAML-SAFE VERSION
-  # ==========================================
-  cleanup:
-    name: 🧹 Conditional Cleanup
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: [dr-check, traffic, dast]
-    if: |
-      always() && 
-      github.ref_name != 'develop' && 
-      (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
-    steps:
-      - name: 🗑️ Cleanup Resources
+    # ==========================================
+    # [CLEANUP] YAML-SAFE VERSION
+    # ==========================================
+    cleanup:
+      name: 🧹 Conditional Cleanup
+      runs-on: ${{ needs.dr-check.outputs.runner_label }}
+      needs: [dr-check, traffic, dast]
+      if: >
+        always() &&
+        github.ref_name != 'develop' &&
+        (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
+      steps:
+        - name: 🗑️ Cleanup Resources
+          run: |
+            echo "🧹 Cleaning up resources..."
+            docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+            docker system prune -f || true
 
   # ==========================================
   # [FINAL] SUMMARY REPORT
