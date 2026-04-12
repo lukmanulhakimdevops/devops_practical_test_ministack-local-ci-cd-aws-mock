@@ -440,49 +440,19 @@ jobs:
           else
             echo "📍 Traffic: GitHub CI Host (us-east-1) via http://localhost:${{ env.HOST_PORT }}"
           fi
-
-  # ==========================================
+# ==========================================
   # [CLEANUP] YAML-SAFE VERSION
   # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, traffic, dast]
-    if: ${{ always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production') }}
+    if: |
+      always() && 
+      github.ref_name != 'develop' && 
+      (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
     steps:
       - name: 🗑️ Cleanup Resources
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          MINISTACK_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-          ACTIVE_REGION: ${{ needs.dr-check.outputs.active_region }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-        run: |
-          set -euo pipefail
-          echo "🧹 Cleaning up Application Container..."
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          
-          ENDPOINT="http://localhost:$MINISTACK_PORT"
-          AWS_CMD="docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli"
-          
-          echo "🗑️ Cleaning EC2/S3/RDS resources created by Terraform in Ministack..."
-          $AWS_CMD ec2 describe-instances --filters "Name=tag:Region,Values=$ACTIVE_REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
-            [ -n "$ID" ] && [ "$ID" != "None" ] && $AWS_CMD ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT" || true
-          done
-          
-          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'$ACTIVE_REGION')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
-            if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
-              $AWS_CMD s3 rm "s3://$BUCKET" --recursive --endpoint-url "$ENDPOINT" || true
-              $AWS_CMD s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT" || true
-            fi
-          done
-          
-          $AWS_CMD rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r DBID; do
-            [ -n "$DBID" ] && [ "$DBID" != "None" ] && $AWS_CMD rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url "$ENDPOINT" || true
-          done
-          
-          echo "✅ Application & Resource Cleanup complete. (Ministack Engine remains untouched)."
 
   # ==========================================
   # [FINAL] SUMMARY REPORT
