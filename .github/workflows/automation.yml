@@ -49,9 +49,9 @@ permissions:
   checks: write
 
 jobs:
-  # --------------------------------------------------------------------------
-  # 🧠 DR Decision & Routing
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 1] ROUTING & DR LOGIC
+  # ==========================================
   dr-check:
     name: 🧠 DR Decision
     runs-on: ubuntu-latest
@@ -78,7 +78,6 @@ jobs:
             PORT="4566"
             PREFIX="ministack/us-east-1"
           fi
-          # S3 backend hanya jika bucket tersedia dan bukan self-hosted runner (opsional)
           if [ -n "${{ env.TF_STATE_BUCKET }}" ] && [ "$RUNNER" != "[self-hosted, linux, x64]" ]; then
             USE_S3="true"
           fi
@@ -89,9 +88,9 @@ jobs:
           echo "state_prefix=$PREFIX"     >> $GITHUB_OUTPUT
           echo "use_s3_backend=$USE_S3"   >> $GITHUB_OUTPUT
 
-  # --------------------------------------------------------------------------
-  # 🔐 SAST & Secrets (CodeQL is back)
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 2] SECURITY SAST (Independent)
+  # ==========================================
   sast:
     name: 🔐 SAST & Secrets
     runs-on: ubuntu-latest
@@ -102,76 +101,83 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          
       - name: 🔐 Gitleaks – Secret Scanning
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-          
       - name: 🧬 Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: csharp
-          
       - name: 🔨 Build for CodeQL
         run: cd TodoWebAPI && dotnet build TodoWebAPI.csproj
-        
       - name: 🧬 Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  # --------------------------------------------------------------------------
-  # 📦 SCA, Build & Publish (Golden Image preparation)
-  # --------------------------------------------------------------------------
-  build:
-    name: 🔨 Build & Publish
+  # ==========================================
+  # [PARALLEL TRACK 3] SECURITY SCA (Independent)
+  # ==========================================
+  sca:
+    name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
-    needs: sast
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-          
-      - name: 🩹 Patch Microsoft.Build vulnerability
-        run: |
-          for proj in TodoWebAPI/*.csproj; do
-            dotnet add "$proj" package Microsoft.Build --version 17.8.43
-          done
-          
       - name: 🔍 Audit NuGet vulnerabilities
         run: |
           dotnet restore TodoWebAPI/*.csproj
           dotnet list TodoWebAPI/*.csproj package --vulnerable --include-transitive || true
-
       - name: 📄 Generate SBOM (CycloneDX)
         uses: CycloneDX/gh-dotnet-generate-sbom@v1
         with:
           path: TodoWebAPI
           output: sbom.xml
-          
-      - name: 🔨 Build & Publish
+      - name: 📤 Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-sbom
+          path: TodoWebAPI/sbom.xml
+          retention-days: 7
+
+  # ==========================================
+  # [PARALLEL TRACK 4] BUILD APPLICATION (Independent)
+  # ==========================================
+  build:
+    name: 🔨 Build Application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🔧 Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: 🩹 Patch Microsoft.Build vulnerability
         run: |
+          for proj in TodoWebAPI/*.csproj; do
+            dotnet add "$proj" package Microsoft.Build --version 17.8.43
+          done
+      - name: 🔨 Restore, Build & Publish
+        run: |
+          dotnet restore TodoWebAPI/*.csproj
           dotnet build TodoWebAPI/*.csproj -c Release --no-restore
           dotnet publish TodoWebAPI/*.csproj -c Release --no-build -o publish_output
-          
-      - name: 📤 Upload App Artifact & SBOM
+      - name: 📤 Upload App Artifact
         uses: actions/upload-artifact@v4
         with:
           name: webapp-binaries
-          path: |
-            publish_output/
-            TodoWebAPI/sbom.xml
-          retention-days: 7
+          path: publish_output/
+          retention-days: 1
 
-  # --------------------------------------------------------------------------
-  # 🐳 Container Build & Scan (THE GOLDEN IMAGE)
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [SUB-TRACK 4.1] CONTAINER BUILD (Waits for App Build)
+  # ==========================================
   container:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
@@ -183,7 +189,6 @@ jobs:
         with:
           name: webapp-binaries
           path: deploy/publish
-
       - name: 🐳 Create hardened Dockerfile
         run: |
           cat > deploy/Dockerfile <<'DOCKERFILE'
@@ -202,10 +207,8 @@ jobs:
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
-
       - name: 🏗️ Build Docker Image
         run: docker build -t ${APP_NAME}:latest ./deploy
-
       - name: 🛡️ Trivy Image Scan (Fail on CRITICAL/HIGH)
         uses: aquasecurity/trivy-action@master
         with:
@@ -214,10 +217,8 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
-
       - name: 💾 Save Docker Image (Artifact)
         run: docker save ${APP_NAME}:latest | gzip > ${APP_NAME}-image.tar.gz
-
       - name: 📤 Upload Docker Image Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -225,19 +226,18 @@ jobs:
           path: ${APP_NAME}-image.tar.gz
           retention-days: 1
 
-  # --------------------------------------------------------------------------
-  # 🏗️ Mock Infrastructure + MySQL (Region-Aware)
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [PARALLEL TRACK 5] INFRASTRUCTURE (Waits for DR Check only)
+  # ==========================================
   infra:
     name: 🏗️ Mock Infrastructure + MySQL
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: [dr-check, container]
+    needs: dr-check
     outputs:
       s3_bucket:     ${{ steps.tf.outputs.s3_bucket }}
       ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
     steps:
       - uses: actions/checkout@v4
-      
       - name: 🔧 Ensure Terraform
         run: |
           if ! command -v terraform &> /dev/null; then
@@ -245,7 +245,6 @@ jobs:
             echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
             sudo apt-get update && sudo apt-get install -y terraform
           fi
-          
       - name: 🐳 Start MySQL (mock RDS)
         run: |
           docker rm -f mock-rds-mysql 2>/dev/null || true
@@ -259,7 +258,6 @@ jobs:
             docker exec mock-rds-mysql mysqladmin ping -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null && break
             sleep 2
           done
-          
       - name: 🐳 Ensure Ministack (Region-Aware Port)
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
@@ -269,7 +267,6 @@ jobs:
             curl -sf "http://localhost:${PORT}/_localstack/health" | grep -q '"s3":"available"' && break
             sleep 3
           done
-          
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -314,30 +311,10 @@ jobs:
             name        = "web-sg-\${var.environment}-\${var.aws_region}"
             description = "SG for \${var.aws_region}"
             tags = { Name = "web-sg-\${var.environment}", Project = "DevSecOps", Region = var.aws_region }
-            ingress {
-              from_port   = 22
-              to_port     = 22
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 80
-              to_port     = 80
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 443
-              to_port     = 443
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
+            ingress { from_port = 22; to_port = 22; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            ingress { from_port = 80; to_port = 80; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            ingress { from_port = 443; to_port = 443; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
+            egress { from_port = 0; to_port = 0; protocol = "-1"; cidr_blocks = ["0.0.0.0/0"] }
           }
           resource "aws_instance" "web" {
             ami             = "ami-0ff8a91507f77f867"
@@ -352,7 +329,6 @@ jobs:
           output "s3_bucket"     { value = aws_s3_bucket.app_bucket.bucket }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           EOF
-          
       - name: 🗃️ Init & Apply Terraform
         id: tf
         working-directory: terraform
@@ -368,13 +344,13 @@ jobs:
           echo "s3_bucket=$(terraform output -raw s3_bucket)"         >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
-  # --------------------------------------------------------------------------
-  # 🗂️ DB Init
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [SUB-TRACK 5.1] DB INITIALIZATION (Waits for Infra)
+  # ==========================================
   db-init:
     name: 🗂️ Initialize DB Tables
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: infra
+    needs: [dr-check, infra]
     steps:
       - name: 🗂️ Create tables
         run: |
@@ -389,13 +365,13 @@ jobs:
           SQL
           echo "✅ DB initialized in ${{ needs.dr-check.outputs.active_region }}"
 
-  # --------------------------------------------------------------------------
-  # 🚀 Deploy + 🔍 Health Check (NO REBUILD)
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [CONVERGENCE GATE] DEPLOYMENT (Waits for ALL Tracks)
+  # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: [dr-check, db-init]
+    needs: [dr-check, sast, sca, container, db-init]
     environment: ${{ github.ref_name == 'develop' && '' || github.event.inputs.environment }}
     steps:
       - name: ⬇️ Download Docker Image Artifact
@@ -403,15 +379,12 @@ jobs:
         with:
           name: docker-image
           path: .
-
       - name: 📦 Load Golden Image
         run: |
           docker load < ${APP_NAME}-image.tar.gz
           echo "✅ Golden Image Loaded."
-
       - name: 🧹 Remove old container
         run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
-
       - name: 🚀 Run container
         run: |
           docker run -d --name ${CONTAINER_NAME} --network host \
@@ -419,7 +392,6 @@ jobs:
             -e "ConnectionStrings__DefaultConnection=Server=127.0.0.1;Port=3306;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
             ${APP_NAME}:latest
-
       - name: 🔍 WAJIB Health Check (Region-Aware)
         run: |
           echo "⏳ Polling health endpoint in ${{ needs.dr-check.outputs.active_region }}..."
@@ -435,13 +407,13 @@ jobs:
           docker logs ${CONTAINER_NAME}
           exit 1
 
-  # --------------------------------------------------------------------------
-  # 🕷️ DAST Scan
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [POST-DEPLOY] DAST SCAN
+  # ==========================================
   dast:
     name: 🕷️ DAST Scan
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: deploy
+    needs: [dr-check, deploy]
     steps:
       - name: 🕷️ Run ZAP baseline scan
         run: |
@@ -452,9 +424,9 @@ jobs:
             }
           echo "✅ DAST passed in ${{ needs.dr-check.outputs.active_region }}"
 
-  # --------------------------------------------------------------------------
-  # 🌐 Traffic Switch & Status
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [POST-DEPLOY] ROUTING NOTIFICATION
+  # ==========================================
   traffic:
     name: 🌐 Traffic Status
     runs-on: ubuntu-latest
@@ -474,13 +446,13 @@ jobs:
             echo "📍 Traffic routed to : GitHub CI Host (us-east-1) via http://localhost:${{ env.HOST_PORT }}"
           fi
 
-  # --------------------------------------------------------------------------
-  # 🧹 Conditional Cleanup (Containerized AWS CLI)
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [CLEANUP] DESTROY MOCK INFRASTRUCTURE
+  # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
-    needs: [traffic, dast, dr-check]
+    needs: [dr-check, traffic, dast]
     if: always() && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
     steps:
       - name: 🗑️ Cleanup Resources via Dockerized AWS CLI
@@ -492,15 +464,12 @@ jobs:
         run: |
           echo "🧹 Cleaning up ${{ needs.dr-check.outputs.active_region }} resources..."
           docker rm -f ${CONTAINER_NAME} mock-rds-mysql 2>/dev/null || true
-          
           REGION="${{ needs.dr-check.outputs.active_region }}"
-          
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
             amazon/aws-cli ec2 describe-instances --filters "Name=tag:Region,Values=$REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read ID; do
             [ -n "$ID" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli ec2 terminate-instances --instance-ids "$ID" --endpoint-url http://localhost:${MINISTACK_PORT} || true
           done
-          
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
             amazon/aws-cli s3api list-buckets --query "Buckets[?contains(Name,'$REGION')].Name" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read BUCKET; do
@@ -509,13 +478,13 @@ jobs:
           done
           echo "✅ Cleanup complete."
 
-  # --------------------------------------------------------------------------
-  # 📢 Notification
-  # --------------------------------------------------------------------------
+  # ==========================================
+  # [FINAL] SUMMARY REPORT
+  # ==========================================
   notify:
     name: 📢 Pipeline Summary
     runs-on: ubuntu-latest
-    needs: [traffic, dast, cleanup, dr-check]
+    needs: [dr-check, traffic, dast, cleanup]
     if: always()
     steps:
       - name: 📊 Print Summary
