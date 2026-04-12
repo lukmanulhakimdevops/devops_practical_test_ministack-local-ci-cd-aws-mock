@@ -1,4 +1,4 @@
-name: 🛡️ Enterprise DevSecOps CI/CD (Real-Time DR Healthcheck)
+name: 🛡️ Enterprise DevSecOps CI/CD (Bare-Metal Native DR)
 
 on:
   push:
@@ -77,31 +77,31 @@ jobs:
 
           echo "📡 Scanning Primary Region us-east-1..."
           STATUS="UP"
-          if ! curl -sf --connect-timeout 10 "http://localhost:4566/_localstack/health" > /dev/null 2>&1; then
-            echo "🚨 ALERT: us-east-1 is DOWN or Unreachable!"
+          if ! curl -sf --connect-timeout 5 "http://localhost:4566/_localstack/health" > /dev/null 2>&1; then
+            echo "🚨 ALERT: us-east-1 is DOWN!"
             STATUS="DOWN"
           fi
 
           if [ "$STATUS" == "DOWN" ] || [ "$FAIL" == "true" ]; then
             echo "🚀 ACTION: Initiating Failover to us-east-2 (Bare-Metal Laptop)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
-            echo "region=${{ env.AWS_REGION_DR }}"      >> $GITHUB_OUTPUT
-            echo "port=4566"                            >> $GITHUB_OUTPUT
+            echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
+            echo "port=4566" >> $GITHUB_OUTPUT
             echo "state_key=ministack/us-east-2/${ENV_NAME}/terraform.tfstate" >> $GITHUB_OUTPUT
-            echo "use_s3_backend=false"                 >> $GITHUB_OUTPUT
-            echo "is_dr=true"                           >> $GITHUB_OUTPUT
-            echo "failover=true"                        >> $GITHUB_OUTPUT
+            echo "use_s3_backend=false" >> $GITHUB_OUTPUT
+            echo "is_dr=true" >> $GITHUB_OUTPUT
+            echo "failover=true" >> $GITHUB_OUTPUT
           else
             echo "🟢 ACTION: Staying on Primary us-east-1 (GitHub Cloud)"
-            echo 'runner="ubuntu-latest"'               >> $GITHUB_OUTPUT
+            echo 'runner="ubuntu-latest"' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
-            echo "port=4566"                            >> $GITHUB_OUTPUT
+            echo "port=4566" >> $GITHUB_OUTPUT
             echo "state_key=ministack/us-east-1/${ENV_NAME}/terraform.tfstate" >> $GITHUB_OUTPUT
             USE_S3="false"
             [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
-            echo "use_s3_backend=$USE_S3"               >> $GITHUB_OUTPUT
-            echo "is_dr=false"                          >> $GITHUB_OUTPUT
-            echo "failover=false"                       >> $GITHUB_OUTPUT
+            echo "use_s3_backend=$USE_S3" >> $GITHUB_OUTPUT
+            echo "is_dr=false" >> $GITHUB_OUTPUT
+            echo "failover=false" >> $GITHUB_OUTPUT
           fi
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
 
@@ -721,11 +721,12 @@ jobs:
     steps:
       - run: |
           echo "========================================"
-          echo "🛡️  PCA AUTOMATED DR STATUS"
+          echo "🛡️  PCA BARE-METAL DR STATUS"
           echo "========================================"
           echo "Region Primary : us-east-1"
           echo "Target Region  : ${{ needs.dr-check.outputs.active_region }}"
-          echo "DR Status      : ${{ needs.dr-check.outputs.is_dr == 'true' && '🚨 FAILOVER ACTIVE' || '🟢 HEALTHY' }}"
+          echo "Runner Type    : ${{ needs.dr-check.outputs.is_dr == 'true' && '💻 NATIVE LAPTOP' || '☁️ GITHUB CLOUD' }}"
+          echo "Terraform Mode : ✅ BARE-METAL NATIVE"
           echo "Deployment     : ${{ needs.deploy.result }}"
           echo "========================================"
           echo "URL: http://localhost:${{ env.HOST_PORT }}"
