@@ -247,7 +247,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # INFRASTRUCTURE PROVISIONING – BOTH ENVS
+  # INFRASTRUCTURE PROVISIONING – BOTH ENVS (PARALLEL WITH BUILD)
   # ==========================================
   infra:
     name: 🏗️ Provision Infrastructure
@@ -296,7 +296,6 @@ jobs:
             exit 1
           fi
           echo "✅ Ministack is running"
-          # Ensure LocalStack health endpoint is responding
           for i in $(seq 1 10); do
             curl -sf "http://localhost:${PORT}/_localstack/health" && break
             sleep 2
