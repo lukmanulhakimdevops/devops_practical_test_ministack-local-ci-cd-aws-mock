@@ -259,9 +259,9 @@ jobs:
               random = { source = "hashicorp/random", version = "~> 3.0" }
             }
           }
-          variable "ministack_endpoint" { default = "http://localhost:PORT_PLACEHOLDER" }
+          variable "ministack_endpoint" { default = "http://localhost:PLACEHOLDER_PORT" }
           variable "environment" { default = "staging" }
-          variable "aws_region" { default = "REGION_PLACEHOLDER" }
+          variable "aws_region" { default = "PLACEHOLDER_REGION" }
           provider "aws" {
             region = var.aws_region
             access_key = "test"
@@ -295,9 +295,9 @@ jobs:
             engine_version = "8.0"
             instance_class = "db.t3.micro"
             allocated_storage = 20
-            db_name = "DBNAME_PLACEHOLDER"
-            username = "DBUSER_PLACEHOLDER"
-            password = "DBPASS_PLACEHOLDER"
+            db_name = "PLACEHOLDER_DB"
+            username = "PLACEHOLDER_USER"
+            password = "PLACEHOLDER_PASS"
             port = 3306
             skip_final_snapshot = true
             apply_immediately = true
@@ -306,13 +306,22 @@ jobs:
           output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           TFEOF
-          sed -i "s/PORT_PLACEHOLDER/${{ needs.dr-check.outputs.ministack_port }}/g" terraform/main.tf
-          sed -i "s/REGION_PLACEHOLDER/${{ needs.dr-check.outputs.active_region }}/g" terraform/main.tf
-          sed -i "s/DBNAME_PLACEHOLDER/${{ env.DB_NAME }}/g" terraform/main.tf
-          sed -i "s/DBUSER_PLACEHOLDER/${{ env.DB_USER }}/g" terraform/main.tf
-          sed -i "s/DBPASS_PLACEHOLDER/${{ env.DB_PASSWORD }}/g" terraform/main.tf
+          sed -i "s/PLACEHOLDER_PORT/${{ needs.dr-check.outputs.ministack_port }}/g" terraform/main.tf
+          sed -i "s/PLACEHOLDER_REGION/${{ needs.dr-check.outputs.active_region }}/g" terraform/main.tf
+          sed -i "s/PLACEHOLDER_DB/${{ env.DB_NAME }}/g" terraform/main.tf
+          sed -i "s/PLACEHOLDER_USER/${{ env.DB_USER }}/g" terraform/main.tf
+          sed -i "s/PLACEHOLDER_PASS/${{ env.DB_PASSWORD }}/g" terraform/main.tf
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
-            sed -i '/required_providers/i\    backend "s3" {\n      bucket = "${{ env.TF_STATE_BUCKET }}"\n      key = "${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || '\''staging'\'' }}/terraform.tfstate"\n      region = "us-east-1"\n      encrypt = true\n    }' terraform/main.tf
+            cat > terraform/backend.tf <<EOF
+            terraform {
+              backend "s3" {
+                bucket  = "${{ env.TF_STATE_BUCKET }}"
+                key     = "${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || 'staging' }}/terraform.tfstate"
+                region  = "us-east-1"
+                encrypt = true
+              }
+            }
+            EOF
           fi
       - name: 🗃️ Init & Apply Terraform
         id: tf
@@ -358,15 +367,7 @@ jobs:
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQLEOF'
-          CREATE TABLE IF NOT EXISTS TodoItems (
-            Id INT PRIMARY KEY AUTO_INCREMENT,
-            Name VARCHAR(255) NULL,
-            IsComplete TINYINT(1) NOT NULL DEFAULT 0,
-            CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          SQLEOF
+          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" -e "CREATE TABLE IF NOT EXISTS TodoItems (Id INT PRIMARY KEY AUTO_INCREMENT, Name VARCHAR(255) NULL, IsComplete TINYINT(1) NOT NULL DEFAULT 0, CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
           echo "✅ Database schema initialized."
 
   # ==========================================
@@ -449,13 +450,13 @@ jobs:
           fi
 
   # ==========================================
-  # [CLEANUP] YAML-SAFE VERSION
+  # [CLEANUP] YAML-SAFE & QUOTED
   # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, traffic, dast]
-    if: always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
+    if: "always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')"
     steps:
       - name: 🗑️ Cleanup Resources
         env:
@@ -470,24 +471,26 @@ jobs:
           echo "🧹 Cleaning up $ACTIVE_REGION resources..."
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           ENDPOINT="http://localhost:$MINISTACK_PORT"
-          AWS_CMD="docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli"
           
           echo "🗑️ Cleaning EC2..."
-          $AWS_CMD ec2 describe-instances --filters "Name=tag:Region,Values=$ACTIVE_REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r ID; do
-            [ -n "$ID" ] && [ "$ID" != "None" ] && $AWS_CMD ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT" || true
+          INSTANCES=$(aws ec2 describe-instances --filters "Name=tag:Region,Values=$ACTIVE_REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url "$ENDPOINT" 2>/dev/null || true)
+          for ID in $INSTANCES; do
+            [ -n "$ID" ] && [ "$ID" != "None" ] && aws ec2 terminate-instances --instance-ids "$ID" --endpoint-url "$ENDPOINT" || true
           done
           
           echo "🗑️ Cleaning S3..."
-          $AWS_CMD s3api list-buckets --query "Buckets[?contains(Name,'$ACTIVE_REGION')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r BUCKET; do
+          BUCKETS=$(aws s3api list-buckets --query "Buckets[?contains(Name,'$ACTIVE_REGION')].Name" --output text --endpoint-url "$ENDPOINT" 2>/dev/null || true)
+          for BUCKET in $BUCKETS; do
             if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
-              $AWS_CMD s3 rm "s3://$BUCKET" --recursive --endpoint-url "$ENDPOINT" || true
-              $AWS_CMD s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT" || true
+              aws s3 rm "s3://$BUCKET" --recursive --endpoint-url "$ENDPOINT" || true
+              aws s3 rb "s3://$BUCKET" --force --endpoint-url "$ENDPOINT" || true
             fi
           done
           
           echo "🗑️ Cleaning RDS..."
-          $AWS_CMD rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url "$ENDPOINT" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | while read -r DBID; do
-            [ -n "$DBID" ] && [ "$DBID" != "None" ] && $AWS_CMD rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url "$ENDPOINT" || true
+          DBS=$(aws rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url "$ENDPOINT" 2>/dev/null || true)
+          for DBID in $DBS; do
+            [ -n "$DBID" ] && [ "$DBID" != "None" ] && aws rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url "$ENDPOINT" || true
           done
           echo "✅ Cleanup complete."
 
@@ -519,4 +522,7 @@ jobs:
           echo "  DAST: ${{ needs.dast.result }}"
           echo "  Status: $STATUS"
           echo "================================"
-          [ "$IS_DEV" == "✅ YES (Persistent)" ] && echo "💡 Environment persistent for dev iterations." && echo "🌐 Access: http://localhost:${{ env.HOST_PORT }}"
+          if [ "$IS_DEV" == "✅ YES (Persistent)" ]; then
+            echo "💡 Environment persistent for dev iterations."
+            echo "🌐 Access: http://localhost:${{ env.HOST_PORT }}"
+          fi
