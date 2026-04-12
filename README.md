@@ -5,38 +5,35 @@
 [![Deployment: Docker](https://img.shields.io/badge/Deployment-Docker-blue)](#)
 [![Mock AWS: Ministack](https://img.shields.io/badge/Mock_AWS-Ministack-orange)](#)
 
-Proyek ini merupakan implementasi **DevSecOps CI/CD** tingkat lanjut yang mensimulasikan *deployment* aplikasi .NET ke lingkungan **AWS Mock** menggunakan **Ministack**, lengkap dengan *provisioning* infrastruktur (EC2, RDS, S3) melalui **Terraform**. Pipeline menerapkan 5 lapisan pertahanan keamanan (*Shift-Left Security*) sebelum aplikasi akhirnya berjalan sebagai kontainer di dalam *self-hosted runner* (laptop/server lokal) yang berperan sebagai **EC2 Mock Instance**.
+Proyek ini merupakan **Cetak Biru (Blueprint) Arsitektur DevSecOps Tingkat Enterprise**. 
+
+Pipeline ini mendemonstrasikan orkestrasi *deployment* aplikasi .NET ke dalam ekosistem **AWS Mock (Ministack)**. Menggunakan **Terraform** untuk otomatisasi *provisioning* (EC2, RDS, S3) dan menerapkan standar **5-Layer Shift-Left Security**. Setiap integrasi kode harus melewati validasi keamanan yang ketat sebelum diizinkan untuk di-*deploy* ke *self-hosted runner* (lingkungan lokal) yang disimulasikan sebagai **EC2 Mock Instance**.
 
 ---
 
 ## 📌 Daftar Isi
 
-- [Tentang Proyek](#tentang-proyek)
+- [Ringkasan Eksekutif](#ringkasan-eksekutif)
 - [Arsitektur DevSecOps 5-Layer](#arsitektur-devsecops-5-layer)
-- [Teknologi yang Digunakan](#teknologi-yang-digunakan)
-- [Prasyarat](#prasyarat)
-- [Cara Menggunakan](#cara-menggunakan)
-- [Penjelasan Workflow (Jobs)](#penjelasan-workflow-jobs)
+- [Stack Teknologi](#stack-teknologi)
+- [Prasyarat Sistem](#prasyarat-sistem)
+- [Panduan Eksekusi](#panduan-eksekusi)
+- [Rincian Workflow (Jobs)](#rincian-workflow-jobs)
 - [Struktur Repositori](#struktur-repositori)
-- [Kontribusi & Lisensi](#kontribusi--lisensi)
 
 ---
 
-## Tentang Proyek
+## Ringkasan Eksekutif
 
-**Enterprise DevSecOps Pipeline** ini dirancang untuk menunjukkan praktik terbaik dalam mengamankan *software supply chain* menggunakan **GitHub Actions**. Selain melakukan *build* dan *deploy*, pipeline ini mengintegrasikan:
+Arsitektur ini dirancang untuk memastikan *software supply chain* yang sangat aman dan resilien melalui kapabilitas **GitHub Actions**:
 
-- **Pembuatan Infrastruktur Mock**: Terraform membuat EC2, RDS, dan S3 di **Ministack** (AWS API Mock).
-- **EC2 Mock Container**: Sebuah kontainer Docker bertindak sebagai "EC2 Instance" yang menjalankan aplikasi .NET di dalamnya, memberikan ilusi deployment ke VM sungguhan.
-- **5 Lapisan Keamanan** yang dijalankan secara berurutan, di mana kegagalan di satu lapisan akan menghentikan proses deployment.
-
-Proyek ini cocok untuk keperluan **edukasi, demonstrasi, dan pengujian** pipeline DevSecOps tanpa harus mengeluarkan biaya infrastruktur cloud sungguhan.
+- **Infrastructure as Code (IaC):** Terraform digunakan untuk menginisiasi topologi infrastruktur (EC2, RDS, S3) langsung ke **Ministack** (layanan AWS API Mock).
+- **Simulasi EC2:** Aplikasi .NET tidak berjalan secara *bare-metal*, melainkan diisolasi di dalam kontainer Docker khusus yang bertindak sebagai "EC2 Instance" (*Docker-in-Docker*).
+- **Security Gates:** 5 lapisan keamanan berjalan secara sekuensial. Jika terdapat temuan dengan tingkat severity *HIGH* atau *CRITICAL*, seluruh proses *deployment* akan dihentikan secara otomatis (*fail-fast*).
 
 ---
 
 ## Arsitektur DevSecOps 5-Layer
-
-Berikut diagram alir pipeline yang menunjukkan tahapan keamanan dan deployment:
 
 ```mermaid
 flowchart LR
@@ -66,74 +63,71 @@ flowchart LR
     style K fill:#28a745,color:#fff
 ```
 
-### 🧱 Penjelasan 5 Lapisan Keamanan
+### 🧱 5 Security Gates (Lapisan Keamanan)
 
-| Lapisan | Nama | Tools | Keterangan |
-|--------|------|-------|------------|
-| **1** | **Secret Scanning** | Gitleaks | Mencegah *hardcoded secrets* masuk ke repositori. |
-| **2** | **SAST** | CodeQL | Analisis kode statis untuk mencari kerentanan (CWE) di kode C#. |
-| **3** | **SCA** | `dotnet list package` & OWASP DC | Mendeteksi kerentanan di *third-party libraries* (NuGet). |
-| **4** | **Container Scan** | Trivy | Memindai *Docker Image* dari kerentanan OS dan *application dependencies*. Pipeline akan **gagal** jika ditemukan isu **CRITICAL** atau **HIGH**. |
-| **5** | **DAST** | OWASP ZAP | Menyerang aplikasi yang sedang berjalan (*running container*) untuk menemukan celah keamanan dinamis (XSS, SQLi, misconfigurations). |
+| Tahap | Tools | Deskripsi Fungsional |
+|--------|------|------------|
+| **1: Secret Scan** | Gitleaks | Memblokir kebocoran *hardcoded password*, token, atau API Keys pada riwayat *commit*. |
+| **2: SAST** | CodeQL | Melakukan analisis statis pada source code C# untuk mengidentifikasi kerentanan logika (CWE). |
+| **3: SCA** | `dotnet list` & CycloneDX | Mengaudit dependensi pihak ketiga (NuGet) dari kerentanan publik dan menghasilkan dokumen SBOM. |
+| **4: Container Scan**| Trivy | Memindai *Docker Image* (berbasis Alpine). Menghentikan pipeline jika terdeteksi kerentanan **CRITICAL/HIGH**. |
+| **5: DAST** | OWASP ZAP | Melakukan pemindaian dinamis terhadap aplikasi yang sedang berjalan untuk mengidentifikasi celah seperti XSS atau SQLi. |
 
 ---
 
-## Teknologi yang Digunakan
+## Stack Teknologi
 
-| Komponen            | Teknologi / Tools                                      |
+| Komponen Arsitektur | Teknologi yang Digunakan |
 | ------------------- | ------------------------------------------------------ |
-| CI/CD               | GitHub Actions                                         |
-| Bahasa & Framework  | .NET 8 (C#), ASP.NET Core Web API                      |
-| SAST                | CodeQL, Gitleaks                                       |
-| SCA                 | OWASP Dependency Check, CycloneDX (SBOM)               |
-| Container Scanner   | AquaSecurity Trivy                                     |
-| DAST Scanner        | OWASP ZAP (Zed Attack Proxy)                           |
-| Infrastruktur Mock  | Ministack (AWS API Mock)                               |
-| Provisioning        | Terraform                                              |
-| Containerization    | Docker, Docker-in-Docker (DinD), Alpine Linux          |
-| Runner              | GitHub-Hosted (`ubuntu-latest`) + Self-Hosted (Linux x64) |
+| **Orkestrasi CI/CD** | GitHub Actions                                         |
+| **Aplikasi Utama** | .NET 8 (C#), ASP.NET Core Web API                      |
+| **Static Security (SAST/SCA)**| CodeQL, Gitleaks, OWASP Dependency Check, CycloneDX    |
+| **Dynamic Security (DAST)**| AquaSecurity Trivy, OWASP ZAP (Zed Attack Proxy)       |
+| **Target Environment** | Ministack (Local AWS API Mock)                         |
+| **IaC Automation** | HashiCorp Terraform                                    |
+| **Containerization**| Docker, Docker-in-Docker (DinD), Alpine Linux          |
+| **Runners** | GitHub-Hosted (`ubuntu-latest`) & Self-Hosted (Linux)  |
 
 ---
 
-## Prasyarat
+## Prasyarat Sistem
 
-### Untuk Self-Hosted Runner (Laptop/Server)
+### Persiapan Self-Hosted Runner
 
-Pastikan mesin yang menjadi *self-hosted runner* memenuhi syarat berikut:
+Mesin target (Server/Laptop lokal) wajib memenuhi spesifikasi berikut:
 
-1. **GitHub Actions Runner** terdaftar dengan label `self-hosted, linux, x64`.
-2. **Docker Engine** terinstal dan user yang menjalankan runner memiliki akses ke *Docker daemon* (tanpa `sudo`).
-3. **Ministack** berjalan sebagai kontainer Docker dengan port `4566` terbuka.
+1. **GitHub Actions Runner** aktif dengan label lingkungan: `self-hosted, linux, x64`.
+2. **Docker Engine** beroperasi penuh dan *user* yang menjalankan runner memiliki hak akses *daemon* (tanpa `sudo`).
+3. **Ministack** beroperasi pada *port* `4566`:
    ```bash
    docker run -d --name ministack -p 4566:4566 nahuelnucera/ministack:latest
    ```
-4. **AWS CLI** (opsional, untuk verifikasi; Terraform akan menggunakannya secara internal).
 
-### Secret GitHub yang Harus Diatur
+### Konfigurasi GitHub Secrets
 
-Tambahkan secret berikut di **Settings → Secrets and variables → Actions**:
+Tambahkan variabel berikut pada menu **Settings → Secrets and variables → Actions**:
 
-| Secret Name              | Contoh Nilai                | Deskripsi                                   |
+| Nama Secret | Contoh Nilai | Deskripsi Fungsional |
 | ------------------------ | --------------------------- | ------------------------------------------- |
-| `AWS_ACCESS_KEY_ID`      | `dummy`                     | Kunci akses AWS untuk Ministack             |
-| `AWS_SECRET_ACCESS_KEY`  | `dummy`                     | Kunci rahasia AWS untuk Ministack           |
-| `DB_USER`                | `tempAdmin`                 | Username untuk RDS mock                     |
-| `DB_PASSWORD`            | `!tempAdmin954*`            | Password untuk RDS mock                     |
-| `LOCALSTACK_ENDPOINT`    | `http://localhost:4566`     | Endpoint Ministack (default)                |
+| `AWS_ACCESS_KEY_ID`      | `dummy`                     | Kredensial akses untuk Ministack |
+| `AWS_SECRET_ACCESS_KEY`  | `dummy`                     | Kredensial rahasia untuk Ministack |
+| `DB_USER`                | `tempAdmin`                 | Username untuk autentikasi RDS Mock |
+| `DB_PASSWORD`            | `!tempAdmin954*`            | Password untuk autentikasi RDS Mock |
+| `LOCALSTACK_ENDPOINT`    | `http://localhost:4566`     | URL Endpoint untuk integrasi Ministack |
 
-> **Catatan**: Secret `S3_BUCKET`, `EC2_HOST`, `RDS_ENDPOINT` tidak diperlukan secara langsung karena nilainya dihasilkan oleh Terraform.
+*(Catatan: Variabel `S3_BUCKET`, `EC2_HOST`, dan `RDS_ENDPOINT` akan dihasilkan dan dikelola secara dinamis oleh Terraform selama runtime).*
 
 ---
 
-## Cara Menggunakan
+## Panduan Eksekusi
 
-### 1. Clone Repositori
+### 1. Kloning Repositori
 ```bash
 git clone git@github.com:lukmanulhakimdevops/devops_practical_test_ministack-local-ci-cd-aws-mock.git
 cd devops_practical_test_ministack-local-ci-cd-aws-mock
 ```
 
-### 2. Setup Secret dengan GitHub CLI
+### 2. Setup Kredensial via GitHub CLI
 ```bash
 gh auth login
 
@@ -144,67 +138,51 @@ gh secret set DB_PASSWORD           --body "!tempAdmin954*"
 gh secret set LOCALSTACK_ENDPOINT   --body "http://localhost:4566"
 ```
 
-### 3. Jalankan Self-Hosted Runner
-Ikuti instruksi dari GitHub (**Settings → Actions → Runners → New self-hosted runner**) untuk mendaftarkan runner di laptop Anda. Pastikan runner memiliki label `self-hosted, linux, x64`.
-
-### 4. Trigger Pipeline
-
-- **Otomatis**: Setiap *push* ke branch `main` atau `develop` pada path `TodoWebAPI/**`.
-- **Manual**: Buka tab **Actions** → pilih workflow **Enterprise DevSecOps Pipeline** → **Run workflow** → pilih *environment* (`staging` atau `production`).
+### 3. Menjalankan Pipeline
+- **Trigger Otomatis:** Pipeline dipicu secara otomatis setiap terdapat aktivitas *Push/Merge* ke branch `main` atau `develop`.
+- **Eksekusi Manual:** Navigasi ke tab **Actions** → pilih **Enterprise DevSecOps Pipeline** → klik **Run workflow** → Tentukan *environment* target (`staging` atau `production`).
 
 ---
 
-## Penjelasan Workflow (Jobs)
+## Rincian Workflow (Jobs)
 
-Workflow ini dibagi menjadi beberapa job yang saling bergantung:
-
-| Job | Runner | Deskripsi Singkat |
+| Job | Runner | Deskripsi Tugas |
 |-----|--------|-------------------|
-| `lint` | `ubuntu-latest` | Memformat kode C# dan otomatis commit jika ada perubahan. |
-| `sast` | `ubuntu-latest` | Menjalankan Gitleaks dan CodeQL untuk analisis keamanan statis. |
-| `sca` | `ubuntu-latest` | Memindai dependensi rentan dan menghasilkan SBOM. |
-| `build` | `ubuntu-latest` | Melakukan *build*, *unit test*, dan mempublikasikan *artifact* `.zip`. |
-| `container` | `ubuntu-latest` | Membangun *Docker image*, memindai dengan Trivy, dan menghasilkan SBOM kontainer. |
-| `infra` | `self-hosted` | Membuat infrastruktur mock (EC2, RDS, S3) di Ministack menggunakan Terraform. |
-| `deploy-staging` | `self-hosted` | Menjalankan kontainer **EC2 Mock**, men-deploy aplikasi .NET di dalamnya, dan melakukan *DAST scan* dengan OWASP ZAP. |
-| `deploy-prod` | `self-hosted` | Sama seperti staging, tetapi menggunakan port berbeda dan **memerlukan approval manual** (via Environment Protection Rules). |
-| `notify` | `ubuntu-latest` | Memberikan ringkasan status deployment (dapat diperluas ke Slack). |
-
-### Detail Penting Job `deploy-*`
-
-1. **EC2 Mock Container**: Kontainer `alpine` yang menjalankan *Docker daemon* di dalamnya (DinD). Aplikasi `todo-webapi` dijalankan di dalam kontainer ini sehingga seolah-olah berjalan di EC2 instance.
-2. **DAST Scan**: OWASP ZAP dijalankan dengan perintah `zap-baseline.py -t http://localhost:8080 -l FAIL`. Jika ditemukan kerentanan level `FAIL`, pipeline akan gagal dan aplikasi dihentikan.
+| `lint` | `ubuntu-latest` | Memvalidasi standar format kode C#. |
+| `sast` | `ubuntu-latest` | Memindai *hardcoded secrets* (Gitleaks) dan kerentanan source code (CodeQL). |
+| `sca` | `ubuntu-latest` | Mengaudit dependensi eksternal dan menghasilkan SBOM (Software Bill of Materials). |
+| `build` | `ubuntu-latest` | Mengkompilasi aplikasi .NET menjadi *artifact* siap *deploy* (`.zip`). |
+| `container` | `ubuntu-latest` | Membangun *Docker Image* dan menjalankan inspeksi kerentanan dengan Trivy. |
+| `infra` | `self-hosted` | Mengeksekusi Terraform untuk mem-*provisioning* EC2, RDS, dan S3 di Ministack. |
+| `deploy-staging` | `self-hosted` | Menjalankan *container* simulasi EC2, menginstal aplikasi, dan menjalankan verifikasi DAST. |
+| `deploy-prod` | `self-hosted` | Proses identik dengan *staging*, namun dilindungi oleh **Manual Approval Gate**. |
+| `notify` | `ubuntu-latest` | Mengirimkan telemetri dan ringkasan status operasi pipeline (dapat diintegrasikan ke Slack/Email). |
 
 ---
 
 ## Struktur Repositori
 
-```
+```text
 .
 ├── .github/
 │   └── workflows/
-│       └── dotnet.yml                # Workflow utama
-├── TodoWebAPI/                       # Kode sumber aplikasi .NET
+│       └── dotnet.yml                # Konfigurasi utama CI/CD Pipeline
+├── TodoWebAPI/                       # Source code aplikasi .NET Core
 │   ├── Controllers/
 │   ├── Data/
 │   ├── Models/
 │   ├── Program.cs
 │   └── TodoWebAPI.csproj
-├── terraform/                        # (Opsional, jika tidak digenerate otomatis)
-│   ├── main.tf
-│   ├── variables.tf
-│   └── outputs.tf
-├── ec2-mock.Dockerfile               # (Digenerate otomatis oleh workflow)
-├── ec2-mock-entrypoint.sh            # (Digenerate otomatis oleh workflow)
+├── terraform/                        # Blueprint IaC (Dibuat secara dinamis jika tidak ada)
+├── ec2-mock.Dockerfile               # (Digenerate otomatis oleh pipeline)
+├── ec2-mock-entrypoint.sh            # (Digenerate otomatis oleh pipeline)
 └── README.md
 ```
-
-> **Catatan**: File Terraform dan Dockerfile untuk EC2 Mock **dibuat secara dinamis** oleh workflow, sehingga Anda tidak perlu menyediakannya secara manual.
 
 ---
 
 ## Kontribusi & Lisensi
 
-Proyek ini terbuka untuk kontribusi dalam bentuk *Pull Request*. Silakan buat *issue* terlebih dahulu untuk mendiskusikan perubahan besar.
+Proyek ini dibangun berdasarkan prinsip arsitektur terbuka. Kontribusi melalui *Pull Request* sangat dipersilakan. Untuk perubahan yang signifikan, harap membuka *Issue* terlebih dahulu untuk tahap diskusi arsitektural.
 
-Didistribusikan di bawah lisensi **MIT License**. Lihat file [LICENSE](LICENSE) untuk informasi lebih lanjut.
+Didistribusikan di bawah lisensi **MIT License**. Silakan lihat file [LICENSE](LICENSE) untuk informasi lebih detail.
