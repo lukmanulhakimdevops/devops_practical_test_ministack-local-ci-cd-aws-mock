@@ -1,4 +1,5 @@
 name: 🛡️ Enterprise DevSecOps CI/CD (DR & Audit-Proof)
+
 on:
   push:
     branches: [main, develop]
@@ -51,7 +52,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # [PARALLEL TRACK 1] ROUTING & DR LOGIC
+  # [ROUTING & DR DECISION]
   # ==========================================
   dr-check:
     name: 🧠 DR Decision
@@ -72,7 +73,7 @@ jobs:
           CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
           BRANCH="${{ github.ref_name }}"
 
-          # Tentukan cleanup: hanya jika input true atau branch bukan main/develop
+          # Cleanup hanya jika diminta atau branch bukan main/develop (untuk primary)
           SHOULD_CLEANUP="false"
           if [ "$CLEANUP_INPUT" == "true" ]; then
             SHOULD_CLEANUP="true"
@@ -101,12 +102,13 @@ jobs:
           echo "failover=$FAIL" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [PARALLEL TRACK 2] SECURITY SAST
+  # [DEV SECURITY JOBS] – ONLY ON PRIMARY
   # ==========================================
   sast:
     name: 🔐 SAST & Secrets
     runs-on: ubuntu-latest
     if: needs.dr-check.outputs.is_dr == 'false'
+    needs: dr-check
     permissions:
       security-events: write
       contents: read
@@ -131,13 +133,11 @@ jobs:
       - name: 🧬 Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  # ==========================================
-  # [PARALLEL TRACK 3] SECURITY SCA
-  # ==========================================
   sca:
     name: 📦 SCA & SBOM
     runs-on: ubuntu-latest
     if: needs.dr-check.outputs.is_dr == 'false'
+    needs: dr-check
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Setup .NET
@@ -160,13 +160,11 @@ jobs:
           path: TodoWebAPI/sbom.xml
           retention-days: 7
 
-  # ==========================================
-  # [PARALLEL TRACK 4] BUILD APPLICATION
-  # ==========================================
   build:
     name: 🔨 Build Application
     runs-on: ubuntu-latest
     if: needs.dr-check.outputs.is_dr == 'false'
+    needs: dr-check
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Setup .NET
@@ -190,13 +188,10 @@ jobs:
           path: publish_output/
           retention-days: 1
 
-  # ==========================================
-  # [SUB-TRACK 4.1] CONTAINER BUILD
-  # ==========================================
   container:
     name: 🐳 Container Build & Scan
     runs-on: ubuntu-latest
-    needs: build
+    needs: [dr-check, build]
     if: needs.dr-check.outputs.is_dr == 'false'
     steps:
       - uses: actions/checkout@v4
@@ -252,7 +247,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # [PARALLEL TRACK 5] PROVISION INFRASTRUCTURE
+  # [INFRASTRUCTURE PROVISIONING] – BOTH ENVS
   # ==========================================
   infra:
     name: 🏗️ Provision Infrastructure
@@ -459,19 +454,17 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [SUB-TRACK 5.1] RDS HEALTHCHECK & DB INIT
+  # [RDS HEALTHCHECK & DB INIT] – BOTH ENVS
   # ==========================================
   db-init:
     name: 🗂️ RDS Healthcheck & DB Init
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     steps:
-      # ---------- Helper function to parse RDS endpoint ----------
       - name: Parse RDS Endpoint
         id: parse
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          # Pisahkan host dan port. Jika tidak ada ":", gunakan port default 3306.
           if [[ "$RDS_ENDPOINT" == *":"* ]]; then
             RDS_HOST="${RDS_ENDPOINT%:*}"
             RDS_PORT="${RDS_ENDPOINT##*:}"
@@ -479,13 +472,11 @@ jobs:
             RDS_HOST="$RDS_ENDPOINT"
             RDS_PORT="3306"
           fi
-          # localhost -> 127.0.0.1 untuk koneksi Docker host
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
           echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
-          echo "RDS_HOST=$RDS_HOST, RDS_PORT=$RDS_PORT"
+          echo "RDS endpoint parsed: $RDS_HOST:$RDS_PORT"
 
-      # ---------- GitHub-hosted: restart Ministack if needed ----------
       - name: '🏥 [GitHub] Ensure Ministack & RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -525,7 +516,6 @@ jobs:
                 --no-deletion-protection \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
-            # Update RDS_HOST dan RDS_PORT setelah provisioning ulang
             RDS_ENDPOINT=$(docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
               -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -561,7 +551,6 @@ jobs:
           echo "❌ CRITICAL: RDS Healthcheck FAILED"
           exit 1
 
-      # ---------- Self-hosted: just health check ----------
       - name: '🏥 [Laptop] RDS Health Check'
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
@@ -576,7 +565,6 @@ jobs:
             sleep 2
           done
 
-      # ---------- Common: Schema init ----------
       - name: '🗂️ Database Schema Initialization'
         run: |
           docker run -i --rm --network host mysql:8.0 \
@@ -593,7 +581,7 @@ jobs:
           echo "✅ Database schema initialized in ${{ needs.dr-check.outputs.active_region }}"
 
   # ==========================================
-  # [CONVERGENCE GATE] DEPLOYMENT
+  # [DEPLOYMENT] – BOTH ENVS (WAJIB ARTIFACT)
   # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
@@ -616,7 +604,6 @@ jobs:
           docker load < ${{ env.APP_NAME }}-image.tar.gz
           echo "✅ Golden Image Loaded."
 
-      # ---------- Parse RDS endpoint again (ensure env vars) ----------
       - name: Parse RDS Endpoint
         id: parse
         run: |
@@ -632,7 +619,6 @@ jobs:
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
           echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
 
-      # ---------- GitHub-hosted: Ensure Ministack + RDS ----------
       - name: '🐳 [GitHub] Ensure Ministack + RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -739,7 +725,7 @@ jobs:
           exit 1
 
   # ==========================================
-  # [POST-DEPLOY] DAST SCAN (Only on GitHub)
+  # [DAST SCAN] – ONLY PRIMARY
   # ==========================================
   dast:
     name: 🕷️ DAST Scan
@@ -867,7 +853,7 @@ jobs:
           docker rm -f ministack 2>/dev/null || true
 
   # ==========================================
-  # [POST-DEPLOY] ROUTING NOTIFICATION
+  # [TRAFFIC STATUS]
   # ==========================================
   traffic:
     name: 🌐 Traffic Status
@@ -891,7 +877,7 @@ jobs:
           fi
 
   # ==========================================
-  # [OPTIONAL CLEANUP] Hanya jika diminta
+  # [OPTIONAL CLEANUP] – HANYA PRIMARY & DIMINTA
   # ==========================================
   cleanup:
     name: 🧹 Cleanup (Ephemeral)
@@ -944,7 +930,7 @@ jobs:
           echo "✅ Cleanup complete."
 
   # ==========================================
-  # [FINAL] SUMMARY REPORT
+  # [FINAL SUMMARY]
   # ==========================================
   notify:
     name: 📢 Pipeline Summary
