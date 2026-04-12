@@ -226,7 +226,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # [PARALLEL TRACK 5] MOCK INFRASTRUCTURE (MINISTACK NATIVE RDS)
+  # [PARALLEL TRACK 5] MOCK INFRASTRUCTURE
   # ==========================================
   infra:
     name: 🏗️ Mock Infrastructure (Native Ministack)
@@ -332,7 +332,6 @@ jobs:
             publicly_accessible = true
           }
           
-          # Output format endpoint sesuai standar AWS RDS (hostname:port)
           output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           EOF
@@ -353,48 +352,50 @@ jobs:
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [SUB-TRACK 5.1] DB INITIALIZATION
+  # [SUB-TRACK 5.1] THE IRON GATE: RDS HEALTHCHECK & INIT
   # ==========================================
   db-init:
-    name: 🗂️ Initialize DB Tables
+    name: 🗂️ RDS Healthcheck & DB Init
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, infra]
     steps:
-      - name: ⏳ Wait for Ministack RDS Connection
+      - name: 🏥 PHASE 1: RDS Engine Health Check (The Gatekeeper)
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           
-          # [CRITICAL PATCH] Memaksa penggunaan TCP/IP dengan mengubah localhost menjadi 127.0.0.1
+          # Paksa TCP/IP
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
           
-          echo "⏳ Menunggu MySQL dari Ministack RDS di endpoint TCP $RDS_HOST:$RDS_PORT..."
+          echo "🏥 Memulai Healthcheck Ping ke TCP $RDS_HOST:$RDS_PORT..."
           SUCCESS="false"
-          for i in $(seq 1 30); do
-            # Menggunakan container sementara sebagai client
+          
+          # Looping 60x (5 Menit) untuk memastikan Engine MySQL 8.0 benar-benar siap dari Cold-Start
+          for i in $(seq 1 60); do
             if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
-              echo "✅ Ministack RDS MySQL siap menerima koneksi TCP."
+              echo "✅ HEALTHCHECK PASS: MySQL Engine sudah UP dan merespons TCP Ping."
               SUCCESS="true"
               break
             fi
-            sleep 3
+            echo "⏱️ Menunggu Engine MySQL 8.0 menyelesaikan inisialisasi... ($i/60)"
+            sleep 5
           done
           
           if [ "$SUCCESS" = "false" ]; then
-             echo "❌ CRITICAL: Timeout menunggu database Ministack RDS."
+             echo "❌ CRITICAL: RDS Healthcheck GAGAL (Timeout). Engine tidak merespons."
              exit 1
           fi
 
-      - name: 🗂️ Create tables
+      - name: 🗂️ PHASE 2: Database Schema Initialization (DDL)
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           
-          # [CRITICAL PATCH] Memaksa penggunaan TCP/IP
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
           
+          echo "🗂️ Mengeksekusi Injeksi Skema Database..."
           docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" <<'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
@@ -404,7 +405,7 @@ jobs:
             UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
-          echo "✅ Tabel berhasil dibuat di dalam RDS instance milik Ministack."
+          echo "✅ FASE 2 SELESAI: Tabel berhasil dibuat."
 
   # ==========================================
   # [CONVERGENCE GATE] DEPLOYMENT
@@ -440,18 +441,19 @@ jobs:
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
             ${APP_NAME}:latest
             
-      - name: 🔍 WAJIB Health Check (Region-Aware)
+      - name: 🔍 WAJIB Health Check Aplikasi (Region-Aware)
         run: |
-          echo "⏳ Polling health endpoint in ${{ needs.dr-check.outputs.active_region }}..."
+          echo "⏳ Polling Application Health Endpoint in ${{ needs.dr-check.outputs.active_region }}..."
           HEALTH_URL="http://localhost:${CONTAINER_PORT}/swagger/v1/swagger.json"
-          for i in $(seq 1 12); do
+          
+          for i in $(seq 1 20); do
             if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
-              echo "✅ HEALTH CHECK PASSED in ${{ needs.dr-check.outputs.active_region }}"
+              echo "✅ HEALTH CHECK PASSED: Web App API merespons dengan baik."
               exit 0
             fi
             sleep 5
           done
-          echo "❌ HEALTH CHECK FAILED!"
+          echo "❌ HEALTH CHECK FAILED: Web App gagal merespons!"
           docker logs ${CONTAINER_NAME}
           exit 1
 
@@ -529,7 +531,7 @@ jobs:
             [ -n "$BUCKET" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli s3 rb "s3://$BUCKET" --force --endpoint-url http://localhost:${MINISTACK_PORT} || true
           done
           
-          # Hapus RDS (Menggunakan API Ministack yang akan otomatis membunuh container fisiknya)
+          # Hapus RDS
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
             amazon/aws-cli rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read DBID; do
@@ -558,7 +560,8 @@ jobs:
           echo "================================"
           echo "  Region Active   : $REGION"
           echo "  DR Failover     : $FAILOVER"
-          echo "  Health Check    : ✅ PASSED (Wajib)"
+          echo "  RDS Health Check: ✅ PASSED"
+          echo "  App Health Check: ✅ PASSED"
           echo "  DAST Scan       : ${{ needs.dast.result }}"
           echo "  Status          : $STATUS"
           echo "================================"
