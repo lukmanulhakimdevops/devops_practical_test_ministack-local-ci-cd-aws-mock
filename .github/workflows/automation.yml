@@ -455,7 +455,7 @@ jobs:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, traffic, dast]
-    if: always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
+    if: "always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')"
     steps:
       - name: 🗑️ Cleanup Resources
         env:
