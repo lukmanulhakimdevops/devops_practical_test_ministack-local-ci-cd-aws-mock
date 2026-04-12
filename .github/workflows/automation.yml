@@ -1,4 +1,5 @@
 name: 🛡️ Enterprise DevSecOps CI/CD (DR & Audit-Proof)
+
 on:
   push:
     branches: [main, develop]
@@ -31,9 +32,6 @@ env:
   DOTNET_VERSION: '8.0.x'
   APP_NAME: todo-webapi
   CONTAINER_NAME: todo-webapi
-  # BUG FIX #1+#2: Hapus CONTAINER_PORT. Dengan --network host,
-  # app langsung listen di HOST_PORT via ASPNETCORE_URLS=http://+:HOST_PORT.
-  # Tidak ada port mapping (-p) → tidak ada perbedaan host/container port.
   HOST_PORT: 8080
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
@@ -49,23 +47,6 @@ permissions:
   security-events: write
   actions: read
   checks: write
-
-# ─────────────────────────────────────────────────────────────────
-# SHARED BASH HELPER — inline di setiap job yang butuh Ministack+RDS
-#
-# ensure_ministack <port> <region>
-#   → Start Ministack jika belum jalan (idempotent)
-#   → Poll sampai s3+ec2+rds = "available" (python3 JSON parse)
-#
-# ensure_rds <port> <region> <env_name>
-#   → Provision RDS instance (ignore already-exists error)
-#   → Poll sampai DBInstanceStatus = "available"
-#   → Export RDS_HOST + RDS_PORT ke $GITHUB_ENV
-#
-# Pola ini diperlukan karena GH-hosted runner = VM baru per job.
-# Container yang dibuat di job A tidak tersedia di job B.
-# Self-hosted (DR mode): Ministack sudah jalan → ensure_ hanya verify.
-# ─────────────────────────────────────────────────────────────────
 
 jobs:
   # ==========================================
@@ -92,7 +73,6 @@ jobs:
           BRANCH="${{ github.ref_name }}"
           ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
 
-          # Cleanup: explicit input, atau branch selain main/develop
           SHOULD_CLEANUP="false"
           if [ "$CLEANUP_INPUT" == "true" ]; then
             SHOULD_CLEANUP="true"
@@ -101,11 +81,8 @@ jobs:
           fi
 
           if [ "$FAIL" == "true" ]; then
-            # BUG FIX: runner JSON string → fromJSON() di runs-on bekerja
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}"      >> $GITHUB_OUTPUT
-            # DR: port 4567 agar tidak bentrok dengan Ministack primary
-            # yang mungkin jalan di laptop pada port 4566
             echo "port=4567"                            >> $GITHUB_OUTPUT
             echo "state_key=ministack/us-east-2/${ENV_NAME}/terraform.tfstate" >> $GITHUB_OUTPUT
             echo "use_s3_backend=false"                 >> $GITHUB_OUTPUT
@@ -234,10 +211,6 @@ jobs:
 
       - name: 🐳 Create hardened Dockerfile
         run: |
-          # BUG FIX #6: EXPOSE 8080 (sesuai HOST_PORT).
-          # BUG FIX #1+#2: App di-run dengan --network host +
-          # ASPNETCORE_URLS=http://+:8080. EXPOSE hanya dokumentasi,
-          # tapi harus konsisten agar tidak membingungkan.
           cat > deploy/Dockerfile << 'DOCKERFILE'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
@@ -267,8 +240,6 @@ jobs:
       - name: 🏗️ Build Docker Image
         run: docker build -t ${{ env.APP_NAME }}:latest ./deploy
 
-      # BUG FIX #5: exit-code '0' → '1' agar pipeline gagal
-      # jika ada vulnerability CRITICAL/HIGH yang bisa di-fix
       - name: 🛡️ Trivy Image Scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -290,7 +261,6 @@ jobs:
 
   # ==========================================
   # DAST — PRIMARY ONLY, PARALLEL DENGAN INFRA
-  # Self-contained: setup Ministack+RDS sendiri
   # ==========================================
   dast:
     name: 🕷️ DAST Scan (Ephemeral Env)
@@ -307,8 +277,6 @@ jobs:
           name: docker-image
           path: .
 
-      # BUG FIX #4+#9: Ministack dengan --network host (konsisten)
-      # dan health check python3 JSON parse per-service
       - name: 🐳 Start Ministack for DAST
         run: |
           docker rm -f ministack 2>/dev/null || true
@@ -367,7 +335,6 @@ jobs:
             sleep 5
           done
 
-          # Parse endpoint — Ministack returns real MySQL container endpoint
           ADDR=$(AWS_RUN rds describe-db-instances \
             --db-instance-identifier "$DB_ID" \
             --query "DBInstances[0].Endpoint.Address" \
@@ -381,7 +348,6 @@ jobs:
           echo "RDS_PORT=$PORT" >> $GITHUB_ENV
           echo "DB_ID=$DB_ID"   >> $GITHUB_ENV
 
-          # Wait for MySQL TCP + init schema
           echo "⏳ Waiting for MySQL to accept queries..."
           for i in $(seq 1 30); do
             docker run --rm --network host mysql:8.0 \
@@ -405,7 +371,6 @@ jobs:
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
 
-      # BUG FIX #1+#2: --network host + ASPNETCORE_URLS + 127.0.0.1 for DB
       - name: 🚀 Run App for DAST
         run: |
           docker load < ${{ env.APP_NAME }}-image.tar.gz
@@ -487,7 +452,6 @@ jobs:
           fi
           terraform version
 
-          # BUG FIX #9: --network host konsisten + BUG FIX #4: python3 JSON parse
           docker rm -f ministack 2>/dev/null || true
           docker run -d --name ministack \
             --network host \
@@ -530,14 +494,11 @@ jobs:
             sleep 2
           done
 
-      # BUG FIX #7: Credentials tidak ditulis ke .tf file.
-      # Menggunakan TF_VAR_ environment variables.
-      # main.tf pakai <<'TFEOF' (single-quote) → HCL ${var.x} aman.
-      # terraform.tfvars pakai <<EOF (double-quote) → GitHub expressions dievaluasi.
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
 
+          # FIX: ingress blocks ditulis dengan benar (tanpa ;)
           cat > terraform/main.tf << 'TFEOF'
           terraform {
             required_providers {
@@ -576,9 +537,24 @@ jobs:
             name        = "web-sg-${var.environment}-${var.aws_region}"
             description = "SG for ${var.aws_region}"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
-            ingress { from_port = 80;  to_port = 80;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            ingress { from_port = 443; to_port = 443; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            egress  { from_port = 0;   to_port = 0;   protocol = "-1";  cidr_blocks = ["0.0.0.0/0"] }
+            ingress {
+              from_port   = 80
+              to_port     = 80
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 443
+              to_port     = 443
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            egress {
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
           }
 
           resource "aws_instance" "web" {
@@ -593,7 +569,6 @@ jobs:
             tags   = { Project = "DevSecOps" }
           }
 
-          # Ministack RDS: spawn real MySQL container via docker.sock
           resource "aws_db_instance" "mysql" {
             identifier          = "ministack-mysql-${var.environment}"
             engine              = "mysql"
@@ -614,14 +589,12 @@ jobs:
           output "s3_bucket"    { value = aws_s3_bucket.artifacts.bucket }
           TFEOF
 
-          # tfvars: double-quote EOF agar GitHub expressions di-expand
           cat > terraform/terraform.tfvars << EOF
           ministack_endpoint = "http://localhost:${MS_PORT}"
           environment        = "${ENV_NAME}"
           aws_region         = "${REGION}"
           EOF
 
-          # S3 backend (opsional, hanya primary mode)
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
             cat > terraform/backend.tf << EOF
           terraform {
@@ -638,7 +611,6 @@ jobs:
       - name: 🗃️ Terraform Init → Validate → Apply
         id: tf
         working-directory: terraform
-        # BUG FIX #7: Credentials DB via TF_VAR_ env vars (tidak di file .tf)
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_STATE_ACCESS_KEY || secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_STATE_SECRET_KEY || secrets.AWS_SECRET_ACCESS_KEY }}
@@ -665,8 +637,6 @@ jobs:
 
   # ==========================================
   # DB HEALTHCHECK & INIT — BOTH ENVS
-  # BUG FIX #3: GH-hosted = VM baru → Ministack dari infra tidak ada.
-  # Solusi: re-provision Ministack+RDS idempotent di job ini.
   # ==========================================
   db-init:
     name: 🗂️ DB Healthcheck & Init
@@ -677,14 +647,11 @@ jobs:
       REGION:   ${{ needs.dr-check.outputs.active_region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      # BUG FIX #3+#4: Re-start Ministack jika tidak ada (GH-hosted VM baru)
-      # dengan health check python3 JSON parse yang proper
       - name: 🐳 Ensure Ministack & RDS
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
           DB_ID="ministack-mysql-${ENV_NAME}"
 
-          # Start Ministack jika tidak jalan
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "⚠️ Ministack tidak ditemukan, restart..."
             docker rm -f ministack 2>/dev/null || true
@@ -706,7 +673,6 @@ jobs:
             echo "✅ Ministack already running"
           fi
 
-          # Provision RDS (idempotent — ignore already-exists)
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -723,7 +689,6 @@ jobs:
               --no-deletion-protection \
               --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
 
-          # Wait for RDS available
           echo "⏳ Waiting for RDS..."
           for i in $(seq 1 60); do
             STATUS=$(docker run --rm --network host \
@@ -740,7 +705,6 @@ jobs:
             sleep 5
           done
 
-          # Fetch endpoint
           ADDR=$(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -765,7 +729,6 @@ jobs:
           echo "RDS_PORT=$PORT" >> $GITHUB_ENV
           echo "✅ RDS endpoint: $ADDR:$PORT"
 
-      # BUG FIX: step name mengandung ":" wajib diapit quotes
       - name: '🏥 PHASE 1: MySQL Health Check'
         run: |
           echo "⏳ Waiting for MySQL at ${RDS_HOST}:${RDS_PORT}..."
@@ -798,9 +761,6 @@ jobs:
 
   # ==========================================
   # DEPLOYMENT — BOTH ENVS
-  # BUG FIX #3: Re-provision Ministack+RDS idempotent (GH-hosted VM baru)
-  # BUG FIX #8: Re-init schema (db-init schema tidak persist ke VM ini)
-  # BUG FIX #1+#2: --network host + ASPNETCORE_URLS + 127.0.0.1
   # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
@@ -817,7 +777,6 @@ jobs:
       REGION:   ${{ needs.dr-check.outputs.active_region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      # ── Load Docker image ──────────────────────────────────────
       - name: ⬇️ Download Golden Image (Primary — current run)
         if: needs.dr-check.outputs.is_dr == 'false'
         uses: actions/download-artifact@v4
@@ -841,8 +800,6 @@ jobs:
           docker load < ${{ env.APP_NAME }}-image.tar.gz
           echo "✅ Image loaded"
 
-      # ── Re-provision Ministack+RDS (idempotent) ────────────────
-      # BUG FIX #3+#4: GH-hosted fresh VM → Ministack tidak ada di sini
       - name: 🐳 Ensure Ministack & RDS
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
@@ -866,7 +823,6 @@ jobs:
             done
           fi
 
-          # Create RDS (idempotent)
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -883,7 +839,6 @@ jobs:
               --no-deletion-protection \
               --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
 
-          # Wait for available
           for i in $(seq 1 60); do
             STATUS=$(docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
@@ -921,8 +876,6 @@ jobs:
           echo "RDS_HOST=$ADDR" >> $GITHUB_ENV
           echo "RDS_PORT=$PORT" >> $GITHUB_ENV
 
-      # BUG FIX #8: Schema ulang (CREATE TABLE IF NOT EXISTS = idempotent)
-      # Diperlukan karena GH-hosted: db-init dan deploy = VM berbeda
       - name: 🗂️ Ensure DB Schema (Idempotent)
         run: |
           echo "⏳ Waiting for MySQL..."
@@ -951,7 +904,6 @@ jobs:
       - name: 🧹 Remove Old Container
         run: docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
 
-      # BUG FIX #1+#2: --network host + ASPNETCORE_URLS + 127.0.0.1 for DB
       - name: 🚀 Run App Container
         run: |
           docker run -d --name ${{ env.CONTAINER_NAME }} \
