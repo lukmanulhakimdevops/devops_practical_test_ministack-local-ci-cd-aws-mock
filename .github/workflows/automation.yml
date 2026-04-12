@@ -73,7 +73,6 @@ jobs:
           CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
           BRANCH="${{ github.ref_name }}"
 
-          # Cleanup hanya jika diminta atau branch bukan main/develop (untuk primary)
           SHOULD_CLEANUP="false"
           if [ "$CLEANUP_INPUT" == "true" ]; then
             SHOULD_CLEANUP="true"
@@ -259,7 +258,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- GitHub-hosted (us-east-1) ----------
       - name: '🔧 [GitHub] Install Terraform & Start Ministack'
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -296,7 +294,6 @@ jobs:
             sleep 3
           done
 
-      # ---------- Self-hosted (us-east-2) ----------
       - name: '💻 [Laptop] Verify Ministack & Terraform'
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
@@ -319,7 +316,6 @@ jobs:
           fi
           echo "✅ Ministack is running (port $PORT)"
 
-      # ---------- Common: Create Terraform config ----------
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -465,6 +461,7 @@ jobs:
         id: parse
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          echo "Original RDS_ENDPOINT: $RDS_ENDPOINT"
           if [[ "$RDS_ENDPOINT" == *":"* ]]; then
             RDS_HOST="${RDS_ENDPOINT%:*}"
             RDS_PORT="${RDS_ENDPOINT##*:}"
@@ -475,7 +472,7 @@ jobs:
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
           echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
-          echo "RDS endpoint parsed: $RDS_HOST:$RDS_PORT"
+          echo "Parsed: RDS_HOST=$RDS_HOST, RDS_PORT=$RDS_PORT"
 
       - name: '🏥 [GitHub] Ensure Ministack & RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
@@ -525,6 +522,8 @@ jobs:
                 --query "DBInstances[0].Endpoint.Address" \
                 --output text \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
+            echo "RDS_ENDPOINT after restart: $RDS_ENDPOINT"
+            # --- PARSING ULANG YANG BENAR ---
             if [[ "$RDS_ENDPOINT" == *":"* ]]; then
               RDS_HOST="${RDS_ENDPOINT%:*}"
               RDS_PORT="${RDS_ENDPOINT##*:}"
@@ -535,6 +534,7 @@ jobs:
             [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
             echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
             echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
+            echo "Updated env: RDS_HOST=$RDS_HOST, RDS_PORT=$RDS_PORT"
           fi
 
           echo "🏥 Healthcheck TCP $RDS_HOST:$RDS_PORT..."
@@ -567,6 +567,7 @@ jobs:
 
       - name: '🗂️ Database Schema Initialization'
         run: |
+          echo "Initializing schema on $RDS_HOST:$RDS_PORT"
           docker run -i --rm --network host mysql:8.0 \
             mysql -h"$RDS_HOST" -P"$RDS_PORT" \
             -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
@@ -581,7 +582,7 @@ jobs:
           echo "✅ Database schema initialized in ${{ needs.dr-check.outputs.active_region }}"
 
   # ==========================================
-  # [DEPLOYMENT] – BOTH ENVS (WAJIB ARTIFACT)
+  # [DEPLOYMENT] – BOTH ENVS
   # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
@@ -608,6 +609,7 @@ jobs:
         id: parse
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          echo "RDS_ENDPOINT from infra: $RDS_ENDPOINT"
           if [[ "$RDS_ENDPOINT" == *":"* ]]; then
             RDS_HOST="${RDS_ENDPOINT%:*}"
             RDS_PORT="${RDS_ENDPOINT##*:}"
@@ -618,6 +620,7 @@ jobs:
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
           echo "RDS_PORT=$RDS_PORT" >> $GITHUB_ENV
+          echo "Using RDS at $RDS_HOST:$RDS_PORT"
 
       - name: '🐳 [GitHub] Ensure Ministack + RDS'
         if: needs.dr-check.outputs.is_dr == 'false'
@@ -667,6 +670,7 @@ jobs:
                 --query "DBInstances[0].Endpoint.Address" \
                 --output text \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
+            echo "RDS_ENDPOINT after restart: $RDS_ENDPOINT"
             if [[ "$RDS_ENDPOINT" == *":"* ]]; then
               RDS_HOST="${RDS_ENDPOINT%:*}"
               RDS_PORT="${RDS_ENDPOINT##*:}"
