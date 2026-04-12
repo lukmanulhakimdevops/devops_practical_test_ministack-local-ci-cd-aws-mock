@@ -295,7 +295,7 @@ jobs:
           echo "RDS_HOST=$host" >> $GITHUB_ENV
           echo "RDS_PORT=$port" >> $GITHUB_ENV
 
-          # Wait for MySQL
+          # Wait for MySQL to be query-ready
           for i in $(seq 1 30); do
             docker run --rm --network host mysql:8.0 mysql -h"$host" -P"$port" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" -e "SELECT 1" --protocol=TCP 2>/dev/null && break
             sleep 10
