@@ -86,6 +86,7 @@ jobs:
           echo "failover=$FAIL"           >> $GITHUB_OUTPUT
           echo "state_prefix=$PREFIX"     >> $GITHUB_OUTPUT
           echo "use_s3_backend=$USE_S3"   >> $GITHUB_OUTPUT
+          echo "🔄 DR Decision: region=$REGION | runner=$RUNNER | port=$PORT | failover=$FAIL | s3=$USE_S3"
 
   # ==========================================
   # [PARALLEL TRACK 2] SECURITY SAST
@@ -245,23 +246,18 @@ jobs:
             echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
             sudo apt-get update && sudo apt-get install -y terraform
           fi
-          
       - name: 🐳 Start Ministack (With Docker Socket for Real RDS)
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           docker rm -f ministack 2>/dev/null || true
-          
-          # [CRITICAL] Me-mount docker.sock agar Ministack bisa menjalankan container MySQL sungguhan
           docker run -d --name ministack -p ${PORT}:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -e SERVICES=ec2,s3,sts,iam,rds \
             nahuelnucera/ministack:latest
-            
           for i in $(seq 1 30); do
             curl -sf "http://localhost:${PORT}/_localstack/health" | grep -q '"s3":"available"' && break
             sleep 3
           done
-          
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -286,7 +282,6 @@ jobs:
           variable "ministack_endpoint" { default = "http://localhost:${{ needs.dr-check.outputs.ministack_port }}" }
           variable "environment"        { default = "staging" }
           variable "aws_region"         { default = "${{ needs.dr-check.outputs.active_region }}" }
-          
           provider "aws" {
             region     = var.aws_region
             access_key = "test"
@@ -303,20 +298,16 @@ jobs:
               rds = var.ministack_endpoint
             }
           }
-          
           resource "aws_security_group" "web_sg" {
             name        = "web-sg-\${var.environment}-\${var.aws_region}"
             tags = { Name = "web-sg-\${var.environment}", Project = "DevSecOps", Region = var.aws_region }
           }
-          
           resource "aws_instance" "web" {
             ami             = "ami-0ff8a91507f77f867"
             instance_type   = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
             tags = { Name = "web-server-\${var.environment}" }
           }
-          
-          # NATIVE MINISTACK RDS
           resource "aws_db_instance" "mysql" {
             identifier          = "ministack-mysql-\${var.environment}"
             engine              = "mysql"
@@ -331,11 +322,9 @@ jobs:
             apply_immediately   = true
             publicly_accessible = true
           }
-          
           output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           EOF
-          
       - name: 🗃️ Init & Apply Terraform
         id: tf
         working-directory: terraform
@@ -364,14 +353,9 @@ jobs:
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          
-          # Paksa TCP/IP
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
-          
           echo "🏥 Memulai Healthcheck Ping ke TCP $RDS_HOST:$RDS_PORT..."
           SUCCESS="false"
-          
-          # Looping 60x (5 Menit) untuk memastikan Engine MySQL 8.0 benar-benar siap dari Cold-Start
           for i in $(seq 1 60); do
             if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
               echo "✅ HEALTHCHECK PASS: MySQL Engine sudah UP dan merespons TCP Ping."
@@ -381,24 +365,18 @@ jobs:
             echo "⏱️ Menunggu Engine MySQL 8.0 menyelesaikan inisialisasi... ($i/60)"
             sleep 5
           done
-          
           if [ "$SUCCESS" = "false" ]; then
              echo "❌ CRITICAL: RDS Healthcheck GAGAL (Timeout). Engine tidak merespons."
              exit 1
           fi
-
       - name: 🗂️ PHASE 2: Database Schema Initialization (DDL)
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
-          
           echo "🗂️ Mengeksekusi Injeksi Skema Database..."
-          
-          # Buat file SQL menggunakan heredoc (aman dari YAML parsing)
-          cat > /tmp/init.sql <<'EOF'
+          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" -e "
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -406,14 +384,7 @@ jobs:
             CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          EOF
-          
-          # Jalankan file SQL melalui Docker volume mount
-          docker run -i --rm --network host \
-            -v /tmp/init.sql:/init.sql:ro \
-            mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" \
-            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" < /init.sql
-          
+          "
           echo "✅ FASE 2 SELESAI: Tabel berhasil dibuat."
 
   # ==========================================
@@ -431,9 +402,7 @@ jobs:
           name: docker-image
           path: .
       - name: 📦 Load Golden Image
-        run: |
-          docker load < ${APP_NAME}-image.tar.gz
-          echo "✅ Golden Image Loaded."
+        run: docker load < ${APP_NAME}-image.tar.gz && echo "✅ Golden Image Loaded."
       - name: 🧹 Remove old container
         run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
       - name: 🚀 Run container
@@ -441,20 +410,16 @@ jobs:
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          
           if [ "$RDS_HOST" = "localhost" ]; then RDS_HOST="127.0.0.1"; fi
-          
           docker run -d --name ${CONTAINER_NAME} --network host \
             -e ASPNETCORE_URLS=http://+:${HOST_PORT} \
             -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
             ${APP_NAME}:latest
-            
       - name: 🔍 WAJIB Health Check Aplikasi (Region-Aware)
         run: |
           echo "⏳ Polling Application Health Endpoint in ${{ needs.dr-check.outputs.active_region }}..."
           HEALTH_URL="http://localhost:${CONTAINER_PORT}/swagger/v1/swagger.json"
-          
           for i in $(seq 1 20); do
             if curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
               echo "✅ HEALTH CHECK PASSED: Web App API merespons dengan baik."
@@ -506,13 +471,13 @@ jobs:
           fi
 
   # ==========================================
-  # [CLEANUP] DESTROY MOCK INFRASTRUCTURE
+  # [CLEANUP] DESTROY MOCK INFRASTRUCTURE (YAML-FIXED)
   # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
     runs-on: ${{ needs.dr-check.outputs.runner_label }}
     needs: [dr-check, traffic, dast]
-    if: always() && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
+    if: always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
     steps:
       - name: 🗑️ Cleanup Resources via Dockerized AWS CLI
         env:
@@ -521,32 +486,70 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           MINISTACK_PORT: ${{ needs.dr-check.outputs.ministack_port }}
         run: |
+          set -euo pipefail
           echo "🧹 Cleaning up ${{ needs.dr-check.outputs.active_region }} resources..."
           docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
           REGION="${{ needs.dr-check.outputs.active_region }}"
+          ENDPOINT="http://localhost:${MINISTACK_PORT}"
           
-          # Hapus EC2
-          docker run --rm --network host \
+          echo "🗑️ Cleaning EC2 instances..."
+          INSTANCES=$(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-            amazon/aws-cli ec2 describe-instances --filters "Name=tag:Region,Values=$REGION" --query "Reservations[*].Instances[*].InstanceId" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read ID; do
-            [ -n "$ID" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli ec2 terminate-instances --instance-ids "$ID" --endpoint-url http://localhost:${MINISTACK_PORT} || true
+            amazon/aws-cli ec2 describe-instances \
+            --filters "Name=tag:Region,Values=${REGION}" \
+            --query "Reservations[*].Instances[*].InstanceId" \
+            --output text \
+            --endpoint-url "${ENDPOINT}" 2>/dev/null || echo "")
+          for ID in ${INSTANCES}; do
+            if [ -n "${ID}" ] && [ "${ID}" != "None" ]; then
+              echo "   Terminating EC2: ${ID}"
+              docker run --rm --network host \
+                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+                amazon/aws-cli ec2 terminate-instances \
+                --instance-ids "${ID}" \
+                --endpoint-url "${ENDPOINT}" || true
+            fi
           done
           
-          # Hapus S3
-          docker run --rm --network host \
+          echo "🗑️ Cleaning S3 buckets..."
+          BUCKETS=$(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-            amazon/aws-cli s3api list-buckets --query "Buckets[?contains(Name,'$REGION')].Name" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read BUCKET; do
-            [ -n "$BUCKET" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli s3 rm "s3://$BUCKET" --recursive --endpoint-url http://localhost:${MINISTACK_PORT} || true
-            [ -n "$BUCKET" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli s3 rb "s3://$BUCKET" --force --endpoint-url http://localhost:${MINISTACK_PORT} || true
+            amazon/aws-cli s3api list-buckets \
+            --query "Buckets[?contains(Name,'${REGION}')].Name" \
+            --output text \
+            --endpoint-url "${ENDPOINT}" 2>/dev/null || echo "")
+          for BUCKET in ${BUCKETS}; do
+            if [ -n "${BUCKET}" ] && [ "${BUCKET}" != "None" ]; then
+              echo "   Deleting S3: ${BUCKET}"
+              docker run --rm --network host \
+                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+                amazon/aws-cli s3 rm "s3://${BUCKET}" --recursive \
+                --endpoint-url "${ENDPOINT}" || true
+              docker run --rm --network host \
+                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+                amazon/aws-cli s3 rb "s3://${BUCKET}" --force \
+                --endpoint-url "${ENDPOINT}" || true
+            fi
           done
           
-          # Hapus RDS
-          docker run --rm --network host \
+          echo "🗑️ Cleaning RDS instances..."
+          DBS=$(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-            amazon/aws-cli rds describe-db-instances --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" --output text --endpoint-url http://localhost:${MINISTACK_PORT} 2>/dev/null | tr '\t' '\n' | while read DBID; do
-            [ -n "$DBID" ] && docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli rds delete-db-instance --db-instance-identifier "$DBID" --skip-final-snapshot --endpoint-url http://localhost:${MINISTACK_PORT} || true
+            amazon/aws-cli rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier,'ministack-mysql')].DBInstanceIdentifier" \
+            --output text \
+            --endpoint-url "${ENDPOINT}" 2>/dev/null || echo "")
+          for DBID in ${DBS}; do
+            if [ -n "${DBID}" ] && [ "${DBID}" != "None" ]; then
+              echo "   Deleting RDS: ${DBID}"
+              docker run --rm --network host \
+                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+                amazon/aws-cli rds delete-db-instance \
+                --db-instance-identifier "${DBID}" \
+                --skip-final-snapshot \
+                --endpoint-url "${ENDPOINT}" || true
+            fi
           done
-          
           echo "✅ Cleanup complete."
 
   # ==========================================
@@ -562,11 +565,14 @@ jobs:
         run: |
           REGION="${{ needs.dr-check.outputs.active_region }}"
           FAILOVER="${{ needs.dr-check.outputs.failover }}"
+          IS_DEV="${{ github.ref_name == 'develop' && '✅ YES (Persistent)' || '❌ NO' }}"
           STATUS="✅ SUCCESS"
           [ "${{ needs.dast.result }}" != "success" ] && STATUS="❌ FAILED"
           echo "================================"
           echo "  🛡️ DevSecOps Pipeline Summary"
           echo "================================"
+          echo "  Branch          : ${{ github.ref_name }}"
+          echo "  Persistent Dev  : $IS_DEV"
           echo "  Region Active   : $REGION"
           echo "  DR Failover     : $FAILOVER"
           echo "  RDS Health Check: ✅ PASSED"
@@ -574,3 +580,7 @@ jobs:
           echo "  DAST Scan       : ${{ needs.dast.result }}"
           echo "  Status          : $STATUS"
           echo "================================"
+          if [ "$IS_DEV" == "✅ YES (Persistent)" ]; then
+            echo "💡 Environment tetap hidup untuk iterasi development."
+            echo "🌐 Akses: http://localhost:${{ env.HOST_PORT }}"
+          fi
