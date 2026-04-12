@@ -93,7 +93,7 @@ jobs:
             echo "failover=true" >> $GITHUB_OUTPUT
           else
             echo "🟢 ACTION: Staying on Primary us-east-1 (GitHub Cloud)"
-            echo 'runner="ubuntu-latest"' >> $GITHUB_OUTPUT
+            echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
             echo "state_key=ministack/us-east-1/${ENV_NAME}/terraform.tfstate" >> $GITHUB_OUTPUT
@@ -515,7 +515,6 @@ jobs:
             sleep 5
           done
 
-          # --- IP Hunting for MySQL container ---
           MYSQL_CONTAINER="$DB_ID"
           echo "🔍 Hunting IP for container $MYSQL_CONTAINER"
           for i in $(seq 1 30); do
