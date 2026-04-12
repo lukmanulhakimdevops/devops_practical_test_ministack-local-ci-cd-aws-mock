@@ -353,9 +353,24 @@ jobs:
             name        = "web-sg-${var.environment}-${var.aws_region}"
             description = "SG for ${var.aws_region}"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
-            ingress { from_port = 80;  to_port = 80;  protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            ingress { from_port = 443; to_port = 443; protocol = "tcp"; cidr_blocks = ["0.0.0.0/0"] }
-            egress  { from_port = 0;   to_port = 0;   protocol = "-1";  cidr_blocks = ["0.0.0.0/0"] }
+            ingress {
+              from_port   = 80
+              to_port     = 80
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            ingress {
+              from_port   = 443
+              to_port     = 443
+              protocol    = "tcp"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
+            egress {
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
+              cidr_blocks = ["0.0.0.0/0"]
+            }
           }
 
           resource "aws_instance" "web" {
@@ -500,29 +515,25 @@ jobs:
             sleep 5
           done
 
-          ADDR=$(docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-            -e AWS_DEFAULT_REGION=${REGION} \
-            amazon/aws-cli rds describe-db-instances \
-              --db-instance-identifier "$DB_ID" \
-              --query "DBInstances[0].Endpoint.Address" \
-              --output text \
-              --endpoint-url "$ENDPOINT_URL" 2>/dev/null || echo "127.0.0.1")
-          PORT=$(docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-            -e AWS_DEFAULT_REGION=${REGION} \
-            amazon/aws-cli rds describe-db-instances \
-              --db-instance-identifier "$DB_ID" \
-              --query "DBInstances[0].Endpoint.Port" \
-              --output text \
-              --endpoint-url "$ENDPOINT_URL" 2>/dev/null || echo "3306")
-
-          [ "$ADDR" = "localhost" ] || [ -z "$ADDR" ] && ADDR="127.0.0.1"
-          echo "RDS_HOST=$ADDR" >> $GITHUB_ENV
-          echo "RDS_PORT=$PORT" >> $GITHUB_ENV
-          echo "✅ RDS endpoint: $ADDR:$PORT"
+          # --- IP Hunting for MySQL container ---
+          MYSQL_CONTAINER="$DB_ID"
+          echo "🔍 Hunting IP for container $MYSQL_CONTAINER"
+          for i in $(seq 1 30); do
+            DB_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$MYSQL_CONTAINER" 2>/dev/null || echo "")
+            if [ -n "$DB_IP" ]; then
+              echo "✅ MySQL container IP: $DB_IP"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$DB_IP" ]; then
+            echo "❌ Could not determine MySQL container IP"
+            exit 1
+          fi
+          DB_PORT=3306
+          echo "RDS_HOST=$DB_IP" >> $GITHUB_ENV
+          echo "RDS_PORT=$DB_PORT" >> $GITHUB_ENV
+          echo "✅ RDS endpoint (internal): $DB_IP:$DB_PORT"
 
       - name: 🏥 MySQL Health Check
         run: |
