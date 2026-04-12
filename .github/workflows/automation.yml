@@ -194,7 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Primary: Install Terraform & start Ministack ---
+      # --- Primary: Install Terraform & start Ministack (us-east-1 ONLY) ---
       - name: 🔧 Install Terraform & Start Ministack (Primary)
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -226,7 +226,7 @@ jobs:
             sleep 3
           done
 
-      # --- DR: Verify existing Ministack + Terraform ---
+      # --- DR: Verify existing Ministack + Terraform (us-east-2 ONLY) ---
       - name: 💻 Verify Local Environment (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
@@ -377,7 +377,6 @@ jobs:
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
           echo "🧹 Cleaning up any previously failed resources..."
-          # Delete security groups that might conflict (ignore errors)
           for sg in "web-sg-${ENV_NAME}-${REGION}" "web-sg-${ENV_NAME}-${REGION}-"*; do
             docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
@@ -387,7 +386,6 @@ jobs:
               --group-name "$sg" \
               --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
           done
-          # Delete RDS instances that might conflict
           for db in "ministack-mysql-${ENV_NAME}" "ministack-mysql-${ENV_NAME}-"*; do
             docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
@@ -428,7 +426,6 @@ jobs:
       - name: 🐳 Ensure Ministack & RDS
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
-          # Get the actual DB identifier from Terraform output (with suffix)
           DB_ID=$(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -633,7 +630,6 @@ jobs:
       - name: 🗑️ Cleanup Ministack Resources
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
-          # Find and delete all resources created in this run
           for db in $(docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
             -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
