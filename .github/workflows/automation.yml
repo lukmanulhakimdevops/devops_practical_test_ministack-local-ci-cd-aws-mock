@@ -20,6 +20,12 @@ on:
         default: 'false'
         type: choice
         options: ['true', 'false']
+      cleanup_resources:
+        description: 'Cleanup after pipeline? (only for ephemeral env)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
 
 env:
   DOTNET_VERSION: '8.0.x'
@@ -58,10 +64,23 @@ jobs:
       state_key_prefix: ${{ steps.set.outputs.state_prefix }}
       use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
       is_dr: ${{ steps.set.outputs.is_dr }}
+      should_cleanup: ${{ steps.set.outputs.should_cleanup }}
     steps:
       - id: set
         run: |
           FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+          CLEANUP_INPUT="${{ github.event.inputs.cleanup_resources }}"
+          BRANCH="${{ github.ref_name }}"
+
+          # Tentukan cleanup: hanya jika input true atau branch bukan main/develop
+          SHOULD_CLEANUP="false"
+          if [ "$CLEANUP_INPUT" == "true" ]; then
+            SHOULD_CLEANUP="true"
+          elif [ "$BRANCH" != "main" ] && [ "$BRANCH" != "develop" ]; then
+            SHOULD_CLEANUP="true"
+          fi
+          echo "should_cleanup=$SHOULD_CLEANUP" >> $GITHUB_OUTPUT
+
           if [ "$FAIL" == "true" ]; then
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}"      >> $GITHUB_OUTPUT
@@ -692,11 +711,12 @@ jobs:
           exit 1
 
   # ==========================================
-  # [POST-DEPLOY] DAST SCAN
+  # [POST-DEPLOY] DAST SCAN (Only on GitHub)
   # ==========================================
   dast:
     name: 🕷️ DAST Scan
-    runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
+    runs-on: ubuntu-latest
+    if: needs.dr-check.outputs.is_dr == 'false'   # Hanya di primary
     needs: [dr-check, deploy]
     steps:
       - name: ⬇️ Download Docker Image Artifact
@@ -705,50 +725,49 @@ jobs:
           name: docker-image
           path: .
 
-      # ---------- GitHub-hosted: Ensure Ministack + RDS ----------
-      - name: '🐳 [GitHub] Ensure Ministack + RDS'
-        if: needs.dr-check.outputs.is_dr == 'false'
+      - name: 🐳 Start Ministack & RDS for DAST
         run: |
-          PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          PORT="4566"
+          docker rm -f ministack 2>/dev/null || true
+          docker run -d --name ministack \
+            -p ${PORT}:4566 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e SERVICES=ec2,s3,sts,iam,rds \
+            -e DEFAULT_REGION=us-east-1 \
+            nahuelnucera/ministack:latest
 
-          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            docker rm -f ministack 2>/dev/null || true
-            docker run -d --name ministack \
-              -p ${PORT}:4566 \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              -e SERVICES=ec2,s3,sts,iam,rds \
-              -e DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
-              nahuelnucera/ministack:latest
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${PORT}/_localstack/health" && break
+            sleep 2
+          done
 
-            for i in $(seq 1 40); do
-              RDS=$(curl -sf "http://localhost:${PORT}/_localstack/health" 2>/dev/null \
-                | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
-              [ "$RDS" == "available" ] && { echo "✅ RDS ready"; break; }
-              sleep 3
-            done
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            amazon/aws-cli rds create-db-instance \
+              --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+              --db-instance-class db.t3.micro \
+              --engine mysql \
+              --engine-version "8.0" \
+              --master-username "${{ env.DB_USER }}" \
+              --master-user-password "${{ env.DB_PASSWORD }}" \
+              --db-name "${{ env.DB_NAME }}" \
+              --allocated-storage 20 \
+              --no-multi-az \
+              --publicly-accessible \
+              --no-deletion-protection \
+              --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
-            docker run --rm --network host \
-              -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-              -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-              -e AWS_DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
-              amazon/aws-cli rds create-db-instance \
-                --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-                --db-instance-class db.t3.micro --engine mysql --engine-version "8.0" \
-                --master-username "${{ env.DB_USER }}" --master-user-password "${{ env.DB_PASSWORD }}" \
-                --db-name "${{ env.DB_NAME }}" --allocated-storage 20 \
-                --no-multi-az --publicly-accessible --no-deletion-protection \
-                --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
-
-            RDS_ENDPOINT=$(docker run --rm --network host \
-              -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-              -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-              -e AWS_DEFAULT_REGION=${{ needs.dr-check.outputs.active_region }} \
-              amazon/aws-cli rds describe-db-instances \
-                --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
-                --query "DBInstances[0].Endpoint.Address" --output text \
-                --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
-          fi
+          RDS_ENDPOINT=$(docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            amazon/aws-cli rds describe-db-instances \
+              --db-instance-identifier "ministack-mysql-${{ github.event.inputs.environment || 'staging' }}" \
+              --query "DBInstances[0].Endpoint.Address" \
+              --output text \
+              --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
 
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
@@ -756,21 +775,21 @@ jobs:
           echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
           echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
 
-      # ---------- Self-hosted: just set RDS env ----------
-      - name: '💻 [Laptop] Set RDS Connection'
-        if: needs.dr-check.outputs.is_dr == 'true'
-        run: |
-          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
-          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
-          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
-          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
-          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
-          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
+          docker run -i --rm --network host mysql:8.0 \
+            mysql -h"$RDS_HOST" -P"$RDS_PORT" \
+            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
+          CREATE TABLE IF NOT EXISTS TodoItems (
+            Id         INT          PRIMARY KEY AUTO_INCREMENT,
+            Name       VARCHAR(255) NULL,
+            IsComplete TINYINT(1)   NOT NULL DEFAULT 0,
+            CreatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          SQL
 
-      - name: 🚀 Ensure App Container (Idempotent)
+      - name: 🚀 Run App Container for DAST
         run: |
-          docker image inspect ${{ env.APP_NAME }}:latest &>/dev/null \
-            || docker load < ${{ env.APP_NAME }}-image.tar.gz
+          docker load < ${{ env.APP_NAME }}-image.tar.gz
           docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
           docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
             -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
@@ -809,6 +828,13 @@ jobs:
           path: /tmp/zap-out/
           retention-days: 7
 
+      # Cleanup after DAST (only ephemeral containers)
+      - name: 🧹 Cleanup DAST containers
+        if: always()
+        run: |
+          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker rm -f ministack 2>/dev/null || true
+
   # ==========================================
   # [POST-DEPLOY] ROUTING NOTIFICATION
   # ==========================================
@@ -816,6 +842,7 @@ jobs:
     name: 🌐 Traffic Status
     runs-on: ubuntu-latest
     needs: [dr-check, deploy, dast]
+    if: always() && (needs.dast.result == 'success' || needs.dast.result == 'skipped')
     steps:
       - name: 📊 Simulate Traffic Routing
         run: |
@@ -825,32 +852,29 @@ jobs:
           echo "🔄 DR Failover: $FAILOVER"
           echo "✅ RDS Health: PASSED"
           echo "✅ App Health: PASSED"
-          echo "✅ DAST Scan: PASSED"
           if [ "$FAILOVER" == "true" ]; then
             echo "📍 Traffic: Laptop (us-east-2) via http://localhost:${{ env.HOST_PORT }}"
           else
             echo "📍 Traffic: GitHub CI Host (us-east-1) via http://localhost:${{ env.HOST_PORT }}"
+            echo "✅ DAST Scan: ${{ needs.dast.result }}"
           fi
 
   # ==========================================
-  # [CLEANUP] TEARDOWN RESOURCES
+  # [OPTIONAL CLEANUP] Hanya jika diminta
   # ==========================================
   cleanup:
-    name: 🧹 Cleanup
+    name: 🧹 Cleanup (Ephemeral)
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, traffic, dast]
-    if: always()
+    if: always() && needs.dr-check.outputs.should_cleanup == 'true' && needs.dr-check.outputs.is_dr == 'false'
     steps:
-      # ---------- GitHub-hosted: full cleanup ----------
-      - name: '🗑️ [GitHub] Cleanup Resources'
-        if: needs.dr-check.outputs.is_dr == 'false'
+      - name: '🗑️ Cleanup GitHub Resources'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          PORT="${{ needs.dr-check.outputs.ministack_port }}"
-          REGION="${{ needs.dr-check.outputs.active_region }}"
+          PORT="4566"
           ENDPOINT="http://localhost:${PORT}"
           AWS="docker run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION amazon/aws-cli"
 
@@ -860,7 +884,7 @@ jobs:
           if docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "🗑️ Terminating EC2 instances..."
             $AWS ec2 describe-instances \
-              --filters "Name=tag:Region,Values=$REGION" \
+              --filters "Name=tag:Region,Values=us-east-1" \
               --query "Reservations[*].Instances[*].InstanceId" \
               --output text --endpoint-url "$ENDPOINT" 2>/dev/null \
             | tr '\t' '\n' | grep -v '^$' | while read -r ID; do
@@ -870,7 +894,7 @@ jobs:
 
             echo "🗑️ Deleting S3 buckets..."
             $AWS s3api list-buckets \
-              --query "Buckets[?contains(Name,'$REGION')].Name" \
+              --query "Buckets[?contains(Name,'us-east-1')].Name" \
               --output text --endpoint-url "$ENDPOINT" 2>/dev/null \
             | tr '\t' '\n' | grep -v '^$' | while read -r BUCKET; do
               [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] && {
@@ -888,14 +912,6 @@ jobs:
           docker rm -f ministack 2>/dev/null || true
           echo "✅ Cleanup complete."
 
-      # ---------- Self-hosted: only stop app container, keep Ministack ----------
-      - name: '💻 [Laptop] Stop App Container (Keep Ministack)'
-        if: needs.dr-check.outputs.is_dr == 'true'
-        run: |
-          echo "🧹 Stopping app container..."
-          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
-          echo "✅ Ministack tetap berjalan di laptop untuk pemakaian berikutnya."
-
   # ==========================================
   # [FINAL] SUMMARY REPORT
   # ==========================================
@@ -911,7 +927,7 @@ jobs:
           FAILOVER="${{ needs.dr-check.outputs.failover }}"
           IS_DEV="${{ github.ref_name == 'develop' && '✅ YES (Persistent)' || '❌ NO' }}"
           STATUS="✅ SUCCESS"
-          [ "${{ needs.dast.result }}" != "success" ] && STATUS="❌ FAILED"
+          [ "${{ needs.dast.result }}" != "success" ] && [ "$FAILOVER" == "false" ] && STATUS="❌ FAILED"
           echo "================================"
           echo "  🛡️ DevSecOps Pipeline Summary"
           echo "================================"
@@ -921,6 +937,20 @@ jobs:
           echo "  DR Failover    : $FAILOVER"
           echo "  RDS Health     : ✅ PASSED"
           echo "  App Health     : ✅ PASSED"
-          echo "  DAST           : ${{ needs.dast.result }}"
+          if [ "$FAILOVER" == "false" ]; then
+            echo "  DAST           : ${{ needs.dast.result }}"
+          else
+            echo "  DAST           : ⏭️ SKIPPED (DR Mode)"
+          fi
+          if [ "${{ needs.dr-check.outputs.should_cleanup }}" == "true" ]; then
+            echo "  Cleanup        : ✅ Done"
+          else
+            echo "  Cleanup        : ⏭️ Skipped (app kept alive)"
+          fi
           echo "  Status         : $STATUS"
           echo "================================"
+          if [ "$FAILOVER" == "true" ]; then
+            echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (Laptop)"
+          else
+            echo "🌍 App URL: http://localhost:${{ env.HOST_PORT }} (GitHub Runner - temporary)"
+          fi
