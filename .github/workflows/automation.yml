@@ -26,8 +26,6 @@ env:
   APP_DLL: TodoWebAPI.dll
   APP_NAME: todo-webapi
   CONTAINER_NAME: todo-webapi
-  # BUG FIX #7: Hapus CONTAINER_PORT (5000) — sumber bug port mismatch.
-  # HOST_PORT=8080 dipakai konsisten di semua step.
   HOST_PORT: 8080
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
@@ -59,17 +57,18 @@ jobs:
       failover: ${{ steps.set.outputs.failover }}
       state_key_prefix: ${{ steps.set.outputs.state_prefix }}
       use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
+      is_dr: ${{ steps.set.outputs.is_dr }}
     steps:
       - id: set
         run: |
           FAIL="${{ github.event.inputs.manual_dr_trigger }}"
           if [ "$FAIL" == "true" ]; then
-            # BUG FIX #6: JSON string agar fromJSON() bekerja di runs-on
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}"      >> $GITHUB_OUTPUT
-            echo "port=4567"                            >> $GITHUB_OUTPUT
+            echo "port=4566"                            >> $GITHUB_OUTPUT
             echo "state_prefix=ministack/us-east-2"     >> $GITHUB_OUTPUT
             echo "use_s3_backend=false"                 >> $GITHUB_OUTPUT
+            echo "is_dr=true"                           >> $GITHUB_OUTPUT
           else
             echo 'runner="ubuntu-latest"'               >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
@@ -78,6 +77,7 @@ jobs:
             USE_S3="false"
             [ -n "${{ env.TF_STATE_BUCKET }}" ] && USE_S3="true"
             echo "use_s3_backend=$USE_S3"               >> $GITHUB_OUTPUT
+            echo "is_dr=false"                          >> $GITHUB_OUTPUT
           fi
           echo "failover=$FAIL" >> $GITHUB_OUTPUT
 
@@ -184,7 +184,6 @@ jobs:
           path: deploy/publish
       - name: 🐳 Create hardened Dockerfile
         run: |
-          # BUG FIX #7: EXPOSE 8080 sesuai HOST_PORT
           cat > deploy/Dockerfile << 'DOCKERFILE'
           FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
           WORKDIR /app
@@ -242,7 +241,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🔧 Ensure Terraform
+      # ---------- GitHub-hosted (us-east-1) ----------
+      - name: '🔧 [GitHub] Install Terraform & Start Ministack'
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           if ! command -v terraform &>/dev/null; then
             curl -fsSL https://apt.releases.hashicorp.com/gpg \
@@ -254,12 +255,6 @@ jobs:
           fi
           terraform version
 
-      # BUG FIX #3 & #4: Ministack butuh docker.sock agar RDS bisa
-      # spawn container MySQL/Postgres yang nyata (bukan mock in-memory).
-      # Tanpa docker.sock → aws_db_instance.endpoint = null → Terraform fail.
-      # BUG FIX #5: Health check python3 JSON parse per-service.
-      - name: 🐳 Start Ministack (with RDS support)
-        run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           docker rm -f ministack 2>/dev/null || true
           docker run -d --name ministack \
@@ -283,11 +278,34 @@ jobs:
             sleep 3
           done
 
+      # ---------- Self-hosted (us-east-2) ----------
+      - name: '💻 [Laptop] Verify Ministack & Terraform'
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          echo "🔍 Verifying local environment..."
+          terraform version || { echo "❌ Terraform not found"; exit 1; }
+
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
+          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
+            echo "❌ Ministack container not running on port $PORT"
+            echo "   Please start it manually:"
+            echo "   docker run -d --name ministack -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest"
+            exit 1
+          fi
+
+          STATUS=$(curl -sf "http://localhost:${PORT}/_localstack/health" 2>/dev/null || echo '{}')
+          RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
+          if [ "$RDS" != "available" ]; then
+            echo "⚠️ Ministack RDS service not ready. Waiting a moment..."
+            sleep 10
+          fi
+          echo "✅ Ministack is running (port $PORT)"
+
+      # ---------- Common: Create Terraform config ----------
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
 
-          # Single-quote EOF → HCL ${var.x} aman, tidak di-expand oleh shell
           cat > terraform/main.tf << 'TFEOF'
           terraform {
             required_providers {
@@ -322,16 +340,23 @@ jobs:
             name        = "web-sg-${var.environment}-${var.aws_region}"
             description = "SG for ${var.aws_region}"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
+
             ingress {
-              from_port   = 80;  to_port = 80;  protocol = "tcp"
+              from_port   = 80
+              to_port     = 80
+              protocol    = "tcp"
               cidr_blocks = ["0.0.0.0/0"]
             }
             ingress {
-              from_port   = 443; to_port = 443; protocol = "tcp"
+              from_port   = 443
+              to_port     = 443
+              protocol    = "tcp"
               cidr_blocks = ["0.0.0.0/0"]
             }
             egress {
-              from_port   = 0;   to_port = 0;   protocol = "-1"
+              from_port   = 0
+              to_port     = 0
+              protocol    = "-1"
               cidr_blocks = ["0.0.0.0/0"]
             }
           }
@@ -343,7 +368,6 @@ jobs:
             tags = { Name = "web-server-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
           }
 
-          # Ministack RDS: spawn real MySQL Docker container via docker.sock
           resource "aws_db_instance" "mysql" {
             identifier          = "ministack-mysql-${var.environment}"
             engine              = "mysql"
@@ -364,7 +388,6 @@ jobs:
           output "ec2_public_ip" { value = aws_instance.web.public_ip }
           TFEOF
 
-          # Inject placeholders via sed (nilai tidak mengandung / sehingga aman)
           sed -i "s|PORT_PLACEHOLDER|${{ needs.dr-check.outputs.ministack_port }}|g"    terraform/main.tf
           sed -i "s|REGION_PLACEHOLDER|${{ needs.dr-check.outputs.active_region }}|g"   terraform/main.tf
           sed -i "s|ACCESS_KEY_PLACEHOLDER|${{ secrets.AWS_ACCESS_KEY_ID }}|g"          terraform/main.tf
@@ -373,7 +396,6 @@ jobs:
           sed -i "s|DBUSER_PLACEHOLDER|${{ secrets.DB_USER }}|g"                        terraform/main.tf
           sed -i "s|DBPASS_PLACEHOLDER|${{ secrets.DB_PASSWORD }}|g"                    terraform/main.tf
 
-          # backend.tf terpisah: double-quote EOF agar GitHub expressions dievaluasi
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
             cat > terraform/backend.tf << EOF
           terraform {
@@ -421,24 +443,18 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     steps:
-      # BUG FIX #1 — ROOT CAUSE "line 355":
-      # Step name mengandung ": " (colon + space) TANPA quotes.
-      # YAML parser membacanya sebagai nested key baru → syntax error.
-      # Fix: selalu quote step name yang mengandung titik dua.
-      - name: '🏥 PHASE 1: RDS Engine Health Check'
+      # ---------- GitHub-hosted: restart Ministack if needed ----------
+      - name: '🏥 [GitHub] Ensure Ministack & RDS'
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
 
-          # BUG FIX #8: GH-hosted runner = VM baru per job.
-          # Ministack dari infra job tidak ada → restart + tunggu RDS siap.
-          # Self-hosted (DR): Ministack masih hidup → rm -f + restart bersih.
-          echo "🔍 Checking Ministack..."
+          PORT="${{ needs.dr-check.outputs.ministack_port }}"
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
             echo "⚠️ Ministack tidak ditemukan, restart..."
-            PORT="${{ needs.dr-check.outputs.ministack_port }}"
             docker rm -f ministack 2>/dev/null || true
             docker run -d --name ministack \
               -p ${PORT}:4566 \
@@ -451,12 +467,9 @@ jobs:
               STATUS=$(curl -sf "http://localhost:${PORT}/_localstack/health" 2>/dev/null || echo '{}')
               RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
               [ "$RDS" == "available" ] && { echo "✅ Ministack RDS ready"; break; }
-              echo "  attempt $i/40 — rds=$RDS"
               sleep 3
             done
 
-            # Re-create RDS instance setelah Ministack restart
-            PORT="${{ needs.dr-check.outputs.ministack_port }}"
             docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
               -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -475,7 +488,6 @@ jobs:
                 --no-deletion-protection \
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || true
 
-            # Re-fetch endpoint setelah provisioning ulang
             RDS_ENDPOINT=$(docker run --rm --network host \
               -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
               -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
@@ -494,7 +506,7 @@ jobs:
             if docker run --rm --network host mysql:8.0 \
               mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" \
               -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
-              echo "✅ HEALTHCHECK PASS: RDS Ministack UP (attempt $i)"
+              echo "✅ HEALTHCHECK PASS (attempt $i)"
               exit 0
             fi
             echo "  attempt $i/60"
@@ -503,8 +515,28 @@ jobs:
           echo "❌ CRITICAL: RDS Healthcheck FAILED"
           exit 1
 
-      # BUG FIX #2: Same issue — step name "PHASE 2: ..." harus diquote
-      - name: '🗂️ PHASE 2: Database Schema Initialization'
+      # ---------- Self-hosted: just health check ----------
+      - name: '🏥 [Laptop] RDS Health Check'
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+
+          echo "🏥 Checking RDS at $RDS_HOST:$RDS_PORT ..."
+          for i in $(seq 1 30); do
+            if docker run --rm --network host mysql:8.0 \
+              mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" \
+              -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" --silent 2>/dev/null; then
+              echo "✅ RDS is healthy (attempt $i)"
+              break
+            fi
+            sleep 2
+          done
+
+      # ---------- Common: Schema init ----------
+      - name: '🗂️ Database Schema Initialization'
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
@@ -544,9 +576,9 @@ jobs:
           docker load < ${{ env.APP_NAME }}-image.tar.gz
           echo "✅ Golden Image Loaded."
 
-      # BUG FIX #8: GH-hosted = VM baru → Ministack + RDS tidak ada.
-      # Re-start Ministack dan re-provision RDS secara idempotent.
-      - name: 🐳 Ensure Ministack + RDS (Idempotent)
+      # ---------- GitHub-hosted: Ensure Ministack + RDS ----------
+      - name: '🐳 [GitHub] Ensure Ministack + RDS'
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
@@ -597,7 +629,17 @@ jobs:
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
           fi
 
-          # Simpan endpoint ke env file untuk step berikutnya
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
+
+      # ---------- Self-hosted: just set RDS env ----------
+      - name: '💻 [Laptop] Set RDS Connection'
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
@@ -623,7 +665,6 @@ jobs:
 
       - name: 🚀 Run container
         run: |
-          # BUG FIX #9: --read-only butuh tmpfs /app/logs selain /tmp
           docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
             -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
             -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
@@ -633,7 +674,6 @@ jobs:
             --tmpfs /app/logs:rw,noexec,nosuid,size=32m \
             ${{ env.APP_NAME }}:latest
 
-      # BUG FIX #7: Health check ke HOST_PORT (8080), bukan CONTAINER_PORT (5000)
       - name: 🔍 WAJIB Health Check Aplikasi
         run: |
           HEALTH_URL="http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json"
@@ -659,14 +699,15 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, deploy]
     steps:
-      # BUG FIX #8: GH-hosted = VM baru → app tidak ada → restart idempotent
       - name: ⬇️ Download Docker Image Artifact
         uses: actions/download-artifact@v4
         with:
           name: docker-image
           path: .
 
-      - name: 🐳 Ensure Ministack + RDS (Idempotent)
+      # ---------- GitHub-hosted: Ensure Ministack + RDS ----------
+      - name: '🐳 [GitHub] Ensure Ministack + RDS'
+        if: needs.dr-check.outputs.is_dr == 'false'
         run: |
           PORT="${{ needs.dr-check.outputs.ministack_port }}"
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
@@ -709,6 +750,17 @@ jobs:
                 --endpoint-url "http://localhost:${PORT}" 2>/dev/null || echo "127.0.0.1")
           fi
 
+          RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
+          RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
+          [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
+          echo "RDS_HOST=$RDS_HOST" >> $GITHUB_ENV
+          echo "RDS_PORT=${RDS_PORT:-3306}" >> $GITHUB_ENV
+
+      # ---------- Self-hosted: just set RDS env ----------
+      - name: '💻 [Laptop] Set RDS Connection'
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
@@ -782,7 +834,6 @@ jobs:
 
   # ==========================================
   # [CLEANUP] TEARDOWN RESOURCES
-  # BUG FIX #10: if: always() — semua skenario dibersihkan
   # ==========================================
   cleanup:
     name: 🧹 Cleanup
@@ -790,7 +841,9 @@ jobs:
     needs: [dr-check, traffic, dast]
     if: always()
     steps:
-      - name: 🗑️ Cleanup Resources in Ministack
+      # ---------- GitHub-hosted: full cleanup ----------
+      - name: '🗑️ [GitHub] Cleanup Resources'
+        if: needs.dr-check.outputs.is_dr == 'false'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -834,6 +887,14 @@ jobs:
 
           docker rm -f ministack 2>/dev/null || true
           echo "✅ Cleanup complete."
+
+      # ---------- Self-hosted: only stop app container, keep Ministack ----------
+      - name: '💻 [Laptop] Stop App Container (Keep Ministack)'
+        if: needs.dr-check.outputs.is_dr == 'true'
+        run: |
+          echo "🧹 Stopping app container..."
+          docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          echo "✅ Ministack tetap berjalan di laptop untuk pemakaian berikutnya."
 
   # ==========================================
   # [FINAL] SUMMARY REPORT
