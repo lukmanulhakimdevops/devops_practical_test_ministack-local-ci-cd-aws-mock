@@ -29,15 +29,15 @@ env:
   CONTAINER_NAME: todo-webapi
   HOST_PORT: 8080
   CONTAINER_PORT: 5000
-  MINISTACK_ENDPOINT: ${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}
+  MINISTACK_ENDPOINT: "${{ secrets.LOCALSTACK_ENDPOINT || 'http://localhost:4566' }}"
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  DB_NAME: ${{ secrets.DB_NAME }}
-  DB_USER: ${{ secrets.DB_USER }}
-  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET || '' }}
+  AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+  AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+  DB_NAME: "${{ secrets.DB_NAME }}"
+  DB_USER: "${{ secrets.DB_USER }}"
+  DB_PASSWORD: "${{ secrets.DB_PASSWORD }}"
+  TF_STATE_BUCKET: "${{ secrets.TF_STATE_BUCKET || '' }}"
 
 permissions:
   contents: read
@@ -53,16 +53,16 @@ jobs:
     name: 🧠 DR Decision
     runs-on: ubuntu-latest
     outputs:
-      active_region: ${{ steps.set.outputs.region }}
-      runner_label: ${{ steps.set.outputs.runner }}
-      ministack_port: ${{ steps.set.outputs.port }}
-      failover: ${{ steps.set.outputs.failover }}
-      state_key_prefix: ${{ steps.set.outputs.state_prefix }}
-      use_s3_backend: ${{ steps.set.outputs.use_s3_backend }}
+      active_region: "${{ steps.set.outputs.region }}"
+      runner_label: "${{ steps.set.outputs.runner }}"
+      ministack_port: "${{ steps.set.outputs.port }}"
+      failover: "${{ steps.set.outputs.failover }}"
+      state_key_prefix: "${{ steps.set.outputs.state_prefix }}"
+      use_s3_backend: "${{ steps.set.outputs.use_s3_backend }}"
     steps:
       - id: set
         run: |
-          FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+          FAIL="${{ github.event.inputs.manual_dr_trigger || 'false' }}"
           USE_S3="false"
           if [ "$FAIL" == "true" ]; then
             REGION="${{ env.AWS_REGION_DR }}"
@@ -101,11 +101,11 @@ jobs:
       - name: 🔐 Gitleaks – Secret Scanning
         uses: gitleaks/gitleaks-action@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
+          dotnet-version: "${{ env.DOTNET_VERSION }}"
       - name: 🧬 Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -126,7 +126,7 @@ jobs:
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
+          dotnet-version: "${{ env.DOTNET_VERSION }}"
       - name: 🔍 Audit NuGet vulnerabilities
         run: |
           dotnet restore TodoWebAPI/*.csproj
@@ -154,7 +154,7 @@ jobs:
       - name: 🔧 Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
+          dotnet-version: "${{ env.DOTNET_VERSION }}"
       - name: 🩹 Patch Microsoft.Build vulnerability
         run: |
           for proj in TodoWebAPI/*.csproj; do
@@ -187,50 +187,52 @@ jobs:
           name: webapp-binaries
           path: deploy/publish
       - name: 🐳 Create hardened Dockerfile
+        env:
+          DOCKERFILE_CONTENT: |
+            FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
+            WORKDIR /app
+            RUN apk update && apk upgrade --no-cache && apk add --no-cache openssl
+            RUN openssl req -x509 -newkey rsa:4096 -keyout /app/https-key.pem -out /app/https-cert.pem -days 365 -nodes -subj '/CN=localhost' && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/https-key.pem -in /app/https-cert.pem -passout pass:devpassword && rm /app/https-key.pem /app/https-cert.pem && apk del openssl
+            ENV ASPNETCORE_ENVIRONMENT=Production
+            ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
+            ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
+            RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
+            USER appuser
+            EXPOSE 5000 5001
+            COPY publish/ /app/
+            ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
         run: |
-          cat > deploy/Dockerfile <<'DOCKERFILE'
-          FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine
-          WORKDIR /app
-          RUN apk update && apk upgrade --no-cache && apk add --no-cache openssl
-          RUN openssl req -x509 -newkey rsa:4096 -keyout /app/https-key.pem -out /app/https-cert.pem -days 365 -nodes -subj '/CN=localhost' && openssl pkcs12 -export -out /app/aspnetapp.pfx -inkey /app/https-key.pem -in /app/https-cert.pem -passout pass:devpassword && rm /app/https-key.pem /app/https-cert.pem && apk del openssl
-          ENV ASPNETCORE_ENVIRONMENT=Production
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx
-          ENV ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword
-          RUN adduser -u 1000 --disabled-password --gecos "" appuser && chown -R appuser /app
-          USER appuser
-          EXPOSE 5000 5001
-          COPY publish/ /app/
-          ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
-          DOCKERFILE
+          mkdir -p deploy
+          echo "$DOCKERFILE_CONTENT" > deploy/Dockerfile
       - name: 🏗️ Build Docker Image
-        run: docker build -t ${{ env.APP_NAME }}:latest ./deploy
+        run: docker build -t "${{ env.APP_NAME }}:latest" ./deploy
       - name: 🛡️ Trivy Image Scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: '${{ env.APP_NAME }}:latest'
+          image-ref: "${{ env.APP_NAME }}:latest"
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
       - name: 💾 Save Docker Image
-        run: docker save ${{ env.APP_NAME }}:latest | gzip > ${{ env.APP_NAME }}-image.tar.gz
+        run: docker save "${{ env.APP_NAME }}:latest" | gzip > "${{ env.APP_NAME }}-image.tar.gz"
       - name: 📤 Upload Docker Image Artifact
         uses: actions/upload-artifact@v4
         with:
           name: docker-image
-          path: ${{ env.APP_NAME }}-image.tar.gz
+          path: "${{ env.APP_NAME }}-image.tar.gz"
           retention-days: 1
 
   # ==========================================
-  # [PARALLEL TRACK 5] PROVISION INFRASTRUCTURE (TERRAFORM -> MINISTACK)
+  # [PARALLEL TRACK 5] PROVISION INFRASTRUCTURE (TERRAFORM)
   # ==========================================
   infra:
     name: 🏗️ Provision Infrastructure
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    runs-on: "${{ needs.dr-check.outputs.runner_label }}"
     needs: dr-check
     outputs:
-      rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
-      ec2_public_ip: ${{ steps.tf.outputs.ec2_public_ip }}
+      rds_endpoint: "${{ steps.tf.outputs.rds_endpoint }}"
+      ec2_public_ip: "${{ steps.tf.outputs.ec2_public_ip }}"
     steps:
       - uses: actions/checkout@v4
       - name: 🔧 Ensure Terraform
@@ -242,93 +244,85 @@ jobs:
           fi
           
       - name: 📝 Create Terraform config
+        env:
+          TF_MAIN_CONFIG: |
+            terraform {
+              required_providers {
+                aws = { source = "hashicorp/aws", version = "~> 5.0" }
+                random = { source = "hashicorp/random", version = "~> 3.0" }
+              }
+            }
+            variable "ministack_endpoint" {}
+            variable "environment" {}
+            variable "aws_region" {}
+            variable "db_name" {}
+            variable "db_user" {}
+            variable "db_password" {}
+            variable "aws_access_key" {}
+            variable "aws_secret_key" {}
+            
+            provider "aws" {
+              region = var.aws_region
+              access_key = var.aws_access_key
+              secret_key = var.aws_secret_key
+              skip_credentials_validation = true
+              skip_requesting_account_id = true
+              skip_metadata_api_check = true
+              s3_use_path_style = true
+              endpoints {
+                ec2 = var.ministack_endpoint
+                s3 = var.ministack_endpoint
+                sts = var.ministack_endpoint
+                iam = var.ministack_endpoint
+                rds = var.ministack_endpoint
+              }
+            }
+            resource "random_id" "suffix" { byte_length = 4 }
+            resource "aws_security_group" "web_sg" {
+              name = "web-sg-${var.environment}-${var.aws_region}"
+              tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
+            }
+            resource "aws_instance" "web" {
+              ami = "ami-0ff8a91507f77f867"
+              instance_type = "t2.micro"
+              security_groups = [aws_security_group.web_sg.name]
+              tags = { Name = "web-server-${var.environment}" }
+            }
+            resource "aws_db_instance" "mysql" {
+              identifier = "ministack-mysql-${var.environment}"
+              engine = "mysql"
+              engine_version = "8.0"
+              instance_class = "db.t3.micro"
+              allocated_storage = 20
+              db_name = var.db_name
+              username = var.db_user
+              password = var.db_password
+              port = 3306
+              skip_final_snapshot = true
+              apply_immediately = true
+              publicly_accessible = true
+            }
+            output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
+            output "ec2_public_ip" { value = aws_instance.web.public_ip }
         run: |
           mkdir -p terraform
-          cat > terraform/main.tf <<'TFEOF'
-          terraform {
-            required_providers {
-              aws = { source = "hashicorp/aws", version = "~> 5.0" }
-              random = { source = "hashicorp/random", version = "~> 3.0" }
-            }
-          }
-          variable "ministack_endpoint" { default = "http://localhost:PORT_PLACEHOLDER" }
-          variable "environment" { default = "staging" }
-          variable "aws_region" { default = "REGION_PLACEHOLDER" }
-          
-          provider "aws" {
-            region = var.aws_region
-            access_key = "ACCESS_KEY_PLACEHOLDER"
-            secret_key = "SECRET_KEY_PLACEHOLDER"
-            skip_credentials_validation = true
-            skip_requesting_account_id = true
-            skip_metadata_api_check = true
-            s3_use_path_style = true
-            endpoints {
-              ec2 = var.ministack_endpoint
-              s3 = var.ministack_endpoint
-              sts = var.ministack_endpoint
-              iam = var.ministack_endpoint
-              rds = var.ministack_endpoint
-            }
-          }
-          resource "random_id" "suffix" { byte_length = 4 }
-          resource "aws_security_group" "web_sg" {
-            name = "web-sg-${var.environment}-${var.aws_region}"
-            tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps", Region = var.aws_region }
-          }
-          resource "aws_instance" "web" {
-            ami = "ami-0ff8a91507f77f867"
-            instance_type = "t2.micro"
-            security_groups = [aws_security_group.web_sg.name]
-            tags = { Name = "web-server-${var.environment}" }
-          }
-          
-          # TERRAFORM MEMBUAT RDS DI MINISTACK
-          resource "aws_db_instance" "mysql" {
-            identifier = "ministack-mysql-${var.environment}"
-            engine = "mysql"
-            engine_version = "8.0"
-            instance_class = "db.t3.micro"
-            allocated_storage = 20
-            db_name = "DBNAME_PLACEHOLDER"
-            username = "DBUSER_PLACEHOLDER"
-            password = "DBPASS_PLACEHOLDER"
-            port = 3306
-            skip_final_snapshot = true
-            apply_immediately = true
-            publicly_accessible = true
-          }
-          
-          # MENGAMBIL ENDPOINT YANG DIHASILKAN OLEH MINISTACK
-          output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
-          output "ec2_public_ip" { value = aws_instance.web.public_ip }
-          TFEOF
-          
-          sed -i "s/PORT_PLACEHOLDER/${{ needs.dr-check.outputs.ministack_port }}/g" terraform/main.tf
-          sed -i "s/REGION_PLACEHOLDER/${{ needs.dr-check.outputs.active_region }}/g" terraform/main.tf
-          sed -i "s/ACCESS_KEY_PLACEHOLDER/${{ secrets.AWS_ACCESS_KEY_ID }}/g" terraform/main.tf
-          sed -i "s/SECRET_KEY_PLACEHOLDER/${{ secrets.AWS_SECRET_ACCESS_KEY }}/g" terraform/main.tf
-          sed -i "s/DBNAME_PLACEHOLDER/${{ secrets.DB_NAME }}/g" terraform/main.tf
-          sed -i "s/DBUSER_PLACEHOLDER/${{ secrets.DB_USER }}/g" terraform/main.tf
-          sed -i "s/DBPASS_PLACEHOLDER/${{ secrets.DB_PASSWORD }}/g" terraform/main.tf
-          
-          if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
-            cat << 'EOF' > terraform/backend.tf
-            terraform {
-              backend "s3" {}
-            }
-          EOF
-          fi
+          echo "$TF_MAIN_CONFIG" > terraform/main.tf
 
       - name: 🗃️ Init & Apply Terraform
         id: tf
         working-directory: terraform
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_STATE_ACCESS_KEY || secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_STATE_SECRET_KEY || secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
+          TF_VAR_ministack_endpoint: "http://localhost:${{ needs.dr-check.outputs.ministack_port }}"
+          TF_VAR_environment: "${{ github.event.inputs.environment || 'staging' }}"
+          TF_VAR_aws_region: "${{ needs.dr-check.outputs.active_region }}"
+          TF_VAR_db_name: "${{ secrets.DB_NAME }}"
+          TF_VAR_db_user: "${{ secrets.DB_USER }}"
+          TF_VAR_db_password: "${{ secrets.DB_PASSWORD }}"
+          TF_VAR_aws_access_key: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          TF_VAR_aws_secret_key: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
         run: |
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
+            echo 'terraform { backend "s3" {} }' > backend.tf
             terraform init -input=false -reconfigure -upgrade \
               -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
               -backend-config="key=${{ needs.dr-check.outputs.state_key_prefix }}/${{ github.event.inputs.environment || 'staging' }}/terraform.tfstate" \
@@ -338,9 +332,7 @@ jobs:
             terraform init -input=false -reconfigure -upgrade
           fi
           
-          terraform apply -auto-approve -input=false -var="environment=${{ github.event.inputs.environment || 'staging' }}" -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
-          
-          # EKSPOR ENDPOINT UNTUK JOB BERIKUTNYA
+          terraform apply -auto-approve -input=false
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
@@ -349,10 +341,13 @@ jobs:
   # ==========================================
   db-init:
     name: 🗂️ RDS Healthcheck & DB Init
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    runs-on: "${{ needs.dr-check.outputs.runner_label }}"
     needs: [dr-check, infra]
     steps:
       - name: 🏥 PHASE 1: RDS Engine Health Check
+        env:
+          DB_USER: "${{ secrets.DB_USER }}"
+          DB_PASS: "${{ secrets.DB_PASSWORD }}"
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
@@ -361,7 +356,7 @@ jobs:
           
           echo "🏥 Healthcheck Ping ke TCP $RDS_HOST:$RDS_PORT..."
           for i in $(seq 1 60); do
-            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" --silent 2>/dev/null; then
+            if docker run --rm --network host mysql:8.0 mysqladmin ping -h"$RDS_HOST" -P"$RDS_PORT" -u"$DB_USER" -p"$DB_PASS" --silent 2>/dev/null; then
               echo "✅ HEALTHCHECK PASS: RDS Ministack UP."
               exit 0
             fi
@@ -372,21 +367,26 @@ jobs:
           exit 1
           
       - name: 🗂️ PHASE 2: Database Schema Initialization
+        env:
+          DB_USER: "${{ secrets.DB_USER }}"
+          DB_PASS: "${{ secrets.DB_PASSWORD }}"
+          DB_NAME: "${{ secrets.DB_NAME }}"
+          SQL_SCRIPT: |
+            CREATE TABLE IF NOT EXISTS TodoItems (
+              Id INT PRIMARY KEY AUTO_INCREMENT,
+              Name VARCHAR(255) NULL,
+              IsComplete TINYINT(1) NOT NULL DEFAULT 0,
+              CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           
-          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ secrets.DB_NAME }}" <<'SQLEOF'
-          CREATE TABLE IF NOT EXISTS TodoItems (
-            Id INT PRIMARY KEY AUTO_INCREMENT,
-            Name VARCHAR(255) NULL,
-            IsComplete TINYINT(1) NOT NULL DEFAULT 0,
-            CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          SQLEOF
+          echo "$SQL_SCRIPT" > init.sql
+          docker run -i --rm --network host mysql:8.0 mysql -h"$RDS_HOST" -P"$RDS_PORT" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < init.sql
           echo "✅ Database schema initialized."
 
   # ==========================================
@@ -394,9 +394,9 @@ jobs:
   # ==========================================
   deploy:
     name: 🚀 Deploy & Health Check
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    runs-on: "${{ needs.dr-check.outputs.runner_label }}"
     needs: [dr-check, sast, sca, container, db-init, infra]
-    environment: ${{ github.event.inputs.environment || 'staging' }}
+    environment: "${{ github.event.inputs.environment || 'staging' }}"
     steps:
       - name: ⬇️ Download Docker Image Artifact
         uses: actions/download-artifact@v4
@@ -404,21 +404,25 @@ jobs:
           name: docker-image
           path: .
       - name: 📦 Load Golden Image
-        run: docker load < ${{ env.APP_NAME }}-image.tar.gz && echo "✅ Golden Image Loaded."
+        run: docker load < "${{ env.APP_NAME }}-image.tar.gz" && echo "✅ Golden Image Loaded."
       - name: 🧹 Remove old container
-        run: docker rm -f ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+        run: docker rm -f "${{ env.CONTAINER_NAME }}" 2>/dev/null || true
       - name: 🚀 Run container
+        env:
+          DB_USER: "${{ secrets.DB_USER }}"
+          DB_PASS: "${{ secrets.DB_PASSWORD }}"
+          DB_NAME: "${{ secrets.DB_NAME }}"
         run: |
           RDS_ENDPOINT="${{ needs.infra.outputs.rds_endpoint }}"
           RDS_HOST=$(echo "$RDS_ENDPOINT" | cut -d':' -f1)
           RDS_PORT=$(echo "$RDS_ENDPOINT" | cut -d':' -f2)
           [ "$RDS_HOST" = "localhost" ] && RDS_HOST="127.0.0.1"
           
-          docker run -d --name ${{ env.CONTAINER_NAME }} --network host \
+          docker run -d --name "${{ env.CONTAINER_NAME }}" --network host \
             -e ASPNETCORE_URLS=http://+:${{ env.HOST_PORT }} \
-            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=${{ secrets.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};" \
+            -e "ConnectionStrings__DefaultConnection=Server=$RDS_HOST;Port=$RDS_PORT;Database=$DB_NAME;Uid=$DB_USER;Pwd=$DB_PASS;" \
             --security-opt="no-new-privileges:true" --read-only --tmpfs /tmp \
-            ${{ env.APP_NAME }}:latest
+            "${{ env.APP_NAME }}:latest"
             
       - name: 🔍 WAJIB Health Check Aplikasi
         run: |
@@ -432,7 +436,7 @@ jobs:
             sleep 5
           done
           echo "❌ HEALTH CHECK FAILED"
-          docker logs ${{ env.CONTAINER_NAME }}
+          docker logs "${{ env.CONTAINER_NAME }}"
           exit 1
 
   # ==========================================
@@ -440,7 +444,7 @@ jobs:
   # ==========================================
   dast:
     name: 🕷️ DAST Scan
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    runs-on: "${{ needs.dr-check.outputs.runner_label }}"
     needs: [dr-check, deploy]
     steps:
       - name: 🕷️ Run ZAP baseline scan
@@ -475,21 +479,18 @@ jobs:
   # ==========================================
   cleanup:
     name: 🧹 Conditional Cleanup
-    runs-on: ${{ needs.dr-check.outputs.runner_label }}
+    runs-on: "${{ needs.dr-check.outputs.runner_label }}"
     needs: [dr-check, traffic, dast]
-    if: |
-      always() && 
-      github.ref_name != 'develop' && 
-      (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
+    if: always() && github.ref_name != 'develop' && (needs.dast.result != 'success' || github.event.inputs.environment == 'production')
     steps:
       - name: 🗑️ Cleanup Resources in Ministack
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
           AWS_DEFAULT_REGION: us-east-1
-          MINISTACK_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-          ACTIVE_REGION: ${{ needs.dr-check.outputs.active_region }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          MINISTACK_PORT: "${{ needs.dr-check.outputs.ministack_port }}"
+          ACTIVE_REGION: "${{ needs.dr-check.outputs.active_region }}"
+          CONTAINER_NAME: "${{ env.CONTAINER_NAME }}"
         run: |
           set -euo pipefail
           echo "🧹 Cleaning up Application Container..."
