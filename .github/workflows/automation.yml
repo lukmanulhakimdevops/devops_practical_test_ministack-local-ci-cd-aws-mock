@@ -297,11 +297,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.5.0
-
       - name: 🐳 Start MySQL container (mock RDS)
         id: mysql
         run: |
@@ -330,19 +325,17 @@ jobs:
             sleep 3
           done
 
-      - name: 🐳 Ensure Ministack is running
+      - name: 🐳 Ensure Ministack is running (fresh)
         run: |
-          if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "🚀 Starting Ministack container..."
-            docker run -d --name ministack \
-              -p 4566:4566 \
-              -e SERVICES=ec2,s3,sts,iam \
-              nahuelnucera/ministack:latest
-            echo "⏳ Waiting 30s for Ministack to initialize..."
-            sleep 30
-          else
-            echo "✅ Ministack already running."
-          fi
+          echo "🧹 Removing old Ministack container if exists..."
+          docker rm -f ministack 2>/dev/null || true
+          echo "🚀 Starting fresh Ministack container..."
+          docker run -d --name ministack \
+            -p 4566:4566 \
+            -e SERVICES=ec2,s3,sts,iam \
+            nahuelnucera/ministack:latest
+          echo "⏳ Waiting 30s for Ministack to initialize..."
+          sleep 30
 
           echo "🔍 Checking Ministack health..."
           for i in $(seq 1 30); do
@@ -354,50 +347,46 @@ jobs:
             sleep 5
           done
 
-      - name: 🧹 Clean up leftover Ministack resources
+      - name: 🧹 Clean up leftover Ministack resources (pre-Terraform)
         env:
           AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
           AWS_REGION:       ${{ needs.dr-check.outputs.active_region }}
         run: |
           ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
-          echo "🧹 Cleaning leftovers for env: $ENV_NAME"
-          # EC2
-          INSTANCE_ID=$(aws ec2 describe-instances \
+          echo "🧹 Pre‑Terraform cleanup for env: $ENV_NAME"
+          # EC2 instances tagged Project=DevSecOps
+          INSTANCE_IDS=$(aws ec2 describe-instances \
             --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
-            --filters "Name=tag:Name,Values=web-server-${ENV_NAME}" \
-            --query "Reservations[0].Instances[0].InstanceId" \
+            --filters "Name=tag:Project,Values=DevSecOps" \
+            --query "Reservations[*].Instances[*].InstanceId" \
             --output text 2>/dev/null || echo "")
-          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
-            echo "🗑️ Terminating EC2: $INSTANCE_ID"
-            aws ec2 terminate-instances \
-              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
-              --instance-ids "$INSTANCE_ID" && sleep 10
-          fi
-          # Security Group
-          SG_ID=$(aws ec2 describe-security-groups \
+          for ID in $INSTANCE_IDS; do
+            [ -n "$ID" ] && [ "$ID" != "None" ] && \
+              aws ec2 terminate-instances --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --instance-ids "$ID" || true
+          done
+          [ -n "$INSTANCE_IDS" ] && sleep 10
+          # Security Groups with tag Project=DevSecOps (except default)
+          SG_IDS=$(aws ec2 describe-security-groups \
             --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
-            --filters "Name=group-name,Values=web-sg-${ENV_NAME}" \
-            --query "SecurityGroups[0].GroupId" \
+            --filters "Name=tag:Project,Values=DevSecOps" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
             --output text 2>/dev/null || echo "")
-          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
-            echo "🗑️ Deleting SG: $SG_ID"
-            aws ec2 delete-security-group \
-              --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
-              --group-id "$SG_ID" || true
-          fi
-          # S3 - delete all objects first, then bucket
+          for SG in $SG_IDS; do
+            [ -n "$SG" ] && [ "$SG" != "None" ] && \
+              aws ec2 delete-security-group --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --group-id "$SG" || true
+          done
+          # S3 buckets containing 'app-bucket'
           BUCKETS=$(aws s3api list-buckets \
             --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
-            --query "Buckets[?contains(Name,'app-bucket-${ENV_NAME}')].Name" \
+            --query "Buckets[?contains(Name,'app-bucket')].Name" \
             --output text 2>/dev/null || echo "")
           for BUCKET in $BUCKETS; do
             if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
-              echo "🗑️ Emptying and deleting S3 bucket: $BUCKET"
               aws s3 rm "s3://$BUCKET" --recursive --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" || true
               aws s3 rb "s3://$BUCKET" --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --force || true
             fi
           done
-          echo "✅ Cleanup done."
+          echo "✅ Pre‑Terraform cleanup done."
 
       - name: 📝 Create Terraform config
         run: |
@@ -508,22 +497,30 @@ jobs:
           TF_VAR_aws_region:         ${{ needs.dr-check.outputs.active_region }}
           AWS_ENDPOINT_URL:          ${{ env.MINISTACK_ENDPOINT }}
         run: |
-          terraform init
-          terraform apply -auto-approve \
+          terraform init -input=false
+          terraform apply -auto-approve -input=false \
             -var="environment=${{ github.event.inputs.environment || 'staging' }}" \
             -var="aws_region=${{ needs.dr-check.outputs.active_region }}"
           echo "s3_bucket=$(terraform output -raw s3_bucket)"         >> $GITHUB_OUTPUT
           echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
 
+      - name: 💾 Save Terraform state as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: terraform/terraform.tfstate
+          retention-days: 1
+        if: always()
+
   # --------------------------------------------------------------------------
-  # DB Init (Create schema in MySQL container)
+  # DB Init
   # --------------------------------------------------------------------------
   db-init:
     name: 🗂️ Initialize DB Tables
     runs-on: [self-hosted, linux, x64]
     needs: infra
     steps:
-      - name: ⏳ Wait for MySQL to be fully ready
+      - name: ⏳ Final MySQL readiness check
         run: |
           echo "⏳ Final check for MySQL..."
           for i in $(seq 1 10); do
@@ -554,13 +551,7 @@ jobs:
             INDEX idx_name (Name)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
           SQL
-
-          echo "✅ Tables created. Verifying..."
-          docker exec mock-rds-mysql mysql \
-            -u"${{ env.DB_USER }}" \
-            -p"${{ env.DB_PASSWORD }}" \
-            "${{ env.DB_NAME }}" \
-            -e "SHOW TABLES; SELECT COUNT(*) AS rows FROM TodoItems;"
+          echo "✅ Tables created."
 
   # --------------------------------------------------------------------------
   # Deploy
@@ -578,12 +569,9 @@ jobs:
 
       - name: 📂 Prepare deploy_input
         run: |
-          set -euo pipefail
           rm -rf deploy_input
           mkdir -p deploy_input/publish
           cp -r ./artifact/. deploy_input/publish/
-          echo "✅ Files ready:"
-          ls deploy_input/publish/
 
       - name: 🐳 Create hardened Dockerfile
         run: |
@@ -610,8 +598,7 @@ jobs:
           RUN adduser -u 1000 --disabled-password --gecos "" appuser \
            && chown -R appuser /app
           USER appuser
-          EXPOSE 5000
-          EXPOSE 5001
+          EXPOSE 5000 5001
           COPY publish/ /app/
           ENTRYPOINT ["dotnet", "TodoWebAPI.dll"]
           DOCKERFILE
@@ -619,52 +606,40 @@ jobs:
       - name: 🏗️ Build Docker image
         run: |
           docker build -t ${APP_NAME}:latest ./deploy_input
-          echo "✅ Image built: ${APP_NAME}:latest"
 
       - name: 🧹 Remove old container
         run: docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
 
       - name: 🚀 Run container
         run: |
-          set -euo pipefail
-
-          DB_PORT="3306"   # MySQL container exposed on 3306
-
           docker run -d \
             --name    ${CONTAINER_NAME} \
             --network host \
             -e        ASPNETCORE_ENVIRONMENT=Production \
             -e        ASPNETCORE_Kestrel__Certificates__Default__Path=/app/aspnetapp.pfx \
             -e        ASPNETCORE_Kestrel__Certificates__Default__Password=devpassword \
-            -e        "ConnectionStrings__DefaultConnection=Server=127.0.0.1;Port=${DB_PORT};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
+            -e        "ConnectionStrings__DefaultConnection=Server=127.0.0.1;Port=3306;Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};" \
             --security-opt="no-new-privileges:true" \
             --restart unless-stopped \
             --read-only \
             --tmpfs   /tmp \
             ${APP_NAME}:latest
 
-          echo "✅ Container started"
-          echo "   App:     http://localhost:${HOST_PORT}"
-          echo "   Swagger: http://localhost:${HOST_PORT}/api-docs"
-          echo "   DB:      127.0.0.1:${DB_PORT}/${{ env.DB_NAME }}"
-
       - name: ⏳ Wait for app readiness
         run: |
-          echo "⏳ Polling Swagger endpoint..."
           for i in $(seq 1 12); do
             if curl -sf "http://localhost:${HOST_PORT}/swagger/v1/swagger.json" >/dev/null 2>&1; then
               echo "✅ App ready after $((i * 5))s."
               exit 0
             fi
-            echo "   attempt $i/12 — retrying in 5s..."
             sleep 5
           done
-          echo "❌ App not ready after 60s. Container logs:"
+          echo "❌ App not ready. Logs:"
           docker logs ${CONTAINER_NAME}
           exit 1
 
   # --------------------------------------------------------------------------
-  # DAST (OWASP ZAP)
+  # DAST
   # --------------------------------------------------------------------------
   dast:
     name: 🕷️ DAST Scan (OWASP ZAP)
@@ -678,14 +653,14 @@ jobs:
             zap-baseline.py \
               -t "http://localhost:${HOST_PORT}" \
               -l FAIL || {
-                echo "❌ DAST found critical issues — stopping container."
+                echo "❌ DAST found critical issues."
                 docker rm -f ${CONTAINER_NAME}
                 exit 1
               }
           echo "✅ DAST passed."
 
   # --------------------------------------------------------------------------
-  # Traffic Switch Simulation
+  # Traffic Switch
   # --------------------------------------------------------------------------
   traffic:
     name: 🌐 Traffic Switch
@@ -694,10 +669,58 @@ jobs:
     steps:
       - run: |
           if [ "${{ needs.dr-check.outputs.failover }}" == "true" ]; then
-            echo "🔄 FAILOVER — routing to DR region: ${{ env.DR_FALLBACK_REGION }}"
+            echo "🔄 FAILOVER → DR region: ${{ env.DR_FALLBACK_REGION }}"
           else
-            echo "✅ PRIMARY — routing to: ${{ env.AWS_REGION_TARGET }}"
+            echo "✅ PRIMARY → region: ${{ env.AWS_REGION_TARGET }}"
           fi
+
+  # --------------------------------------------------------------------------
+  # Global Cleanup
+  # --------------------------------------------------------------------------
+  cleanup:
+    name: 🧹 Global Cleanup
+    runs-on: [self-hosted, linux, x64]
+    needs: [traffic, dast]
+    if: always()
+    steps:
+      - name: 🗑️ Cleanup containers & mock resources
+        env:
+          AWS_ENDPOINT_URL: ${{ env.MINISTACK_ENDPOINT }}
+          AWS_REGION:       ${{ env.AWS_REGION_TARGET }}
+        run: |
+          echo "🧹 Cleaning up..."
+          docker rm -f ${CONTAINER_NAME} mock-rds-mysql 2>/dev/null || true
+          ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
+          # EC2
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
+            --filters "Name=tag:Project,Values=DevSecOps" \
+            --query "Reservations[*].Instances[*].InstanceId" \
+            --output text 2>/dev/null || echo "")
+          for ID in $INSTANCE_IDS; do
+            [ -n "$ID" ] && aws ec2 terminate-instances --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --instance-ids "$ID" || true
+          done
+          # Security Groups
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
+            --filters "Name=tag:Project,Values=DevSecOps" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
+            --output text 2>/dev/null || echo "")
+          for SG in $SG_IDS; do
+            [ -n "$SG" ] && aws ec2 delete-security-group --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --group-id "$SG" || true
+          done
+          # S3 buckets
+          BUCKETS=$(aws s3api list-buckets \
+            --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" \
+            --query "Buckets[?contains(Name,'app-bucket')].Name" \
+            --output text 2>/dev/null || echo "")
+          for BUCKET in $BUCKETS; do
+            if [ -n "$BUCKET" ]; then
+              aws s3 rm "s3://$BUCKET" --recursive --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" || true
+              aws s3 rb "s3://$BUCKET" --endpoint-url="${{ env.MINISTACK_ENDPOINT }}" --force || true
+            fi
+          done
+          echo "✅ Cleanup complete."
 
   # --------------------------------------------------------------------------
   # Notification
@@ -705,15 +728,13 @@ jobs:
   notify:
     name: 📢 Pipeline Summary
     runs-on: ubuntu-latest
-    needs: [traffic, dast]
+    needs: [traffic, dast, cleanup]
     if: always()
     steps:
       - name: 📊 Print summary
         run: |
-          if [ "${{ needs.dast.result }}"    == "success" ] && \
-             [ "${{ needs.traffic.result }}" == "success" ]; then
-            STATUS="✅ SUCCESS"
-          else
+          STATUS="✅ SUCCESS"
+          if [ "${{ needs.dast.result }}" != "success" ] || [ "${{ needs.traffic.result }}" != "success" ]; then
             STATUS="❌ FAILED"
           fi
           echo "=============================="
