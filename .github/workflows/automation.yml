@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # PHASE 1: DR DECISION
+  # PHASE 1: DR DECISION (NEVER SKIP PRIMARY)
   # ==========================================
   dr-check:
     name: 🧠 Intelligence & Health Recon
@@ -83,8 +83,9 @@ jobs:
             STATUS="DOWN"
           fi
 
-          if [ "$STATUS" == "DOWN" ] || [ "$FAIL" == "true" ]; then
-            echo "🚀 ACTION: Initiating Failover to us-east-2 (Bare-Metal Laptop)"
+          # Only failover when MANUAL trigger is true
+          if [ "$FAIL" == "true" ]; then
+            echo "🚀 ACTION: Manual Failover to us-east-2 (Bare-Metal Laptop)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
@@ -93,6 +94,7 @@ jobs:
             echo "is_dr=true" >> $GITHUB_OUTPUT
             echo "failover=true" >> $GITHUB_OUTPUT
           else
+            # Always stay on Primary, regardless of health check status
             echo "🟢 ACTION: Staying on Primary us-east-1 (GitHub Cloud)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
@@ -107,7 +109,7 @@ jobs:
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # PHASE 2: SAST & SCA (PRIMARY ONLY)
+  # PHASE 2: SAST & SCA (ALWAYS ON PRIMARY)
   # ==========================================
   sast:
     name: 🔐 SAST & Secrets
