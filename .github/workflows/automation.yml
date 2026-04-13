@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # PHASE 1: DR DECISION (NEVER SKIP PRIMARY)
+  # PHASE 1: DR DECISION
   # ==========================================
   dr-check:
     name: 🧠 Intelligence & Health Recon
@@ -83,7 +83,6 @@ jobs:
             STATUS="DOWN"
           fi
 
-          # Only failover when MANUAL trigger is true
           if [ "$FAIL" == "true" ]; then
             echo "🚀 ACTION: Manual Failover to us-east-2 (Bare-Metal Laptop)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
@@ -94,7 +93,6 @@ jobs:
             echo "is_dr=true" >> $GITHUB_OUTPUT
             echo "failover=true" >> $GITHUB_OUTPUT
           else
-            # Always stay on Primary, regardless of health check status
             echo "🟢 ACTION: Staying on Primary us-east-1 (GitHub Cloud)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
@@ -109,7 +107,7 @@ jobs:
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # PHASE 2: SAST & SCA (ALWAYS ON PRIMARY)
+  # PHASE 2: SAST & SCA
   # ==========================================
   sast:
     name: 🔐 SAST & Secrets
@@ -251,7 +249,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # PHASE 3: INFRASTRUCTURE (BOTH ENVS)
+  # PHASE 3: INFRASTRUCTURE
   # ==========================================
   infra:
     name: 🏗️ IaC Provisioning
@@ -268,7 +266,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ----- Primary: Install Terraform & start Ministack (us-east-1) -----
       - name: 🔧 Install Terraform & Start Ministack (Primary)
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -298,7 +295,6 @@ jobs:
             sleep 3
           done
 
-      # ----- DR: Verify existing Ministack + Terraform (us-east-2) -----
       - name: 💻 Verify Local Environment (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
@@ -314,7 +310,6 @@ jobs:
           done
           echo "✅ Ministack ready"
 
-      # ----- Ensure state bucket (idempotent) -----
       - name: 🪣 Ensure S3 Bucket for Terraform State
         if: env.USE_S3_BACKEND == 'true'
         run: |
@@ -326,7 +321,6 @@ jobs:
             amazon/aws-cli s3 mb "s3://${{ env.TF_STATE_BUCKET }}" \
             --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
 
-      # ----- Terraform Configuration -----
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
@@ -422,7 +416,6 @@ jobs:
           output "db_identifier" { value = aws_db_instance.mysql.identifier }
           TFEOF
 
-          # Replace backend placeholder based on use_s3_backend
           if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
             sed -i 's|BACKEND_PLACEHOLDER|backend "s3" {}|g' terraform/main.tf
           else
@@ -435,7 +428,6 @@ jobs:
           aws_region         = "${REGION}"
           EOF
 
-      # ----- Terraform Init -----
       - name: 🗃️ Terraform Init
         working-directory: terraform
         env:
@@ -457,7 +449,6 @@ jobs:
             terraform init -input=false -reconfigure -upgrade
           fi
 
-      # ----- Force clean conflicting resources (idempotent) -----
       - name: 🧹 Force Clean Conflicting Resources
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
@@ -474,7 +465,6 @@ jobs:
           done
           sleep 10
 
-      # ----- Terraform Apply -----
       - name: 🚀 Terraform Apply
         id: tf
         working-directory: terraform
@@ -489,7 +479,7 @@ jobs:
           echo "✅ Terraform applied in ${REGION}"
 
   # ==========================================
-  # PHASE 4: DB INIT (BOTH ENVS)
+  # PHASE 4: DB INIT (FIXED)
   # ==========================================
   db-init:
     name: 🗂️ DB Healthcheck & Init
@@ -500,7 +490,7 @@ jobs:
       REGION:   ${{ needs.dr-check.outputs.active_region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      - name: 🐳 Ensure Ministack & RDS
+      - name: 🐳 Ensure Ministack & Locate MySQL Container
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
           DB_ID="${{ needs.infra.outputs.db_identifier }}"
@@ -509,18 +499,19 @@ jobs:
             echo "❌ No DB identifier found from Terraform output"
             exit 1
           fi
-          echo "RDS instance: $DB_ID"
+          echo "RDS instance identifier: $DB_ID"
 
+          # ---------- Ensure Ministack is running (consistent with infra job) ----------
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "⚠️ Ministack not found, restarting..."
+            echo "⚠️ Ministack container not running. Starting with bridge network..."
             docker rm -f ministack 2>/dev/null || true
             docker run -d --name ministack \
-              --network host \
-              -v /var/run/docker.sock:/var/run/docker.sock \
+              -p ${MS_PORT}:4566 \
               -e SERVICES=ec2,s3,sts,iam,rds \
               -e DEFAULT_REGION=${REGION} \
               nahuelnucera/ministack:latest
 
+            echo "⏳ Waiting for Ministack health endpoint..."
             for i in $(seq 1 40); do
               STATUS=$(curl -sf "http://localhost:${MS_PORT}/_localstack/health" 2>/dev/null || echo '{}')
               RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
@@ -531,44 +522,48 @@ jobs:
             echo "✅ Ministack already running"
           fi
 
-          echo "⏳ Waiting for RDS instance to be available..."
+          # ---------- Wait for MySQL container to appear (Terraform creates it via Ministack) ----------
+          echo "🔍 Waiting for MySQL container (matching '$DB_ID') to be created..."
+          MYSQL_CONTAINER=""
           for i in $(seq 1 60); do
-            STATUS=$(docker run --rm \
-              -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-              -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-              -e AWS_DEFAULT_REGION=${REGION} \
-              amazon/aws-cli rds describe-db-instances \
-                --db-instance-identifier "$DB_ID" \
-                --query "DBInstances[0].DBInstanceStatus" \
-                --output text \
-                --endpoint-url "$ENDPOINT_URL" 2>/dev/null || echo "creating")
-            [ "$STATUS" = "available" ] && { echo "✅ RDS available"; break; }
-            echo "  waiting... ($i/60) status=$STATUS"
+            # Look for container whose name starts with the DB identifier
+            MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep "^${DB_ID}" | head -n1)
+            if [ -n "$MYSQL_CONTAINER" ]; then
+              echo "✅ MySQL container found: $MYSQL_CONTAINER"
+              break
+            fi
+            echo "  waiting for MySQL container... ($i/60)"
             sleep 5
           done
 
-          # IP Hunting
-          MYSQL_CONTAINER=$(docker ps --format '{{.Names}}' | grep -E "ministack-mysql.*${ENV_NAME}" | head -n1)
           if [ -z "$MYSQL_CONTAINER" ]; then
-            echo "❌ MySQL container not found"
+            echo "❌ MySQL container never appeared. Debug info:"
+            docker ps -a --format "table {{.Names}}\t{{.Status}}"
             exit 1
           fi
+
+          # ---------- Obtain IP address of the MySQL container ----------
           echo "🔍 Hunting IP for container $MYSQL_CONTAINER"
+          DB_IP=""
           for i in $(seq 1 30); do
             DB_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$MYSQL_CONTAINER" 2>/dev/null || echo "")
-            if [ -n "$DB_IP" ]; then
+            if [ -n "$DB_IP" ] && [ "$DB_IP" != "<no value>" ]; then
               echo "✅ MySQL container IP: $DB_IP"
               break
             fi
             sleep 2
           done
-          if [ -z "$DB_IP" ]; then
+
+          if [ -z "$DB_IP" ] || [ "$DB_IP" = "<no value>" ]; then
             echo "❌ Could not determine MySQL container IP"
+            docker inspect "$MYSQL_CONTAINER" | grep -A5 NetworkSettings
             exit 1
           fi
+
           DB_PORT=3306
           echo "RDS_HOST=$DB_IP" >> $GITHUB_ENV
           echo "RDS_PORT=$DB_PORT" >> $GITHUB_ENV
+          echo "MYSQL_CONTAINER=$MYSQL_CONTAINER" >> $GITHUB_ENV
           echo "✅ RDS endpoint (internal): $DB_IP:$DB_PORT"
 
       - name: 🏥 MySQL Health Check
@@ -585,7 +580,8 @@ jobs:
             fi
             sleep 5
           done
-          echo "❌ MySQL never became ready"
+          echo "❌ MySQL never became ready. Container logs:"
+          docker logs --tail 50 "$MYSQL_CONTAINER"
           exit 1
 
       - name: 🗂️ Schema Initialization
@@ -605,7 +601,7 @@ jobs:
           echo "✅ Schema ready in ${REGION}"
 
   # ==========================================
-  # PHASE 5: DEPLOY & DAST (BOTH ENVS)
+  # PHASE 5: DEPLOY & DAST
   # ==========================================
   deploy:
     name: 🚀 Deploy & Fullstack DAST
@@ -720,7 +716,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # PHASE 6: CLEANUP (EPHEMERAL ONLY)
+  # PHASE 6: CLEANUP
   # ==========================================
   cleanup:
     name: 🧹 SRE Cleanup
