@@ -1,4 +1,4 @@
-name: 🛡️ Enterprise DevSecOps CI/CD (Full-Spectrum Bare-Metal DR)
+name: 🛡️ Enterprise DevSecOps CI/CD (Force Primary Deploy)
 
 on:
   push:
@@ -10,7 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       manual_dr_trigger:
-        description: 'Force DR failover (Override Healthcheck)'
+        description: 'Force DR failover to us-east-2 (Override Healthcheck)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      force_primary_deploy:
+        description: 'FORCE deploy to us-east-1 even if health check fails'
         required: false
         default: 'false'
         type: choice
@@ -46,10 +52,10 @@ permissions:
 
 jobs:
   # ==========================================
-  # [PHASE 1: RADAR - DR DECISION]
+  # [PHASE 1: RADAR - DR DECISION WITH FORCE OVERRIDE]
   # ==========================================
   dr-check:
-    name: 🧠 Intelligence Recon
+    name: 🧠 Intelligence Recon + Force Override
     runs-on: ubuntu-latest
     outputs:
       runner_label: ${{ steps.radar.outputs.runner }}
@@ -57,33 +63,46 @@ jobs:
       is_dr: ${{ steps.radar.outputs.is_dr }}
       ministack_port: ${{ steps.radar.outputs.port }}
       env_name: ${{ steps.radar.outputs.env_name }}
+      force_primary: ${{ steps.radar.outputs.force_primary }}
     steps:
       - id: radar
         run: |
           FAIL="${{ github.event.inputs.manual_dr_trigger }}"
+          FORCE_PRIMARY="${{ github.event.inputs.force_primary_deploy }}"
           ENV_NAME="staging"
           
           echo "📡 Scanning Primary Region us-east-1..."
           STATUS="UP"
           if ! curl -sf --connect-timeout 5 "${{ env.PRIMARY_ENDPOINT }}/_localstack/health" > /dev/null 2>&1; then
-            echo "🚨 ALERT: us-east-1 is DOWN!"
+            echo "🚨 ALERT: us-east-1 health check FAILED!"
             STATUS="DOWN"
           fi
 
-          if [ "$STATUS" == "DOWN" ] || [ "$FAIL" == "true" ]; then
+          # FORCE PRIMARY OVERRIDE LOGIC
+          if [ "$FORCE_PRIMARY" == "true" ]; then
+            echo "⚡ FORCE_PRIMARY=true: Bypassing health check, deploying to us-east-1"
+            echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
+            echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
+            echo "is_dr=false" >> $GITHUB_OUTPUT
+            echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=true" >> $GITHUB_OUTPUT
+          elif [ "$FAIL" == "true" ] || [ "$STATUS" == "DOWN" ]; then
             echo "🚀 FAILOVER: Targeting Bare-Metal Laptop (us-east-2)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
             echo "is_dr=true" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=false" >> $GITHUB_OUTPUT
           else
             echo "🟢 PRIMARY: Targeting GitHub Cloud (us-east-1)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "is_dr=false" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=false" >> $GITHUB_OUTPUT
           fi
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+          echo "📊 Decision: force=$FORCE_PRIMARY | health=$STATUS | is_dr=${{ steps.radar.outputs.is_dr }}"
 
   # ==========================================
   # [PHASE 2: SAST & SECRETS SCAN]
@@ -682,10 +701,14 @@ jobs:
     steps:
       - run: |
           echo "========================================"
-          echo "🛡️ FULL-SPECTRUM DEVSECOPS SUMMARY"
+          echo "🛡️ FORCE PRIMARY DEPLOY SUMMARY"
           echo "========================================"
-          echo "Target Region  : ${{ needs.dr-check.outputs.region }}"
-          echo "Runner State   : ${{ needs.dr-check.outputs.is_dr == 'true' && '💻 BARE-METAL' || '☁️ GITHUB CLOUD' }}"
-          echo "Deployment     : ${{ needs.deploy.result }}"
+          echo "Force Primary    : ${{ needs.dr-check.outputs.force_primary }}"
+          echo "Target Region    : ${{ needs.dr-check.outputs.region }}"
+          echo "Runner State     : ${{ needs.dr-check.outputs.is_dr == 'true' && '💻 BARE-METAL' || '☁️ GITHUB CLOUD' }}"
+          echo "Deployment       : ${{ needs.deploy.result }}"
           echo "========================================"
-          echo "URL: http://localhost:${{ env.HOST_PORT }}"
+          echo "🌐 App URL: http://localhost:${{ env.HOST_PORT }}"
+          if [ "${{ needs.dr-check.outputs.force_primary }}" == "true" ]; then
+            echo "⚡ Deployed to us-east-1 BYPASSING health check alarm!"
+          fi
