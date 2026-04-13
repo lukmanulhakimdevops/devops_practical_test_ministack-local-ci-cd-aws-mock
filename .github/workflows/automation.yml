@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # [PHASE 1: RADAR - AUTOMATED HEALTHCHECK & DR DECISION]
+  # PHASE 1: DR DECISION
   # ==========================================
   dr-check:
     name: 🧠 Intelligence & Health Recon
@@ -107,7 +107,7 @@ jobs:
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
 
   # ==========================================
-  # [PHASE 2: BUILD & SECURITY SAST/SCA – PRIMARY ONLY]
+  # PHASE 2: SAST & SCA (PRIMARY ONLY)
   # ==========================================
   sast:
     name: 🔐 SAST & Secrets
@@ -249,7 +249,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # [PHASE 3: INFRASTRUCTURE PROVISIONING – BOTH ENVS]
+  # PHASE 3: INFRASTRUCTURE (BOTH ENVS)
   # ==========================================
   infra:
     name: 🏗️ IaC Provisioning
@@ -479,7 +479,7 @@ jobs:
           echo "✅ Terraform applied in ${REGION}"
 
   # ==========================================
-  # [PHASE 4: DB INIT & IP HUNTING]
+  # PHASE 4: DB INIT (BOTH ENVS)
   # ==========================================
   db-init:
     name: 🗂️ DB Healthcheck & Init
@@ -595,7 +595,7 @@ jobs:
           echo "✅ Schema ready in ${REGION}"
 
   # ==========================================
-  # [PHASE 5: DEPLOY & FULLSTACK DAST]
+  # PHASE 5: DEPLOY & DAST (BOTH ENVS)
   # ==========================================
   deploy:
     name: 🚀 Deploy & Fullstack DAST
@@ -710,7 +710,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # [PHASE 6: CLEANUP – EPHEMERAL ONLY]
+  # PHASE 6: CLEANUP (EPHEMERAL ONLY)
   # ==========================================
   cleanup:
     name: 🧹 SRE Cleanup
@@ -765,7 +765,7 @@ jobs:
           echo "✅ Cleanup complete"
 
   # ==========================================
-  # [PHASE 7: MISSION SUMMARY]
+  # PHASE 7: SUMMARY
   # ==========================================
   notify:
     name: 📢 Mission Summary
