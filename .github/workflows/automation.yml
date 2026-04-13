@@ -264,6 +264,7 @@ jobs:
       MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
       REGION:  ${{ needs.dr-check.outputs.active_region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
+      USE_S3_BACKEND: ${{ needs.dr-check.outputs.use_s3_backend }}
     steps:
       - uses: actions/checkout@v4
 
@@ -315,7 +316,7 @@ jobs:
 
       # ----- Ensure state bucket (idempotent) -----
       - name: 🪣 Ensure S3 Bucket for Terraform State
-        if: env.TF_STATE_BUCKET != ''
+        if: env.USE_S3_BACKEND == 'true'
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
           docker run --rm \
@@ -335,7 +336,7 @@ jobs:
               aws    = { source = "hashicorp/aws", version = "~> 5.0" }
               random = { source = "hashicorp/random", version = "~> 3.0" }
             }
-            backend "s3" {}
+            BACKEND_PLACEHOLDER
           }
 
           variable "ministack_endpoint" {}
@@ -421,6 +422,13 @@ jobs:
           output "db_identifier" { value = aws_db_instance.mysql.identifier }
           TFEOF
 
+          # Replace backend placeholder based on use_s3_backend
+          if [ "${{ needs.dr-check.outputs.use_s3_backend }}" == "true" ]; then
+            sed -i 's|BACKEND_PLACEHOLDER|backend "s3" {}|g' terraform/main.tf
+          else
+            sed -i '/BACKEND_PLACEHOLDER/d' terraform/main.tf
+          fi
+
           cat > terraform/terraform.tfvars << EOF
           ministack_endpoint = "http://localhost:${MS_PORT}"
           environment        = "${ENV_NAME}"
@@ -428,7 +436,7 @@ jobs:
           EOF
 
       # ----- Terraform Init -----
-      - name: 🗃️ Terraform Init (Remote S3 Backend)
+      - name: 🗃️ Terraform Init
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
