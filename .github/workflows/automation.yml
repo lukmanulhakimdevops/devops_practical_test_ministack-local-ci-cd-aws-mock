@@ -788,5 +788,3 @@ jobs:
           echo "Deployment     : ${{ needs.deploy.result }}"
           echo "========================================"
           echo "URL: http://localhost:${{ env.HOST_PORT }}"
-
-liat nih bisa!
