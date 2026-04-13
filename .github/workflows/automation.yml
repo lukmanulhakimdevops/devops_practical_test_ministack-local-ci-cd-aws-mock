@@ -387,13 +387,13 @@ output "rds_endpoint" {
 output "s3_bucket" {
   value = aws_s3_bucket.artifacts.bucket
 }
-          TFEOF
+TFEOF
 
           cat > terraform/terraform.tfvars << EOF
 ministack_endpoint = "http://localhost:${MS_PORT}"
 environment        = "${ENV_NAME}"
 aws_region         = "${REGION}"
-          EOF
+EOF
 
       - name: 🗃️ Terraform Init (Remote S3 Backend)
         working-directory: terraform
