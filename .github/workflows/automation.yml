@@ -27,7 +27,7 @@ env:
   APP_NAME: todo-webapi
   CONTAINER_NAME: todo-webapi
   HOST_PORT: 8080
-  PRIMARY_ENDPOINT: "http://localhost:4566"
+  PRIMARY_ENDPOINT: 'http://localhost:4566'
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -189,12 +189,11 @@ jobs:
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
     env:
       MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
-      REGION:  ${{ needs.dr-check.outputs.region }}
+      REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - uses: actions/checkout@v4
 
-      # --- Primary: Install Terraform & start Ministack (us-east-1 ONLY) ---
       - name: 🔧 Install Terraform & Start Ministack (Primary)
         if: needs.dr-check.outputs.is_dr == 'false'
         run: |
@@ -216,7 +215,7 @@ jobs:
           echo "⏳ Waiting for Ministack services..."
           for i in $(seq 1 40); do
             STATUS=$(curl -sf "http://localhost:${MS_PORT}/_localstack/health" 2>/dev/null || echo '{}')
-            S3=$(echo  "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))"  2>/dev/null)
+            S3=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))" 2>/dev/null)
             EC2=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('ec2',''))" 2>/dev/null)
             RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
             if [ "$S3" = "available" ] && [ "$EC2" = "available" ] && [ "$RDS" = "available" ]; then
@@ -226,14 +225,12 @@ jobs:
             sleep 3
           done
 
-      # --- DR: Verify existing Ministack + Terraform (us-east-2 ONLY) ---
       - name: 💻 Verify Local Environment (DR)
         if: needs.dr-check.outputs.is_dr == 'true'
         run: |
           terraform version || { echo "❌ Terraform not found."; exit 1; }
           if ! docker ps --format '{{.Names}}' | grep -q '^ministack$'; then
-            echo "❌ Ministack not running. Start with:"
-            echo "   docker run -d --name ministack --network host -v /var/run/docker.sock:/var/run/docker.sock -e SERVICES=ec2,s3,sts,iam,rds nahuelnucera/ministack:latest"
+            echo "❌ Ministack not running."
             exit 1
           fi
           for i in $(seq 1 10); do
@@ -242,7 +239,6 @@ jobs:
           done
           echo "✅ Ministack ready"
 
-      # --- Create state bucket (idempotent) ---
       - name: 🪣 Ensure S3 Bucket for Terraform State
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
@@ -253,37 +249,36 @@ jobs:
             amazon/aws-cli s3 mb "s3://${{ env.TF_STATE_BUCKET }}" \
             --endpoint-url "$ENDPOINT_URL" 2>/dev/null || true
 
-      # --- Common Terraform configuration ---
       - name: 📝 Create Terraform config
         run: |
           mkdir -p terraform
           cat > terraform/main.tf << 'TFEOF'
           terraform {
             required_providers {
-              aws    = { source = "hashicorp/aws",    version = "~> 5.0" }
+              aws = { source = "hashicorp/aws", version = "~> 5.0" }
               random = { source = "hashicorp/random", version = "~> 3.0" }
             }
             backend "s3" {}
           }
 
           variable "ministack_endpoint" {}
-          variable "environment"        {}
-          variable "aws_region"         {}
-          variable "db_name"            { sensitive = true }
-          variable "db_user"            { sensitive = true }
-          variable "db_password"        { sensitive = true }
+          variable "environment" {}
+          variable "aws_region" {}
+          variable "db_name" { sensitive = true }
+          variable "db_user" { sensitive = true }
+          variable "db_password" { sensitive = true }
 
           provider "aws" {
-            region                      = var.aws_region
-            access_key                  = "test"
-            secret_key                  = "test"
+            region = var.aws_region
+            access_key = "test"
+            secret_key = "test"
             skip_credentials_validation = true
-            skip_requesting_account_id  = true
-            skip_metadata_api_check     = true
-            s3_use_path_style           = true
+            skip_requesting_account_id = true
+            skip_metadata_api_check = true
+            s3_use_path_style = true
             endpoints {
               ec2 = var.ministack_endpoint
-              s3  = var.ministack_endpoint
+              s3 = var.ministack_endpoint
               sts = var.ministack_endpoint
               iam = var.ministack_endpoint
               rds = var.ministack_endpoint
@@ -293,74 +288,73 @@ jobs:
           resource "random_id" "suffix" { byte_length = 4 }
 
           resource "aws_security_group" "web_sg" {
-            name        = "web-sg-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
+            name = "web-sg-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
             description = "SG for ${var.aws_region}"
             tags = { Name = "web-sg-${var.environment}", Project = "DevSecOps" }
             ingress {
-              from_port   = 80
-              to_port     = 80
-              protocol    = "tcp"
+              from_port = 80
+              to_port = 80
+              protocol = "tcp"
               cidr_blocks = ["0.0.0.0/0"]
             }
             ingress {
-              from_port   = 443
-              to_port     = 443
-              protocol    = "tcp"
+              from_port = 443
+              to_port = 443
+              protocol = "tcp"
               cidr_blocks = ["0.0.0.0/0"]
             }
             egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
+              from_port = 0
+              to_port = 0
+              protocol = "-1"
               cidr_blocks = ["0.0.0.0/0"]
             }
           }
 
           resource "aws_instance" "web" {
-            ami             = "ami-0ff8a91507f77f867"
-            instance_type   = "t2.micro"
+            ami = "ami-0ff8a91507f77f867"
+            instance_type = "t2.micro"
             security_groups = [aws_security_group.web_sg.name]
             tags = { Name = "web-server-${var.environment}", Project = "DevSecOps" }
           }
 
           resource "aws_s3_bucket" "artifacts" {
             bucket = "artifacts-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
-            tags   = { Project = "DevSecOps" }
+            tags = { Project = "DevSecOps" }
           }
 
           resource "aws_db_instance" "mysql" {
-            identifier          = "ministack-mysql-${var.environment}-${random_id.suffix.hex}"
-            engine              = "mysql"
-            engine_version      = "8.0"
-            instance_class      = "db.t3.micro"
-            allocated_storage   = 20
-            db_name             = var.db_name
-            username            = var.db_user
-            password            = var.db_password
-            port                = 3306
+            identifier = "ministack-mysql-${var.environment}-${random_id.suffix.hex}"
+            engine = "mysql"
+            engine_version = "8.0"
+            instance_class = "db.t3.micro"
+            allocated_storage = 20
+            db_name = var.db_name
+            username = var.db_user
+            password = var.db_password
+            port = 3306
             skip_final_snapshot = true
-            apply_immediately   = true
+            apply_immediately = true
             publicly_accessible = true
             tags = { Project = "DevSecOps" }
           }
 
           output "rds_endpoint" { value = aws_db_instance.mysql.endpoint }
-          output "s3_bucket"    { value = aws_s3_bucket.artifacts.bucket }
+          output "s3_bucket" { value = aws_s3_bucket.artifacts.bucket }
           TFEOF
 
           cat > terraform/terraform.tfvars << EOF
           ministack_endpoint = "http://localhost:${MS_PORT}"
-          environment        = "${ENV_NAME}"
-          aws_region         = "${REGION}"
+          environment = "${ENV_NAME}"
+          aws_region = "${REGION}"
           EOF
 
-      # --- Terraform Init with Remote Backend ---
       - name: 🗃️ Terraform Init (Remote S3 Backend)
         working-directory: terraform
         env:
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    us-east-1
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           terraform init -input=false -reconfigure -upgrade \
             -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
@@ -372,7 +366,6 @@ jobs:
             -backend-config="skip_region_validation=true" \
             -backend-config="force_path_style=true"
 
-      # --- Force clean conflicting resources (idempotent) ---
       - name: 🧹 Force Clean Conflicting Resources
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
@@ -398,13 +391,12 @@ jobs:
           done
           sleep 10
 
-      # --- Terraform Apply ---
       - name: 🚀 Terraform Apply
         id: tf
         working-directory: terraform
         env:
-          TF_VAR_db_name:     ${{ secrets.DB_NAME }}
-          TF_VAR_db_user:     ${{ secrets.DB_USER }}
+          TF_VAR_db_name: ${{ secrets.DB_NAME }}
+          TF_VAR_db_user: ${{ secrets.DB_USER }}
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
         run: |
           terraform apply -auto-approve -input=false
@@ -419,8 +411,8 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, infra]
     env:
-      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
-      REGION:   ${{ needs.dr-check.outputs.region }}
+      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
+      REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - name: 🐳 Ensure Ministack & RDS
@@ -475,7 +467,6 @@ jobs:
             sleep 5
           done
 
-          # IP Hunting
           MYSQL_CONTAINER="$DB_ID"
           echo "🔍 Hunting IP for container $MYSQL_CONTAINER"
           for i in $(seq 1 30); do
@@ -515,11 +506,11 @@ jobs:
             mysql --protocol=TCP -h"${RDS_HOST}" -P"${RDS_PORT}" \
             -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
-            Id         INT          PRIMARY KEY AUTO_INCREMENT,
-            Name       VARCHAR(255) NULL,
-            IsComplete TINYINT(1)   NOT NULL DEFAULT 0,
-            CreatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-            UpdatedAt  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            Id INT PRIMARY KEY AUTO_INCREMENT,
+            Name VARCHAR(255) NULL,
+            IsComplete TINYINT(1) NOT NULL DEFAULT 0,
+            CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
           SQL
           echo "✅ Schema ready in ${REGION}"
@@ -532,11 +523,11 @@ jobs:
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: [dr-check, build, db-init]
     env:
-      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
-      REGION:   ${{ needs.dr-check.outputs.region }}
+      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
+      REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      - name: ⬇️ Download Golden Image (Primary: current run, DR: latest main)
+      - name: ⬇️ Download Golden Image
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: ${{ github.workflow }}
@@ -606,8 +597,7 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-api-scan.py \
             -t http://localhost:${{ env.HOST_PORT }}/swagger/v1/swagger.json \
-            -f openapi -r dast_report.html \
-          || echo "⚠️ Security findings detected."
+            -f openapi -r dast_report.html || echo "⚠️ Security findings detected."
           echo "✅ DAST completed"
 
       - name: 📤 Upload ZAP Report
@@ -627,8 +617,8 @@ jobs:
     needs: [dr-check, deploy]
     if: always() && github.event.inputs.cleanup_resources == 'true' && needs.dr-check.outputs.is_dr == 'false'
     env:
-      MS_PORT:  ${{ needs.dr-check.outputs.ministack_port }}
-      REGION:   ${{ needs.dr-check.outputs.region }}
+      MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
+      REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
       - name: 🗑️ Cleanup Ministack Resources
@@ -684,7 +674,7 @@ jobs:
     steps:
       - run: |
           echo "========================================"
-          echo "🛡️  FULL-SPECTRUM DEVSECOPS SUMMARY"
+          echo "🛡️ FULL-SPECTRUM DEVSECOPS SUMMARY"
           echo "========================================"
           echo "Target Region  : ${{ needs.dr-check.outputs.region }}"
           echo "Runner State   : ${{ needs.dr-check.outputs.is_dr == 'true' && '💻 BARE-METAL' || '☁️ GITHUB CLOUD' }}"
