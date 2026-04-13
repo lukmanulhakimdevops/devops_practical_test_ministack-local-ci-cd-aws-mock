@@ -36,12 +36,13 @@ env:
   PRIMARY_ENDPOINT: 'http://localhost:4566'
   AWS_REGION_PRIMARY: us-east-1
   AWS_REGION_DR: us-east-2
+  # ✅ Semua credential via GitHub Secrets — TIDAK DI-HARDCODE
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   DB_NAME: ${{ secrets.DB_NAME }}
   DB_USER: ${{ secrets.DB_USER }}
   DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-  TF_STATE_BUCKET: ministack-terraform-state
+  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
   TF_STATE_KEY: devsecops/todo-webapi/terraform.tfstate
 
 permissions:
@@ -52,10 +53,10 @@ permissions:
 
 jobs:
   # ==========================================
-  # [PHASE 1: RADAR - DR DECISION WITH RUNNER TYPE DETECTION]
+  # [PHASE 1: RADAR - DR DECISION]
   # ==========================================
   dr-check:
-    name: 🧠 Intelligence Recon + Runner Detection
+    name: 🧠 Intelligence Recon
     runs-on: ubuntu-latest
     outputs:
       runner_label: ${{ steps.radar.outputs.runner }}
@@ -63,10 +64,7 @@ jobs:
       is_dr: ${{ steps.radar.outputs.is_dr }}
       ministack_port: ${{ steps.radar.outputs.port }}
       env_name: ${{ steps.radar.outputs.env_name }}
-      force_primary: ${{ steps.radar.outputs.force_primary }}
       runner_type: ${{ steps.radar.outputs.runner_type }}
-      network_mode: ${{ steps.radar.outputs.network_mode }}
-      docker_socket: ${{ steps.radar.outputs.docker_socket }}
     steps:
       - id: radar
         run: |
@@ -81,43 +79,32 @@ jobs:
             STATUS="DOWN"
           fi
 
-          # DR Decision Logic with Runner Type Detection
           if [ "$FORCE_PRIMARY" == "true" ]; then
             echo "⚡ FORCE_PRIMARY=true: Deploying to us-east-1 (GitHub-hosted)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "is_dr=false" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
-            echo "force_primary=true" >> $GITHUB_OUTPUT
             echo "runner_type=github-hosted" >> $GITHUB_OUTPUT
-            echo "network_mode=bridge" >> $GITHUB_OUTPUT
-            echo "docker_socket=false" >> $GITHUB_OUTPUT
           elif [ "$FAIL" == "true" ] || [ "$STATUS" == "DOWN" ]; then
             echo "🚀 FAILOVER: Targeting Bare-Metal Laptop (us-east-2)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
             echo "is_dr=true" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
-            echo "force_primary=false" >> $GITHUB_OUTPUT
             echo "runner_type=self-hosted" >> $GITHUB_OUTPUT
-            echo "network_mode=host" >> $GITHUB_OUTPUT
-            echo "docker_socket=true" >> $GITHUB_OUTPUT
           else
             echo "🟢 PRIMARY: Targeting GitHub Cloud (us-east-1)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "is_dr=false" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
-            echo "force_primary=false" >> $GITHUB_OUTPUT
             echo "runner_type=github-hosted" >> $GITHUB_OUTPUT
-            echo "network_mode=bridge" >> $GITHUB_OUTPUT
-            echo "docker_socket=false" >> $GITHUB_OUTPUT
           fi
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
-          echo "📊 Decision: runner=${{ steps.radar.outputs.runner_type }} | network=${{ steps.radar.outputs.network_mode }}"
 
   # ==========================================
-  # [PHASE 2-4: SAST/SCA/BUILD - Same for both]
+  # [PHASE 2-4: SAST/SCA/BUILD]
   # ==========================================
   sast:
     name: 🔐 SAST Defense
@@ -204,10 +191,10 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # [PHASE 5: INFRASTRUCTURE - RUNNER-AWARE]
+  # [PHASE 5: INFRASTRUCTURE]
   # ==========================================
   infra:
-    name: 🏗️ IaC Provisioning (Runner-Aware)
+    name: 🏗️ IaC Provisioning
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: dr-check
     outputs:
@@ -220,8 +207,6 @@ jobs:
       REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
       RUNNER_TYPE: ${{ needs.dr-check.outputs.runner_type }}
-      NETWORK_MODE: ${{ needs.dr-check.outputs.network_mode }}
-      DOCKER_SOCKET: ${{ needs.dr-check.outputs.docker_socket }}
     steps:
       - uses: actions/checkout@v4
 
@@ -240,7 +225,6 @@ jobs:
             -p ${MS_PORT}:4566 \
             -e SERVICES=ec2,s3,sts,iam,rds \
             -e DEFAULT_REGION=${REGION} \
-            -e DOCKER_HOST=unix:///var/run/docker.sock \
             nahuelnucera/ministack:latest
 
           echo "⏳ Waiting for Ministack services..."
@@ -249,7 +233,7 @@ jobs:
             S3=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))" 2>/dev/null)
             RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
             if [ "$S3" = "available" ] && [ "$RDS" = "available" ]; then
-              echo "✅ Ministack ready on GitHub-hosted runner"
+              echo "✅ Ministack ready"
               break
             fi
             sleep 3
@@ -267,17 +251,17 @@ jobs:
             curl -sf "http://localhost:${MS_PORT}/_localstack/health" && break
             sleep 2
           done
-          echo "✅ Ministack ready on self-hosted runner"
+          echo "✅ Ministack ready"
 
-      - name: 🔗 Configure Network Settings (Runner-Aware)
+      - name: 🔗 Configure Network Settings
         id: network-config
         run: |
           if [ "${{ needs.dr-check.outputs.runner_type }}" == "self-hosted" ]; then
-            echo "🔗 Self-hosted runner: Using host network mode"
+            echo "🔗 Self-hosted: MySQL at 127.0.0.1:3306"
             echo "mysql_host=127.0.0.1" >> $GITHUB_OUTPUT
             echo "mysql_port=3306" >> $GITHUB_OUTPUT
           else
-            echo "🔗 GitHub-hosted runner: Using bridge network mode"
+            echo "🔗 GitHub-hosted: MySQL at localhost:3306"
             echo "mysql_host=localhost" >> $GITHUB_OUTPUT
             echo "mysql_port=3306" >> $GITHUB_OUTPUT
           fi
@@ -411,17 +395,18 @@ output "s3_bucket" {
 output "db_identifier" {
   value = aws_db_instance.mysql.identifier
 }
-TFEOF
+          TFEOF
 
           cat > terraform/terraform.tfvars << EOF
 ministack_endpoint = "http://localhost:${MS_PORT}"
 environment        = "${ENV_NAME}"
 aws_region         = "${REGION}"
-EOF
+          EOF
 
       - name: 🗃️ Terraform Init (Remote S3 Backend)
         working-directory: terraform
         env:
+          # ✅ Credentials via GitHub Secrets — TIDAK DI-HARDCODE
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
@@ -456,6 +441,7 @@ EOF
         id: tf
         working-directory: terraform
         env:
+          # ✅ Database credentials via GitHub Secrets — TIDAK DI-HARDCODE
           TF_VAR_db_name: ${{ secrets.DB_NAME }}
           TF_VAR_db_user: ${{ secrets.DB_USER }}
           TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
@@ -466,7 +452,7 @@ EOF
           echo "✅ Terraform applied in ${REGION}"
 
   # ==========================================
-  # [PHASE 6: DB INIT - RUNNER-AWARE]
+  # [PHASE 6: DB INIT]
   # ==========================================
   db-init:
     name: 🗂️ DB Healthcheck & Init
@@ -507,10 +493,9 @@ EOF
             sleep 5
           done
 
-      - name: 🔗 Set RDS Endpoint (Runner-Aware)
+      - name: 🔗 Set RDS Endpoint
         id: db-endpoint
         run: |
-          # For both runner types, we use the network configuration determined earlier
           MYSQL_HOST="${{ needs.infra.outputs.mysql_host }}"
           MYSQL_PORT="${{ needs.infra.outputs.mysql_port }}"
           echo "🔗 Using MySQL at $MYSQL_HOST:$MYSQL_PORT in ${REGION}"
@@ -527,7 +512,8 @@ EOF
             if docker run --rm \
               mysql:8.0 \
               mysql --protocol=TCP -h"${RDS_HOST}" -P"${RDS_PORT}" \
-              -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" \
+              -u"${{ secrets.DB_USER }}" \
+              -p="${{ secrets.DB_PASSWORD }}" \
               --connect-timeout=5 -e "SELECT 1" 2>/dev/null; then
               echo "✅ MySQL READY (attempt $i) in ${REGION}"
               exit 0
@@ -546,7 +532,8 @@ EOF
           docker run -i --rm \
             mysql:8.0 \
             mysql --protocol=TCP -h"${RDS_HOST}" -P"${RDS_PORT}" \
-            -u"${{ env.DB_USER }}" -p"${{ env.DB_PASSWORD }}" "${{ env.DB_NAME }}" << 'SQL'
+            -u"${{ secrets.DB_USER }}" \
+            -p="${{ secrets.DB_PASSWORD }}" "${{ secrets.DB_NAME }}" << 'SQL'
           CREATE TABLE IF NOT EXISTS TodoItems (
             Id INT PRIMARY KEY AUTO_INCREMENT,
             Name VARCHAR(255) NULL,
@@ -558,7 +545,7 @@ EOF
           echo "✅ Schema ready in ${REGION}"
 
   # ==========================================
-  # [PHASE 7: DEPLOY & DAST - RUNNER-AWARE]
+  # [PHASE 7: DEPLOY & DAST]
   # ==========================================
   deploy:
     name: 🚀 Deploy & Fullstack DAST
@@ -612,7 +599,7 @@ EOF
               --tmpfs /tmp:rw,noexec,nosuid,size=64m \
               -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
               -e ASPNETCORE_ENVIRONMENT=Production \
-              -e "ConnectionStrings__DefaultConnection=Server=${{ env.RDS_HOST }};Port=${{ env.RDS_PORT }};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
+              -e "ConnectionStrings__DefaultConnection=Server=${{ env.RDS_HOST }};Port=${{ env.RDS_PORT }};Database=${{ secrets.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
               ${{ env.APP_NAME }}:latest
           else
             docker run -d --name ${{ env.CONTAINER_NAME }} \
@@ -622,7 +609,7 @@ EOF
               --tmpfs /tmp:rw,noexec,nosuid,size=64m \
               -e ASPNETCORE_URLS="http://+:${{ env.HOST_PORT }}" \
               -e ASPNETCORE_ENVIRONMENT=Production \
-              -e "ConnectionStrings__DefaultConnection=Server=${{ env.RDS_HOST }};Port=${{ env.RDS_PORT }};Database=${{ env.DB_NAME }};Uid=${{ env.DB_USER }};Pwd=${{ env.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
+              -e "ConnectionStrings__DefaultConnection=Server=${{ env.RDS_HOST }};Port=${{ env.RDS_PORT }};Database=${{ secrets.DB_NAME }};Uid=${{ secrets.DB_USER }};Pwd=${{ secrets.DB_PASSWORD }};AllowPublicKeyRetrieval=true;" \
               ${{ env.APP_NAME }}:latest
           fi
 
@@ -664,7 +651,7 @@ EOF
           retention-days: 7
 
   # ==========================================
-  # [PHASE 8: CLEANUP - RUNNER-AWARE]
+  # [PHASE 8: CLEANUP]
   # ==========================================
   cleanup:
     name: 🧹 SRE Cleanup
