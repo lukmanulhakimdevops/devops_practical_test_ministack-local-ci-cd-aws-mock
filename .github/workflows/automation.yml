@@ -527,7 +527,15 @@ jobs:
       REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
     steps:
-      - name: ⬇️ Download Golden Image
+      - name: ⬇️ Download Golden Image (Primary — current run)
+        if: needs.dr-check.outputs.is_dr == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: golden-image
+          path: .
+
+      - name: ⬇️ Download Golden Image (DR — latest main build)
+        if: needs.dr-check.outputs.is_dr == 'true'
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: ${{ github.workflow }}
