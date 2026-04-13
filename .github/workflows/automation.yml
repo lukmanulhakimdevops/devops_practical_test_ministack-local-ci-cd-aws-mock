@@ -681,4 +681,4 @@ jobs:
           echo "Runner Type      : ${{ needs.dr-check.outputs.runner_type }}"
           echo "Deployment       : ${{ needs.deploy.result }}"
           echo "========================================"
-          echo "🌐 App URL: http://localhost:${{ env.HOST_PORT }}"
+          echo "🌐 App URL: http://localhost:${{ env.HOST_PORT }}" || true
