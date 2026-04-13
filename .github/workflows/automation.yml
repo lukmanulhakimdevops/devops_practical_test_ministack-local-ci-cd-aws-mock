@@ -279,7 +279,6 @@ jobs:
           docker rm -f ministack 2>/dev/null || true
           docker run -d --name ministack \
             -p ${MS_PORT}:4566 \
-            -v /var/run/docker.sock:/var/run/docker.sock \
             -e SERVICES=ec2,s3,sts,iam,rds \
             -e DEFAULT_REGION=${REGION} \
             nahuelnucera/ministack:latest
@@ -508,7 +507,6 @@ jobs:
             docker rm -f ministack 2>/dev/null || true
             docker run -d --name ministack \
               -p ${MS_PORT}:4566 \
-              -v /var/run/docker.sock:/var/run/docker.sock \
               -e SERVICES=ec2,s3,sts,iam,rds \
               -e DEFAULT_REGION=${REGION} \
               nahuelnucera/ministack:latest
