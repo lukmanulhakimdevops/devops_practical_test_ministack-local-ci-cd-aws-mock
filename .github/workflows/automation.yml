@@ -52,10 +52,10 @@ permissions:
 
 jobs:
   # ==========================================
-  # [PHASE 1: RADAR - DR DECISION]
+  # [PHASE 1: RADAR - DR DECISION WITH RUNNER TYPE DETECTION]
   # ==========================================
   dr-check:
-    name: 🧠 Intelligence Recon
+    name: 🧠 Intelligence Recon + Runner Detection
     runs-on: ubuntu-latest
     outputs:
       runner_label: ${{ steps.radar.outputs.runner }}
@@ -63,7 +63,10 @@ jobs:
       is_dr: ${{ steps.radar.outputs.is_dr }}
       ministack_port: ${{ steps.radar.outputs.port }}
       env_name: ${{ steps.radar.outputs.env_name }}
+      force_primary: ${{ steps.radar.outputs.force_primary }}
       runner_type: ${{ steps.radar.outputs.runner_type }}
+      network_mode: ${{ steps.radar.outputs.network_mode }}
+      docker_socket: ${{ steps.radar.outputs.docker_socket }}
     steps:
       - id: radar
         run: |
@@ -78,32 +81,43 @@ jobs:
             STATUS="DOWN"
           fi
 
+          # DR Decision Logic with Runner Type Detection
           if [ "$FORCE_PRIMARY" == "true" ]; then
             echo "⚡ FORCE_PRIMARY=true: Deploying to us-east-1 (GitHub-hosted)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "is_dr=false" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=true" >> $GITHUB_OUTPUT
             echo "runner_type=github-hosted" >> $GITHUB_OUTPUT
+            echo "network_mode=bridge" >> $GITHUB_OUTPUT
+            echo "docker_socket=false" >> $GITHUB_OUTPUT
           elif [ "$FAIL" == "true" ] || [ "$STATUS" == "DOWN" ]; then
             echo "🚀 FAILOVER: Targeting Bare-Metal Laptop (us-east-2)"
             echo 'runner=["self-hosted","linux","x64"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_DR }}" >> $GITHUB_OUTPUT
             echo "is_dr=true" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=false" >> $GITHUB_OUTPUT
             echo "runner_type=self-hosted" >> $GITHUB_OUTPUT
+            echo "network_mode=host" >> $GITHUB_OUTPUT
+            echo "docker_socket=true" >> $GITHUB_OUTPUT
           else
             echo "🟢 PRIMARY: Targeting GitHub Cloud (us-east-1)"
             echo 'runner=["ubuntu-latest"]' >> $GITHUB_OUTPUT
             echo "region=${{ env.AWS_REGION_PRIMARY }}" >> $GITHUB_OUTPUT
             echo "is_dr=false" >> $GITHUB_OUTPUT
             echo "port=4566" >> $GITHUB_OUTPUT
+            echo "force_primary=false" >> $GITHUB_OUTPUT
             echo "runner_type=github-hosted" >> $GITHUB_OUTPUT
+            echo "network_mode=bridge" >> $GITHUB_OUTPUT
+            echo "docker_socket=false" >> $GITHUB_OUTPUT
           fi
           echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+          echo "📊 Decision: runner=${{ steps.radar.outputs.runner_type }} | network=${{ steps.radar.outputs.network_mode }}"
 
   # ==========================================
-  # [PHASE 2-4: SAST/SCA/BUILD]
+  # [PHASE 2-4: SAST/SCA/BUILD - Same for both]
   # ==========================================
   sast:
     name: 🔐 SAST Defense
@@ -190,19 +204,24 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # [PHASE 5: INFRASTRUCTURE]
+  # [PHASE 5: INFRASTRUCTURE - RUNNER-AWARE]
   # ==========================================
   infra:
-    name: 🏗️ IaC Provisioning
+    name: 🏗️ IaC Provisioning (Runner-Aware)
     runs-on: ${{ fromJSON(needs.dr-check.outputs.runner_label) }}
     needs: dr-check
     outputs:
       rds_endpoint: ${{ steps.tf.outputs.rds_endpoint }}
+      mysql_host: ${{ steps.network-config.outputs.mysql_host }}
+      mysql_port: ${{ steps.network-config.outputs.mysql_port }}
+      db_identifier: ${{ steps.tf.outputs.db_identifier }}
     env:
       MS_PORT: ${{ needs.dr-check.outputs.ministack_port }}
       REGION: ${{ needs.dr-check.outputs.region }}
       ENV_NAME: ${{ needs.dr-check.outputs.env_name }}
       RUNNER_TYPE: ${{ needs.dr-check.outputs.runner_type }}
+      NETWORK_MODE: ${{ needs.dr-check.outputs.network_mode }}
+      DOCKER_SOCKET: ${{ needs.dr-check.outputs.docker_socket }}
     steps:
       - uses: actions/checkout@v4
 
@@ -221,6 +240,7 @@ jobs:
             -p ${MS_PORT}:4566 \
             -e SERVICES=ec2,s3,sts,iam,rds \
             -e DEFAULT_REGION=${REGION} \
+            -e DOCKER_HOST=unix:///var/run/docker.sock \
             nahuelnucera/ministack:latest
 
           echo "⏳ Waiting for Ministack services..."
@@ -229,7 +249,7 @@ jobs:
             S3=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('s3',''))" 2>/dev/null)
             RDS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('rds',''))" 2>/dev/null)
             if [ "$S3" = "available" ] && [ "$RDS" = "available" ]; then
-              echo "✅ Ministack ready"
+              echo "✅ Ministack ready on GitHub-hosted runner"
               break
             fi
             sleep 3
@@ -247,17 +267,17 @@ jobs:
             curl -sf "http://localhost:${MS_PORT}/_localstack/health" && break
             sleep 2
           done
-          echo "✅ Ministack ready"
+          echo "✅ Ministack ready on self-hosted runner"
 
       - name: 🔗 Configure Network Settings (Runner-Aware)
         id: network-config
         run: |
           if [ "${{ needs.dr-check.outputs.runner_type }}" == "self-hosted" ]; then
-            echo "🔗 Self-hosted: MySQL at 127.0.0.1:3306"
+            echo "🔗 Self-hosted runner: Using host network mode"
             echo "mysql_host=127.0.0.1" >> $GITHUB_OUTPUT
             echo "mysql_port=3306" >> $GITHUB_OUTPUT
           else
-            echo "🔗 GitHub-hosted: MySQL at localhost:3306"
+            echo "🔗 GitHub-hosted runner: Using bridge network mode"
             echo "mysql_host=localhost" >> $GITHUB_OUTPUT
             echo "mysql_port=3306" >> $GITHUB_OUTPUT
           fi
@@ -276,124 +296,128 @@ jobs:
         run: |
           mkdir -p terraform
           cat > terraform/main.tf << 'TFEOF'
-          terraform {
-            required_providers {
-              aws = {
-                source  = "hashicorp/aws"
-                version = "~> 5.0"
-              }
-              random = {
-                source  = "hashicorp/random"
-                version = "~> 3.0"
-              }
-            }
-            backend "s3" {}
-          }
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+  backend "s3" {}
+}
 
-          variable "ministack_endpoint" {}
-          variable "environment" {}
-          variable "aws_region" {}
-          variable "db_name" { sensitive = true }
-          variable "db_user" { sensitive = true }
-          variable "db_password" { sensitive = true }
+variable "ministack_endpoint" {}
+variable "environment" {}
+variable "aws_region" {}
+variable "db_name" { sensitive = true }
+variable "db_user" { sensitive = true }
+variable "db_password" { sensitive = true }
 
-          provider "aws" {
-            region                      = var.aws_region
-            access_key                  = "test"
-            secret_key                  = "test"
-            skip_credentials_validation = true
-            skip_requesting_account_id  = true
-            skip_metadata_api_check     = true
-            s3_use_path_style           = true
-            endpoints {
-              ec2 = var.ministack_endpoint
-              s3  = var.ministack_endpoint
-              sts = var.ministack_endpoint
-              iam = var.ministack_endpoint
-              rds = var.ministack_endpoint
-            }
-          }
+provider "aws" {
+  region                      = var.aws_region
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+  s3_use_path_style           = true
+  endpoints {
+    ec2 = var.ministack_endpoint
+    s3  = var.ministack_endpoint
+    sts = var.ministack_endpoint
+    iam = var.ministack_endpoint
+    rds = var.ministack_endpoint
+  }
+}
 
-          resource "random_id" "suffix" {
-            byte_length = 4
-          }
+resource "random_id" "suffix" {
+  byte_length = 4
+}
 
-          resource "aws_security_group" "web_sg" {
-            name        = "web-sg-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
-            description = "SG for ${var.aws_region}"
-            tags = {
-              Name    = "web-sg-${var.environment}"
-              Project = "DevSecOps"
-            }
-            ingress {
-              from_port   = 80
-              to_port     = 80
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            ingress {
-              from_port   = 443
-              to_port     = 443
-              protocol    = "tcp"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-            egress {
-              from_port   = 0
-              to_port     = 0
-              protocol    = "-1"
-              cidr_blocks = ["0.0.0.0/0"]
-            }
-          }
+resource "aws_security_group" "web_sg" {
+  name        = "web-sg-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
+  description = "SG for ${var.aws_region}"
+  tags = {
+    Name    = "web-sg-${var.environment}"
+    Project = "DevSecOps"
+  }
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
 
-          resource "aws_instance" "web" {
-            ami             = "ami-0ff8a91507f77f867"
-            instance_type   = "t2.micro"
-            security_groups = [aws_security_group.web_sg.name]
-            tags = {
-              Name    = "web-server-${var.environment}"
-              Project = "DevSecOps"
-            }
-          }
+resource "aws_instance" "web" {
+  ami             = "ami-0ff8a91507f77f867"
+  instance_type   = "t2.micro"
+  security_groups = [aws_security_group.web_sg.name]
+  tags = {
+    Name    = "web-server-${var.environment}"
+    Project = "DevSecOps"
+  }
+}
 
-          resource "aws_s3_bucket" "artifacts" {
-            bucket = "artifacts-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
-            tags = {
-              Project = "DevSecOps"
-            }
-          }
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "artifacts-${var.environment}-${var.aws_region}-${random_id.suffix.hex}"
+  tags = {
+    Project = "DevSecOps"
+  }
+}
 
-          resource "aws_db_instance" "mysql" {
-            identifier          = "ministack-mysql-${var.environment}-${random_id.suffix.hex}"
-            engine              = "mysql"
-            engine_version      = "8.0"
-            instance_class      = "db.t3.micro"
-            allocated_storage   = 20
-            db_name             = var.db_name
-            username            = var.db_user
-            password            = var.db_password
-            port                = 3306
-            skip_final_snapshot = true
-            apply_immediately   = true
-            publicly_accessible = true
-            tags = {
-              Project = "DevSecOps"
-            }
-          }
+resource "aws_db_instance" "mysql" {
+  identifier          = "ministack-mysql-${var.environment}-${random_id.suffix.hex}"
+  engine              = "mysql"
+  engine_version      = "8.0"
+  instance_class      = "db.t3.micro"
+  allocated_storage   = 20
+  db_name             = var.db_name
+  username            = var.db_user
+  password            = var.db_password
+  port                = 3306
+  skip_final_snapshot = true
+  apply_immediately   = true
+  publicly_accessible = true
+  tags = {
+    Project = "DevSecOps"
+  }
+}
 
-          output "rds_endpoint" {
-            value = aws_db_instance.mysql.endpoint
-          }
+output "rds_endpoint" {
+  value = aws_db_instance.mysql.endpoint
+}
 
-          output "s3_bucket" {
-            value = aws_s3_bucket.artifacts.bucket
-          }
-          TFEOF
+output "s3_bucket" {
+  value = aws_s3_bucket.artifacts.bucket
+}
+
+output "db_identifier" {
+  value = aws_db_instance.mysql.identifier
+}
+TFEOF
 
           cat > terraform/terraform.tfvars << EOF
-          ministack_endpoint = "http://localhost:${MS_PORT}"
-          environment        = "${ENV_NAME}"
-          aws_region         = "${REGION}"
-          EOF
+ministack_endpoint = "http://localhost:${MS_PORT}"
+environment        = "${ENV_NAME}"
+aws_region         = "${REGION}"
+EOF
 
       - name: 🗃️ Terraform Init (Remote S3 Backend)
         working-directory: terraform
@@ -438,10 +462,11 @@ jobs:
         run: |
           terraform apply -auto-approve -input=false
           echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> $GITHUB_OUTPUT
+          echo "db_identifier=$(terraform output -raw db_identifier)" >> $GITHUB_OUTPUT
           echo "✅ Terraform applied in ${REGION}"
 
   # ==========================================
-  # [PHASE 6: DB INIT]
+  # [PHASE 6: DB INIT - RUNNER-AWARE]
   # ==========================================
   db-init:
     name: 🗂️ DB Healthcheck & Init
@@ -459,19 +484,13 @@ jobs:
       - name: 🐳 Wait for RDS Instance
         run: |
           ENDPOINT_URL="http://localhost:${MS_PORT}"
-          # Find the actual DB identifier with suffix
-          DB_ID=$(docker run --rm \
-            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
-            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
-            -e AWS_DEFAULT_REGION=${REGION} \
-            amazon/aws-cli rds describe-db-instances \
-            --endpoint-url "$ENDPOINT_URL" \
-            --query "DBInstances[?starts_with(DBInstanceIdentifier, 'ministack-mysql-${ENV_NAME}')].DBInstanceIdentifier" \
-            --output text 2>/dev/null | head -n1)
+          DB_ID="${{ needs.infra.outputs.db_identifier }}"
+          
           if [ -z "$DB_ID" ]; then
-            echo "❌ Could not find RDS instance"
+            echo "❌ No DB identifier found from Terraform output"
             exit 1
           fi
+          
           echo "⏳ Waiting for RDS instance: $DB_ID in ${REGION}..."
           for i in $(seq 1 60); do
             STATUS=$(docker run --rm \
@@ -491,15 +510,12 @@ jobs:
       - name: 🔗 Set RDS Endpoint (Runner-Aware)
         id: db-endpoint
         run: |
-          if [ "${{ env.RUNNER_TYPE }}" == "self-hosted" ]; then
-            echo "🔗 Self-hosted: MySQL at 127.0.0.1:3306"
-            echo "host=127.0.0.1" >> $GITHUB_OUTPUT
-            echo "port=3306" >> $GITHUB_OUTPUT
-          else
-            echo "🔗 GitHub-hosted: MySQL at localhost:3306"
-            echo "host=localhost" >> $GITHUB_OUTPUT
-            echo "port=3306" >> $GITHUB_OUTPUT
-          fi
+          # For both runner types, we use the network configuration determined earlier
+          MYSQL_HOST="${{ needs.infra.outputs.mysql_host }}"
+          MYSQL_PORT="${{ needs.infra.outputs.mysql_port }}"
+          echo "🔗 Using MySQL at $MYSQL_HOST:$MYSQL_PORT in ${REGION}"
+          echo "host=$MYSQL_HOST" >> $GITHUB_OUTPUT
+          echo "port=$MYSQL_PORT" >> $GITHUB_OUTPUT
 
       - name: 🏥 MySQL Health Check
         run: |
@@ -542,7 +558,7 @@ jobs:
           echo "✅ Schema ready in ${REGION}"
 
   # ==========================================
-  # [PHASE 7: DEPLOY & DAST]
+  # [PHASE 7: DEPLOY & DAST - RUNNER-AWARE]
   # ==========================================
   deploy:
     name: 🚀 Deploy & Fullstack DAST
@@ -648,7 +664,7 @@ jobs:
           retention-days: 7
 
   # ==========================================
-  # [PHASE 8: CLEANUP]
+  # [PHASE 8: CLEANUP - RUNNER-AWARE]
   # ==========================================
   cleanup:
     name: 🧹 SRE Cleanup
@@ -703,7 +719,7 @@ jobs:
           echo "========================================"
           echo "🛡️ DEVSECOPS PIPELINE SUMMARY"
           echo "========================================"
-          echo "Force Primary    : ${{ github.event.inputs.force_primary_deploy }}"
+          echo "Force Primary    : ${{ needs.dr-check.outputs.force_primary }}"
           echo "Target Region    : ${{ needs.dr-check.outputs.region }}"
           echo "Runner Type      : ${{ needs.dr-check.outputs.runner_type }}"
           echo "Deployment       : ${{ needs.deploy.result }}"
